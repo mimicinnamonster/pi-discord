@@ -32,3 +32,6 @@ coverage/
 
 # Bun
 bun.lockb
+
+# Logs
+logs.txt

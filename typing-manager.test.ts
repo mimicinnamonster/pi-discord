@@ -200,4 +200,54 @@ describe("TypingManager", () => {
 			expect(channel.sendTyping).toHaveBeenCalledTimes(1);
 		});
 	});
+
+	describe("tool execution flow", () => {
+		it("should keep typing visible during tool execution", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// LLM starts processing (message_start)
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// LLM calls a tool (tool_execution_start) - typing should continue
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Tool is running (tool_execution_update) - typing continues
+			// ... no action needed, already showing
+
+			// Tool finishes (tool_execution_end) - typing continues
+			// ... no action needed, still showing
+
+			// LLM sends response (message_end) - NOW hide typing
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+
+		it("should show typing on tool_execution_start even without prior LLM message", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// Tool starts directly (e.g., bash tool called)
+			typingManager.show("channel-1", channel);
+
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+			expect(channel.sendTyping).toHaveBeenCalledTimes(1);
+		});
+
+		it("should handle multiple tool calls without hiding typing", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// First tool
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Second tool starts (LLM calls another tool)
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// LLM sends final response
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+	});
 });

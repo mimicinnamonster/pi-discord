@@ -140,10 +140,14 @@ function subscribeToSession(
 				}
 				break;
 
-			case "tool_execution_start":
+			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
-				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`...`).catch(() => {});
+				const args = JSON.stringify(event.args, null, 0);
+				sendToDiscord(channel, `🔧 Running \`${event.toolName} ${args}\`...`).catch(() => {});
+				// Keep typing indicator visible during tool execution
+				typingManager.show(channelId, channel);
 				break;
+			}
 
 			case "tool_execution_update":
 				// Streaming tool output
