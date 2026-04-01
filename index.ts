@@ -56,9 +56,77 @@ function isThread(channel: unknown): channel is ThreadChannel {
 	return (channel as ThreadChannel)?.isThread?.() === true;
 }
 
+/**
+ * Escape content to prevent Discord markdown issues in code blocks.
+ * Replaces triple backticks with a safe alternative.
+ */
+function escapeForCodeBlock(text: string): string {
+	return text.replace(/```/g, "`\u200b``\u200b``");
+}
+
 // ============================================================================
 // Discord Message Handling
 // ============================================================================
+
+function splitMessagePreservingCodeBlocks(text: string, maxLength: number): string[] {
+	const chunks: string[] = [];
+	let remaining = text;
+
+	while (remaining.length > 0) {
+		// If the remaining text fits in one chunk, we're done
+		if (remaining.length <= maxLength) {
+			chunks.push(remaining);
+			break;
+		}
+
+		// Try to find code blocks within the current chunk range
+		const visibleSlice = remaining.slice(0, maxLength);
+		const codeBlockMatch = visibleSlice.match(/```/g);
+		const codeBlockCount = codeBlockMatch ? codeBlockMatch.length : 0;
+
+		if (codeBlockCount === 0 || codeBlockCount % 2 === 0) {
+			// No code block or complete pairs within visible range
+			// Check if there's an opening ``` within a few chars of the boundary
+			const nearBoundaryArea = remaining.slice(maxLength, maxLength + 50);
+			const openingIndex = nearBoundaryArea.indexOf("```");
+			if (openingIndex !== -1) {
+				// Code block starts near boundary - include the whole block
+				const actualStart = maxLength + openingIndex;
+				const nextCloseIndex = remaining.indexOf("```", actualStart + 3);
+				if (nextCloseIndex !== -1) {
+					const endOfBlock = nextCloseIndex + 3;
+					chunks.push(remaining.slice(0, endOfBlock));
+					remaining = remaining.slice(endOfBlock);
+				} else {
+					// No closing - include what we can
+					chunks.push(remaining.slice(0, maxLength));
+					remaining = remaining.slice(maxLength);
+				}
+			} else {
+				// Safe to split at maxLength
+				chunks.push(remaining.slice(0, maxLength));
+				remaining = remaining.slice(maxLength);
+			}
+		} else {
+			// Odd number of ``` found in visible range - we're inside a code block
+			// Find the closing ``` and include the entire block
+			const nextCloseIndex = remaining.indexOf("```", maxLength);
+			if (nextCloseIndex !== -1) {
+				// Include the closing ``` plus a bit more if there's content
+				const endOfBlock = nextCloseIndex + 3;
+				chunks.push(remaining.slice(0, endOfBlock));
+				remaining = remaining.slice(endOfBlock);
+			} else {
+				// No closing ``` found - just take what we can
+				// This shouldn't happen for valid Discord messages
+				chunks.push(remaining.slice(0, maxLength));
+				remaining = remaining.slice(maxLength);
+			}
+		}
+	}
+
+	return chunks;
+}
 
 function sendToDiscord(
 	channel: DMChannel | TextChannel | NewsChannel,
@@ -69,11 +137,7 @@ function sendToDiscord(
 	log(`[${channel.id}] sendToDiscord called with: "${text}" (${text.length} chars)`);
 
 	const maxLength = 2000;
-	const chunks: string[] = [];
-
-	for (let i = 0; i < text.length; i += maxLength) {
-		chunks.push(text.slice(i, i + maxLength));
-	}
+	const chunks = splitMessagePreservingCodeBlocks(text, maxLength);
 
 	log(`[${channel.id}] Will send ${chunks.length} chunk(s)`);
 
@@ -146,7 +210,7 @@ function subscribeToSession(
 
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
-				const args = JSON.stringify(event.args, null, 0);
+				const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
 				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``).catch(() => {});
 				// Keep typing indicator visible during tool execution
 				typingManager.show(channelId, channel);
