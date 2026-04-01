@@ -143,7 +143,7 @@ function subscribeToSession(
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
 				const args = JSON.stringify(event.args, null, 0);
-				sendToDiscord(channel, `🔧 Running \`${event.toolName} ${args}\`...`).catch(() => {});
+				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``).catch(() => {});
 				// Keep typing indicator visible during tool execution
 				typingManager.show(channelId, channel);
 				break;
