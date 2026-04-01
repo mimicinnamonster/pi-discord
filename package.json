@@ -1,0 +1,29 @@
+{
+  "name": "pi-discord",
+  "version": "1.0.0",
+  "description": "Standalone Discord bot for pi coding agent",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "start": "bun run index.ts",
+    "start:debug": "DISCORD_DEBUG=true bun run index.ts",
+    "dev": "bun --watch run index.ts",
+    "dev:debug": "DISCORD_DEBUG=true bun --watch run index.ts",
+    "build": "bun run tsc",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "discord.js": "^14.25.1"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "latest",
+    "@sinclair/typebox": "^0.34.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
