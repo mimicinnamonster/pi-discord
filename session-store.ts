@@ -36,6 +36,7 @@ export interface SessionIndex {
 
 export class SessionStore {
 	private sessions = new Map<string, DiscordSession>();
+	private pendingSessions = new Map<string, Promise<DiscordSession>>();
 	private sessionDir: string;
 	private debug: boolean;
 
@@ -141,39 +142,66 @@ export class SessionStore {
 	}
 
 	async getOrCreate(channelId: string): Promise<DiscordSession> {
-		let discordSession = this.sessions.get(channelId);
-
-		if (!discordSession) {
-			const index = this.loadIndex();
-			const indexed = index.sessions[channelId];
-
-			// Use stored session file path if available, otherwise use default
-			const sessionPath = indexed?.sessionFile || this.getSessionPath(channelId);
-			const exists = existsSync(sessionPath);
-
-			if (exists) {
-				this.log(`Found existing session for channel ${channelId}: ${sessionPath}`);
-			} else {
-				this.log(`Creating new session for channel ${channelId}: ${sessionPath}`);
-			}
-
-			const session = await this.createPiSession(channelId, sessionPath);
-			discordSession = {
-				channelId,
-				session,
-				lastActivity: Date.now(),
-			};
-			this.sessions.set(channelId, discordSession);
-
-			// Update index with session file path
-			const newIndex = this.loadIndex();
-			newIndex.sessions[channelId] = {
-				channelId,
-				sessionFile: sessionPath,
-				lastActivity: discordSession.lastActivity,
-			};
-			this.saveIndex(newIndex);
+		// Fast path: already in memory
+		const existing = this.sessions.get(channelId);
+		if (existing) {
+			this.log(`[${channelId}] getOrCreate: returning cached session`);
+			return existing;
 		}
+
+		// Pending path: another call is already creating this session
+		const pending = this.pendingSessions.get(channelId);
+		if (pending) {
+			this.log(`[${channelId}] getOrCreate: waiting for pending session`);
+			return pending;
+		}
+
+		this.log(`[${channelId}] getOrCreate: creating new session (${this.pendingSessions.size} pending)`);
+		// Create new session (only one per channel)
+		const createPromise = this.doCreateSession(channelId);
+		this.pendingSessions.set(channelId, createPromise);
+
+		try {
+			const discordSession = await createPromise;
+			return discordSession;
+		} finally {
+			// Clean up pending promise after completion
+			this.pendingSessions.delete(channelId);
+		}
+	}
+
+	private async doCreateSession(channelId: string): Promise<DiscordSession> {
+		const index = this.loadIndex();
+		const indexed = index.sessions[channelId];
+
+		// Use stored session file path if available, otherwise use default
+		const sessionPath = indexed?.sessionFile || this.getSessionPath(channelId);
+		const exists = existsSync(sessionPath);
+
+		if (exists) {
+			this.log(`Found existing session for channel ${channelId}: ${sessionPath}`);
+		} else {
+			this.log(`Creating new session for channel ${channelId}: ${sessionPath}`);
+		}
+
+		const session = await this.createPiSession(channelId, sessionPath);
+		const discordSession: DiscordSession = {
+			channelId,
+			session,
+			lastActivity: Date.now(),
+		};
+
+		// Store in memory
+		this.sessions.set(channelId, discordSession);
+
+		// Update index with session file path
+		const newIndex = this.loadIndex();
+		newIndex.sessions[channelId] = {
+			channelId,
+			sessionFile: sessionPath,
+			lastActivity: discordSession.lastActivity,
+		};
+		this.saveIndex(newIndex);
 
 		return discordSession;
 	}

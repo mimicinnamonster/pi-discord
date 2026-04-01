@@ -123,6 +123,71 @@ describe("SessionStore", () => {
 	});
 });
 
+describe("Concurrent Session Creation", () => {
+	const testDir = join(tmpdir(), `pi-discord-concurrent-${Date.now()}`);
+
+	beforeEach(() => {
+		if (!existsSync(testDir)) {
+			mkdirSync(testDir, { recursive: true });
+		}
+	});
+
+	afterEach(() => {
+		try {
+			rmSync(testDir, { recursive: true, force: true });
+		} catch {
+			// Ignore cleanup errors
+		}
+	});
+
+	it("should only create one session when getOrCreate is called concurrently", async () => {
+		const store = new SessionStore({ sessionDir: testDir, debug: false });
+		const channelId = "concurrent-channel-test";
+
+		// Track how many times createPiSession is called
+		let createCount = 0;
+		const originalCreate = store["createPiSession"].bind(store);
+		(store as any)["createPiSession"] = async function (...args: any[]) {
+			createCount++;
+			return originalCreate(...args);
+		};
+
+		// Call getOrCreate 5 times concurrently for the same channel
+		const promises = Array(5).fill(null).map(() => store.getOrCreate(channelId));
+		const sessions = await Promise.all(promises);
+
+		// Should only have created ONE session
+		expect(createCount).toBe(1);
+
+		// All 5 calls should return the SAME session object
+		const firstSession = sessions[0];
+		for (const session of sessions) {
+			expect(session).toBe(firstSession);
+		}
+	});
+
+	it("should handle different channels independently", async () => {
+		const store = new SessionStore({ sessionDir: testDir, debug: false });
+
+		// Create sessions for different channels concurrently
+		const results = await Promise.all([
+			store.getOrCreate("channel-a"),
+			store.getOrCreate("channel-b"),
+			store.getOrCreate("channel-c"),
+		]);
+
+		// Each channel should have its own session
+		expect(results[0].channelId).toBe("channel-a");
+		expect(results[1].channelId).toBe("channel-b");
+		expect(results[2].channelId).toBe("channel-c");
+
+		// Sessions should be different objects
+		expect(results[0]).not.toBe(results[1]);
+		expect(results[0]).not.toBe(results[2]);
+		expect(results[1]).not.toBe(results[2]);
+	});
+});
+
 describe("Session Persistence Behavior", () => {
 	/**
 	 * These tests verify the core session persistence contract:

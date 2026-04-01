@@ -5,6 +5,7 @@
 
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel } from "discord.js";
 import { SessionStore, createSessionStore, type DiscordSession } from "./session-store";
+import { TypingManager } from "./typing-manager";
 import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
@@ -42,6 +43,7 @@ if (!discordToken) {
 
 let discordClient: Client | null = null;
 const sessionStore = createSessionStore({ sessionDir, debug });
+const typingManager = new TypingManager();
 
 // ============================================================================
 // Helper Functions
@@ -61,6 +63,8 @@ function sendToDiscord(
 ): Promise<void> {
 	if (!text.trim()) return Promise.resolve();
 
+	log(`[${channel.id}] sendToDiscord called with: "${text}" (${text.length} chars)`);
+
 	const maxLength = 2000;
 	const chunks: string[] = [];
 
@@ -68,15 +72,21 @@ function sendToDiscord(
 		chunks.push(text.slice(i, i + maxLength));
 	}
 
+	log(`[${channel.id}] Will send ${chunks.length} chunk(s)`);
+
 	// Send chunks sequentially to preserve order
-	const sendChunk = (chunk: string): Promise<any> => channel.send(chunk);
+	const sendChunk = (chunk: string): Promise<any> => {
+		log(`[${channel.id}] Actually sending chunk: "${chunk}"`);
+		return channel.send(chunk);
+	};
 	return chunks.reduce((promise, chunk) => promise.then(() => sendChunk(chunk)), Promise.resolve());
 }
 
 function subscribeToSession(
 	session: AgentSession,
 	channelId: string,
-	channel: DMChannel | TextChannel | NewsChannel
+	channel: DMChannel | TextChannel | NewsChannel,
+	typingManager: TypingManager
 ): void {
 	const responseBuffer: string[] = [];
 
@@ -85,18 +95,23 @@ function subscribeToSession(
 			case "agent_start":
 				log(`[${channelId}] Agent starting...`);
 				responseBuffer.length = 0;
+				// LLM is processing - show typing indicator
+				typingManager.show(channelId, channel);
 				break;
 
 			case "message_start":
 				if (event.message.role === "assistant") {
 					log(`[${channelId}] Assistant message started`);
 					responseBuffer.length = 0;
+					// LLM is generating response - show typing indicator
+					typingManager.show(channelId, channel);
 				}
 				break;
 
 			case "message_update": {
 				const assistantEvent = event.assistantMessageEvent;
 				if (assistantEvent?.type === "text_delta") {
+					log(`[${channelId}] text_delta: "${assistantEvent.delta}" (${assistantEvent.delta?.length || 0} chars)`);
 					responseBuffer.push(assistantEvent.delta);
 				}
 				if (assistantEvent?.type === "thinking_delta") {
@@ -108,14 +123,9 @@ function subscribeToSession(
 
 			case "message_end":
 				if (event.message.role === "assistant") {
-					// Get any remaining content
-					const textContent = event.message.content?.find(
-						(c: any) => c.type === "text"
-					);
-					if (textContent?.type === "text" && textContent.text) {
-						responseBuffer.push(textContent.text);
-					}
-
+					// Note: The response has already been accumulated via text_delta events
+					// into responseBuffer. DO NOT push from event.message.content as that
+					// would duplicate the content (streaming + final content = double).
 					const fullResponse = responseBuffer.join("");
 					if (fullResponse.trim()) {
 						log(`[${channelId}] Sending response (${fullResponse.length} chars)`);
@@ -124,6 +134,9 @@ function subscribeToSession(
 						});
 					}
 					responseBuffer.length = 0;
+					// LLM finished generating - stop typing
+					// (Don't stop on agent_end as it comes after message_end)
+					typingManager.hide(channelId);
 				}
 				break;
 
@@ -145,6 +158,8 @@ function subscribeToSession(
 
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
+				// Ensure typing is hidden (defensive, normally message_end handles this)
+				typingManager.hide(channelId);
 				break;
 
 			case "compaction_start":
@@ -245,6 +260,8 @@ async function main() {
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
+	let subscribeCount = 0;
+	let sendCount = 0;
 
 	async function handleMessage(
 		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
@@ -255,10 +272,18 @@ async function main() {
 		const { session } = discordSession;
 
 		// Subscribe to session events once
+		// FIX: Add to set BEFORE calling subscribeToSession to prevent race condition
+		// where two rapid messages could both pass the has() check before either adds
 		if (!subscribedSessions.has(channelId)) {
-			subscribeToSession(session, channelId, channel as DMChannel | TextChannel | NewsChannel);
 			subscribedSessions.add(channelId);
+			subscribeCount++;
+			log(`[${channelId}] Subscribing to session (total subscriptions: ${subscribeCount})`);
+			subscribeToSession(session, channelId, channel as DMChannel | TextChannel | NewsChannel, typingManager);
+		} else {
+			log(`[${channelId}] Already subscribed, skipping`);
 		}
+
+		log(`[${channelId}] handleMessage complete. sendToDiscord called ${sendCount} times total so far`);
 
 		// Update last activity
 		sessionStore.touch(channelId);
@@ -283,6 +308,9 @@ async function main() {
 	// =========================================================================
 	async function shutdown() {
 		log("Shutting down...");
+
+		// Dispose typing manager (stops all typing indicators)
+		typingManager.dispose();
 
 		// Dispose all sessions (saves index)
 		sessionStore.disposeAll();
