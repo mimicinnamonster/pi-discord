@@ -45,6 +45,9 @@ let discordClient: Client | null = null;
 const sessionStore = createSessionStore({ sessionDir, debug });
 const typingManager = new TypingManager();
 
+// Track sessions that are currently running (to allow interruption)
+const runningSessions = new Set<string>();
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -95,6 +98,7 @@ function subscribeToSession(
 			case "agent_start":
 				log(`[${channelId}] Agent starting...`);
 				responseBuffer.length = 0;
+				runningSessions.add(channelId);
 				// LLM is processing - show typing indicator
 				typingManager.show(channelId, channel);
 				break;
@@ -162,6 +166,7 @@ function subscribeToSession(
 
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
+				runningSessions.delete(channelId);
 				// Ensure typing is hidden (defensive, normally message_end handles this)
 				typingManager.hide(channelId);
 				break;
@@ -274,6 +279,14 @@ async function main() {
 		const channelId = channel.id;
 		const discordSession = await sessionStore.getOrCreate(channelId);
 		const { session } = discordSession;
+
+		// Abort any ongoing session operation if user sends a new message
+		if (runningSessions.has(channelId)) {
+			log(`[${channelId}] User interrupted - aborting current operation`);
+			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
+			await session.abort();
+			typingManager.hide(channelId);
+		}
 
 		// Subscribe to session events once
 		// FIX: Add to set BEFORE calling subscribeToSession to prevent race condition
