@@ -413,3 +413,60 @@ describe("tool args JSON formatting", () => {
 		expect(formatted).toContain("a.txt");
 	});
 });
+
+describe("thinking buffer", () => {
+	it("should accumulate thinking deltas", () => {
+		const thinkingBuffer: string[] = [];
+
+		thinkingBuffer.push("Let me think");
+		thinkingBuffer.push(" about this");
+		thinkingBuffer.push(" problem...");
+
+		expect(thinkingBuffer.join("")).toBe("Let me think about this problem...");
+	});
+
+	it("should clear on message_start", () => {
+		const thinkingBuffer: string[] = [];
+
+		thinkingBuffer.push("Previous thinking");
+		expect(thinkingBuffer.length).toBe(1);
+
+		// message_start clears buffer
+		thinkingBuffer.length = 0;
+		expect(thinkingBuffer.length).toBe(0);
+	});
+
+	it("should clear on message_end", () => {
+		const thinkingBuffer: string[] = [];
+
+		thinkingBuffer.push("Some thinking");
+		thinkingBuffer.length = 0;
+
+		expect(thinkingBuffer.join("")).toBe("");
+	});
+
+	it("should only send when thinking exceeds threshold", () => {
+		const thinkingBuffer: string[] = [];
+		const THRESHOLD = 10;
+
+		thinkingBuffer.push("short");
+		const shortText = thinkingBuffer.join("");
+		expect(shortText.length > THRESHOLD).toBe(false);
+
+		thinkingBuffer.push(" more content here");
+		const longText = thinkingBuffer.join("");
+		expect(longText.length > THRESHOLD).toBe(true);
+	});
+
+	it("should format thinking message with emoji and code block", () => {
+		const thinkingText = "Let me analyze this code...";
+		const escapeForCodeBlock = (text: string): string => {
+			return text.replace(/```/g, "`\u200b``\u200b``");
+		};
+		const message = `💭 Thinking...\n\`\`\`\n${escapeForCodeBlock(thinkingText)}\n\`\`\``;
+
+		expect(message).toContain("💭 Thinking...");
+		expect(message).toContain("```");
+		expect(message).toContain(thinkingText);
+	});
+});

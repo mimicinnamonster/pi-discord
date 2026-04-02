@@ -156,6 +156,7 @@ function subscribeToSession(
 	typingManager: TypingManager
 ): void {
 	const responseBuffer: string[] = [];
+	const thinkingBuffer: string[] = [];
 
 	session.subscribe((event: AgentSessionEvent) => {
 		switch (event.type) {
@@ -171,6 +172,7 @@ function subscribeToSession(
 				if (event.message.role === "assistant") {
 					log(`[${channelId}] Assistant message started`);
 					responseBuffer.length = 0;
+					thinkingBuffer.length = 0;
 					// LLM is generating response - show typing indicator
 					typingManager.show(channelId, channel);
 				}
@@ -183,8 +185,13 @@ function subscribeToSession(
 					responseBuffer.push(assistantEvent.delta);
 				}
 				if (assistantEvent?.type === "thinking_delta") {
-					// Could send thinking to Discord as a separate message
-					// For now, we just accumulate it
+					log(`[${channelId}] thinking_delta: "${assistantEvent.delta}"`);
+					thinkingBuffer.push(assistantEvent.delta);
+					// Send thinking as an update
+					const thinkingText = thinkingBuffer.join("");
+					if (thinkingText.length > 10) {
+						sendToDiscord(channel, `💭 Thinking...\n\`\`\`\n${escapeForCodeBlock(thinkingText)}\n\`\`\``).catch(() => {});
+					}
 				}
 				break;
 			}
@@ -202,6 +209,7 @@ function subscribeToSession(
 						});
 					}
 					responseBuffer.length = 0;
+					thinkingBuffer.length = 0;
 					// LLM finished generating - stop typing
 					// (Don't stop on agent_end as it comes after message_end)
 					typingManager.hide(channelId);
