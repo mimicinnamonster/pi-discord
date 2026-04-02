@@ -470,3 +470,54 @@ describe("thinking buffer", () => {
 		expect(message).toContain(thinkingText);
 	});
 });
+
+describe("Bash command parsing", () => {
+	it("should detect ! command", () => {
+		const content = "!ls -la";
+		const isBash = content.startsWith("!");
+		const isExcluded = content.startsWith("!!");
+		const command = isExcluded ? content.slice(2).trim() : content.slice(1).trim();
+
+		expect(isBash).toBe(true);
+		expect(isExcluded).toBe(false);
+		expect(command).toBe("ls -la");
+	});
+
+	it("should detect !! command", () => {
+		const content = "!!ls -la";
+		const isBash = content.startsWith("!");
+		const isExcluded = content.startsWith("!!");
+		const command = isExcluded ? content.slice(2).trim() : content.slice(1).trim();
+
+		expect(isBash).toBe(true);
+		expect(isExcluded).toBe(true);
+		expect(command).toBe("ls -la");
+	});
+
+	it("should handle empty command after !", () => {
+		const content = "!";
+		const isBash = content.startsWith("!");
+		const isExcluded = content.startsWith("!!");
+		const command = isExcluded ? content.slice(2).trim() : content.slice(1).trim();
+
+		expect(command).toBe("");
+	});
+
+	it("should handle empty command after !!", () => {
+		const content = "!!";
+		const isBash = content.startsWith("!");
+		const isExcluded = content.startsWith("!!");
+		const command = isExcluded ? content.slice(2).trim() : content.slice(1).trim();
+
+		expect(command).toBe("");
+	});
+
+	it("should handle command with spaces", () => {
+		const content = "!  echo hello world  ";
+		const isBash = content.startsWith("!");
+		const isExcluded = content.startsWith("!!");
+		const command = isExcluded ? content.slice(2).trim() : content.slice(1).trim();
+
+		expect(command).toBe("echo hello world");
+	});
+});

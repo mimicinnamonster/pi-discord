@@ -531,6 +531,42 @@ async function main() {
 		// Update last activity
 		sessionStore.touch(channelId);
 
+		// Handle bash commands (!command or !!command)
+		if (message.content.startsWith("!")) {
+			const isExcluded = message.content.startsWith("!!");
+			const command = isExcluded 
+				? message.content.slice(2).trim()
+				: message.content.slice(1).trim();
+
+			if (!command) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Usage: `!command` or `!!command`");
+				return;
+			}
+
+			log(`[${channelId}] Executing bash command: ${command}`);
+			typingManager.show(channelId, channel);
+
+			try {
+				const output: string[] = [];
+				await session.executeBash(command, (chunk) => {
+					output.push(chunk);
+				}, { excludeFromContext: isExcluded });
+
+				const fullOutput = output.join("");
+				if (fullOutput) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `📄 Output:\n\`\`\`\n${escapeForCodeBlock(fullOutput)}\n\`\`\``);
+				} else {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Command executed (no output)");
+				}
+			} catch (error) {
+				console.error(`[${channelId}] Bash error:`, error);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Bash error: ${error}`);
+			} finally {
+				typingManager.hide(channelId);
+			}
+			return;
+		}
+
 		// Send user message to pi agent
 		try {
 			await session.sendUserMessage(message.content);
