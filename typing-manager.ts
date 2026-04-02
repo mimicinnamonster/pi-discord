@@ -19,6 +19,8 @@ export class TypingManager {
 		// Clear any existing timeout for this channel
 		this.clearTimeout(channelId);
 
+		console.log(`[typing-manager] Showing typing for ${channelId}`);
+
 		// Start typing
 		channel.sendTyping().catch(() => {
 			// Channel might be unavailable, ignore

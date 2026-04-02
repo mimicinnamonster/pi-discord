@@ -226,6 +226,8 @@ function subscribeToSession(
 				}
 				if (assistantEvent?.type === "thinking_delta") {
 					log(`[${channelId}] thinking_delta: "${assistantEvent.delta}"`);
+					// Show typing indicator when thinking starts
+					typingManager.show(channelId, channel);
 					thinkingBuffer.push(assistantEvent.delta);
 					// Only send when thinking is complete (on message_end) to avoid spam
 				}
