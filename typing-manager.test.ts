@@ -201,6 +201,77 @@ describe("TypingManager", () => {
 		});
 	});
 
+	describe("thinking_delta event flow", () => {
+		it("should show typing indicator on thinking_delta", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// Simulate the new behavior: typing shows immediately when thinking_delta arrives
+			typingManager.show("channel-1", channel);
+
+			// Typing should be visible immediately when thinking starts
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+			expect(channel.sendTyping).toHaveBeenCalledTimes(1);
+		});
+
+		it("should keep typing visible through thinking until message_end", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// Thinking starts
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Multiple thinking_delta events - typing should persist
+			typingManager.show("channel-1", channel);
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Thinking ends, message starts
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Message ends - hide typing
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+
+		it("should transition from thinking to message without losing typing", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// Thinking phase
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Thinking complete, message begins
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Message streaming
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Message ends
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+
+		it("should handle thinking without any text content", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// thinking_delta arrives (reasoning/thinking phase)
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// If LLM directly produces output without message_start
+			// typing should already be visible from thinking_delta
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Message ends
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+	});
+
 	describe("tool execution flow", () => {
 		it("should keep typing visible during tool execution", () => {
 			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
