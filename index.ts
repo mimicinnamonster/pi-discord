@@ -3,7 +3,7 @@
  * Discord integration for pi coding agent using the SDK
  */
 
-import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel } from "discord.js";
+import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
 import { SessionStore, createSessionStore, type DiscordSession } from "./session-store";
 import { TypingManager } from "./typing-manager";
 import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
@@ -47,6 +47,28 @@ const typingManager = new TypingManager();
 
 // Track sessions that are currently running (to allow interruption)
 const runningSessions = new Set<string>();
+
+// Track Discord message IDs to session entry indices for deletion handling
+// Map structure: channelId -> discordMessageId -> { sessionIndex, type: 'user' | 'assistant' | 'tool' | 'thinking' }
+const discordMessageToSession = new Map<string, Map<string, { sessionIndex: number; type: string }>>();
+const sessionMessageIndex = new Map<string, number>(); // Track current message index per channel
+
+// Track the last thinking message ID per channel for editing
+const lastThinkingMessageId = new Map<string, string>();
+
+/**
+ * After deleting a message at index, decrement all tracked indices higher than it.
+ */
+function fixIndicesAfterDeletion(channelId: string, deletedIndex: number): void {
+	const channelMap = discordMessageToSession.get(channelId);
+	if (!channelMap) return;
+
+	for (const [msgId, tracked] of channelMap.entries()) {
+		if (tracked.sessionIndex > deletedIndex) {
+			tracked.sessionIndex--;
+		}
+	}
+}
 
 // ============================================================================
 // Helper Functions
@@ -128,11 +150,12 @@ function splitMessagePreservingCodeBlocks(text: string, maxLength: number): stri
 	return chunks;
 }
 
-function sendToDiscord(
+async function sendToDiscord(
 	channel: DMChannel | TextChannel | NewsChannel,
-	text: string
-): Promise<void> {
-	if (!text.trim()) return Promise.resolve();
+	text: string,
+	options?: { trackInSession?: boolean; type?: string }
+): Promise<Message[]> {
+	if (!text.trim()) return [];
 
 	log(`[${channel.id}] sendToDiscord called with: "${text}" (${text.length} chars)`);
 
@@ -141,12 +164,26 @@ function sendToDiscord(
 
 	log(`[${channel.id}] Will send ${chunks.length} chunk(s)`);
 
+	const sentMessages: Message[] = [];
+
 	// Send chunks sequentially to preserve order
-	const sendChunk = (chunk: string): Promise<any> => {
+	for (const chunk of chunks) {
 		log(`[${channel.id}] Actually sending chunk: "${chunk}"`);
-		return channel.send(chunk);
-	};
-	return chunks.reduce((promise, chunk) => promise.then(() => sendChunk(chunk)), Promise.resolve());
+		const msg = await channel.send(chunk);
+		sentMessages.push(msg);
+
+		// Track Discord message ID for session deletion handling
+		if (options?.trackInSession) {
+			if (!discordMessageToSession.has(channel.id)) {
+				discordMessageToSession.set(channel.id, new Map());
+			}
+			const channelMap = discordMessageToSession.get(channel.id)!;
+			const currentIndex = sessionMessageIndex.get(channel.id) ?? 0;
+			channelMap.set(msg.id, { sessionIndex: currentIndex, type: options.type ?? "unknown" });
+		}
+	}
+
+	return sentMessages;
 }
 
 function subscribeToSession(
@@ -173,6 +210,9 @@ function subscribeToSession(
 					log(`[${channelId}] Assistant message started`);
 					responseBuffer.length = 0;
 					thinkingBuffer.length = 0;
+					// Increment session index for this new assistant message
+					const currentIdx = (sessionMessageIndex.get(channelId) ?? 0) + 1;
+					sessionMessageIndex.set(channelId, currentIdx);
 					// LLM is generating response - show typing indicator
 					typingManager.show(channelId, channel);
 				}
@@ -187,24 +227,27 @@ function subscribeToSession(
 				if (assistantEvent?.type === "thinking_delta") {
 					log(`[${channelId}] thinking_delta: "${assistantEvent.delta}"`);
 					thinkingBuffer.push(assistantEvent.delta);
-					// Send thinking as an update
-					const thinkingText = thinkingBuffer.join("");
-					if (thinkingText.length > 10) {
-						sendToDiscord(channel, `💭 Thinking...\n\`\`\`\n${escapeForCodeBlock(thinkingText)}\n\`\`\``).catch(() => {});
-					}
+					// Only send when thinking is complete (on message_end) to avoid spam
 				}
 				break;
 			}
 
 			case "message_end":
 				if (event.message.role === "assistant") {
+					// Send thinking only once when complete (not streaming)
+					const fullThinking = thinkingBuffer.join("");
+					if (fullThinking.trim().length > 10) {
+						log(`[${channelId}] Sending completed thinking (${fullThinking.length} chars)`);
+						sendToDiscord(channel, `💭 Thinking\n\`\`\`\n${escapeForCodeBlock(fullThinking)}\n\`\`\``, { trackInSession: true, type: "thinking" }).catch(() => {});
+					}
+
 					// Note: The response has already been accumulated via text_delta events
 					// into responseBuffer. DO NOT push from event.message.content as that
 					// would duplicate the content (streaming + final content = double).
 					const fullResponse = responseBuffer.join("");
 					if (fullResponse.trim()) {
 						log(`[${channelId}] Sending response (${fullResponse.length} chars)`);
-						sendToDiscord(channel, fullResponse).catch((error) => {
+						sendToDiscord(channel, fullResponse, { trackInSession: true, type: "response" }).catch((error) => {
 							console.error(`[${channelId}] Failed to send response:`, error);
 						});
 					}
@@ -219,7 +262,10 @@ function subscribeToSession(
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
 				const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
-				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``).catch(() => {});
+				// Increment session index for tool calls
+				const currentIdx = (sessionMessageIndex.get(channelId) ?? 0) + 1;
+				sessionMessageIndex.set(channelId, currentIdx);
+				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``, { trackInSession: true, type: "tool" }).catch(() => {});
 				// Keep typing indicator visible during tool execution
 				typingManager.show(channelId, channel);
 				break;
@@ -232,7 +278,7 @@ function subscribeToSession(
 			case "tool_execution_end":
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
 				if (event.isError) {
-					sendToDiscord(channel, "⚠️ Tool execution failed").catch(() => {});
+					sendToDiscord(channel, "⚠️ Tool execution failed", { trackInSession: true, type: "tool-error" }).catch(() => {});
 				}
 				break;
 
@@ -338,6 +384,103 @@ async function main() {
 	});
 
 	// =========================================================================
+	// Message Deletion Handler
+	// =========================================================================
+	discordClient.on("messageDelete", async (message) => {
+		const channelId = message.channelId;
+		const discordMessageId = message.id;
+
+		log(`[${channelId}] Message deleted: ${discordMessageId}`);
+
+		// Look up if we track this Discord message
+		const channelMap = discordMessageToSession.get(channelId);
+		if (!channelMap) {
+			log(`[${channelId}] No tracked messages for this channel`);
+			return;
+		}
+
+		const tracked = channelMap.get(discordMessageId);
+		if (!tracked) {
+			log(`[${channelId}] Warning: Deleted message ${discordMessageId} was not tracked in session`);
+			return;
+		}
+
+		// Get the session and remove the corresponding message
+		const discordSession = sessionStore.get(channelId);
+		if (!discordSession) {
+			log(`[${channelId}] No session found for channel`);
+			channelMap.delete(discordMessageId);
+			return;
+		}
+
+		const { session } = discordSession;
+		const messages = session.messages;
+
+		// Find and remove the message at the tracked index
+		if (tracked.sessionIndex >= 0 && tracked.sessionIndex < messages.length) {
+			const removed = messages.splice(tracked.sessionIndex, 1);
+			log(`[${channelId}] Removed message from session: ${removed[0]?.role} (index ${tracked.sessionIndex})`);
+			// Fix indices after deletion to prevent drift
+			fixIndicesAfterDeletion(channelId, tracked.sessionIndex);
+		} else {
+			log(`[${channelId}] Warning: Session index ${tracked.sessionIndex} out of bounds (${messages.length} messages)`);
+		}
+
+		// Remove from tracking map
+		channelMap.delete(discordMessageId);
+	});
+
+	discordClient.on("messageDeleteBulk", async (messages) => {
+		// Group messages by channel and sort by index descending
+		const byChannel = new Map<string, Array<{ msgId: string; tracked: { sessionIndex: number; type: string } }>>();
+
+		for (const message of messages.values()) {
+			const channelId = message.channelId;
+			const discordMessageId = message.id;
+
+			log(`[${channelId}] Bulk message deleted: ${discordMessageId}`);
+
+			const channelMap = discordMessageToSession.get(channelId);
+			if (!channelMap) continue;
+
+			const tracked = channelMap.get(discordMessageId);
+			if (!tracked) {
+				log(`[${channelId}] Warning: Bulk-deleted message ${discordMessageId} was not tracked in session`);
+				continue;
+			}
+
+			if (!byChannel.has(channelId)) {
+				byChannel.set(channelId, []);
+			}
+			byChannel.get(channelId)!.push({ msgId: discordMessageId, tracked });
+		}
+
+		// Process each channel
+		for (const [channelId, deletions] of byChannel) {
+			// Sort by index descending so we delete from high to low
+			deletions.sort((a, b) => b.tracked.sessionIndex - a.tracked.sessionIndex);
+
+			const discordSession = sessionStore.get(channelId);
+			if (!discordSession) continue;
+
+			const { session } = discordSession;
+			const sessionMessages = session.messages;
+
+			for (const { msgId, tracked } of deletions) {
+				const channelMap = discordMessageToSession.get(channelId)!;
+				channelMap.delete(msgId);
+
+				if (tracked.sessionIndex >= 0 && tracked.sessionIndex < sessionMessages.length) {
+					const removed = sessionMessages.splice(tracked.sessionIndex, 1);
+					log(`[${channelId}] Removed message from session: ${removed[0]?.role} (index ${tracked.sessionIndex})`);
+					// Fix indices after deletion
+					fixIndicesAfterDeletion(channelId, tracked.sessionIndex);
+				}
+			}
+		}
+	});
+
+	// =========================================================================
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
@@ -351,6 +494,17 @@ async function main() {
 		const channelId = channel.id;
 		const discordSession = await sessionStore.getOrCreate(channelId);
 		const { session } = discordSession;
+
+		// Track user message for deletion handling
+		// User messages are at index = session.messages.length before we add them
+		const userMessageIndex = session.messages.length;
+		if (!discordMessageToSession.has(channelId)) {
+			discordMessageToSession.set(channelId, new Map());
+		}
+		discordMessageToSession.get(channelId)!.set(message.id, {
+			sessionIndex: userMessageIndex,
+			type: "user"
+		});
 
 		// Abort any ongoing session operation if user sends a new message
 		if (runningSessions.has(channelId)) {
