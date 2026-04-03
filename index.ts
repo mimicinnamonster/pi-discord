@@ -175,10 +175,10 @@ async function uploadAsFile(
 
 /**
  * Threshold for uploading as file instead of splitting.
- * Discord has a 2000 char limit, but files can be up to 25MB.
- * We use a threshold of 4000 chars to avoid awkward splitting near the limit.
+ * Discord has a 2000 char limit per message.
+ * We use 2000 to trigger file upload before splitting would fail.
  */
-const FILE_UPLOAD_THRESHOLD = 4000;
+const FILE_UPLOAD_THRESHOLD = 2000;
 
 async function sendToDiscord(
 	channel: DMChannel | TextChannel | NewsChannel,
@@ -223,19 +223,19 @@ async function sendToDiscord(
 			const msg = await channel.send(chunk);
 			log(`[${channel.id}] Message sent successfully: ${msg.id}`);
 			sentMessages.push(msg);
+
+			// Track Discord message ID for session deletion handling
+			if (options?.trackInSession) {
+				if (!discordMessageToSession.has(channel.id)) {
+					discordMessageToSession.set(channel.id, new Map());
+				}
+				const channelMap = discordMessageToSession.get(channel.id)!;
+				const currentIndex = sessionMessageIndex.get(channel.id) ?? 0;
+				channelMap.set(msg.id, { sessionIndex: currentIndex, type: options.type ?? "unknown" });
+			}
 		} catch (sendError) {
 			log(`[${channel.id}] ERROR sending message: ${sendError}`);
 			throw sendError; // Re-throw so callers can handle
-		}
-
-		// Track Discord message ID for session deletion handling
-		if (options?.trackInSession) {
-			if (!discordMessageToSession.has(channel.id)) {
-				discordMessageToSession.set(channel.id, new Map());
-			}
-			const channelMap = discordMessageToSession.get(channel.id)!;
-			const currentIndex = sessionMessageIndex.get(channel.id) ?? 0;
-			channelMap.set(msg.id, { sessionIndex: currentIndex, type: options.type ?? "unknown" });
 		}
 	}
 

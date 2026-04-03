@@ -546,7 +546,7 @@ describe("Session command parsing", () => {
 });
 
 describe("Long message file upload", () => {
-	const FILE_UPLOAD_THRESHOLD = 4000;
+	const FILE_UPLOAD_THRESHOLD = 2000;
 
 	it("should use file upload for messages exceeding threshold", () => {
 		const longMessage = "a".repeat(FILE_UPLOAD_THRESHOLD + 1);
@@ -584,11 +584,11 @@ describe("Long message file upload", () => {
 		expect(shouldUploadAsFile).toBe(true);
 	});
 
-	it("should use 4000 char threshold", () => {
+	it("should use 2000 char threshold (Discord's limit)", () => {
 		// Verify the threshold is set correctly
-		expect(FILE_UPLOAD_THRESHOLD).toBe(4000);
-		// This is double Discord's 2000 limit to avoid awkward splitting
-		expect(FILE_UPLOAD_THRESHOLD).toBe(2 * 2000);
+		expect(FILE_UPLOAD_THRESHOLD).toBe(2000);
+		// This matches Discord's message limit
+		expect(FILE_UPLOAD_THRESHOLD).toBe(2000);
 	});
 
 	it("should handle empty messages (should not upload)", () => {
@@ -604,7 +604,7 @@ describe("Long message file upload", () => {
 
 		// Each Japanese character counts as 1 in string length
 		expect(unicodeMessage.length).toBe(3000);
-		expect(shouldUploadAsFile).toBe(false);
+		expect(shouldUploadAsFile).toBe(true); // 3000 > 2000
 	});
 
 	it("should handle very long messages (100KB+)", () => {
