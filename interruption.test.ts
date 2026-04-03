@@ -638,3 +638,98 @@ describe("File upload attachment", () => {
 		expect(buffer.toString("utf-8")).toBe(text);
 	});
 });
+
+describe("Content extension detection", () => {
+	// Simulate getContentExtension logic for testing
+	function getContentExtension(text: string, type?: string): string {
+		const codeBlockMatch = text.match(/```(\w+)/);
+		if (codeBlockMatch) {
+			const lang = codeBlockMatch[1].toLowerCase();
+			const langMap: Record<string, string> = {
+				js: "js", javascript: "js", ts: "ts", typescript: "ts",
+				json: "json", python: "py", py: "py", rust: "rs", rs: "rs",
+				go: "go", bash: "sh", sh: "sh", shell: "sh", zsh: "sh",
+				toml: "toml", yaml: "yaml", yml: "yaml", xml: "xml",
+				html: "html", css: "css", sql: "sql", md: "md", markdown: "md",
+			};
+			if (langMap[lang]) return langMap[lang];
+		}
+		if (text.includes("diff --git") || text.startsWith("diff ") || text.match(/^--- |^\+\+\+ /m)) return "diff";
+		if (text.match(/^From [a-f0-9]+ /m) || text.includes("--- a/") || text.includes("--- a\\\"")) return "patch";
+		const trimmed = text.trim();
+		if (trimmed.startsWith("{") && trimmed.endsWith("}")) return "json";
+		if (trimmed.startsWith("[") && trimmed.endsWith("]")) return "json";
+		if (trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html") || trimmed.startsWith("<?xml")) return "html";
+		if (type === "tool" && text.includes("command")) return "sh";
+		return "txt";
+	}
+
+	// Simulate filename extension replacement
+	function replaceExtension(filename: string, ext: string): string {
+		return filename.replace(/\.[^.]+$/, `.${ext}`);
+	}
+
+	it("should replace extension in filename", () => {
+		expect(replaceExtension("output.txt", "md")).toBe("output.md");
+		expect(replaceExtension("output.txt", "json")).toBe("output.json");
+		expect(replaceExtension("output.txt", "sh")).toBe("output.sh");
+	});
+
+	it("should handle filenames without extension", () => {
+		const noExtFilename = "output";
+		const ext = getContentExtension("plain text");
+		// Without extension, replace won't match
+		expect(replaceExtension(noExtFilename, ext)).toBe(noExtFilename);
+		// This is why we pass "output.txt" as default in the code
+	});
+
+	it("should detect javascript code blocks", () => {
+		expect(getContentExtension("```javascript\nconsole.log('hi');\n```")).toBe("js");
+		expect(getContentExtension("```js\nconsole.log('hi');\n```")).toBe("js");
+	});
+
+	it("should detect typescript code blocks", () => {
+		expect(getContentExtension("```typescript\nconst x: number = 1;\n```")).toBe("ts");
+		expect(getContentExtension("```ts\nconst x: number = 1;\n```")).toBe("ts");
+	});
+
+	it("should detect JSON", () => {
+		expect(getContentExtension('{"key": "value"}')).toBe("json");
+		expect(getContentExtension('[1, 2, 3]')).toBe("json");
+	});
+
+	it("should detect git diff output", () => {
+		expect(getContentExtension("diff --git a/file.txt b/file.txt")).toBe("diff");
+		expect(getContentExtension("diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt")).toBe("diff");
+		expect(getContentExtension("--- a/file.txt\n+++ b/file.txt")).toBe("diff");
+	});
+
+	it("should detect bash/shell", () => {
+		expect(getContentExtension("```bash\necho hello\n```")).toBe("sh");
+		expect(getContentExtension("```sh\necho hello\n```")).toBe("sh");
+		expect(getContentExtension("```shell\necho hello\n```")).toBe("sh");
+	});
+
+	it("should default to txt for unknown content", () => {
+		expect(getContentExtension("Hello world")).toBe("txt");
+		expect(getContentExtension("Some random text")).toBe("txt");
+	});
+
+	it("should use type hint for tool output with command", () => {
+		expect(getContentExtension("Running command: ls", "tool")).toBe("sh");
+	});
+
+	it("should detect HTML", () => {
+		expect(getContentExtension("<!DOCTYPE html>")).toBe("html");
+		expect(getContentExtension("<html><body></body></html>")).toBe("html");
+		expect(getContentExtension("<?xml version=\"1.0\"?>")).toBe("html");
+	});
+
+	it("should detect python", () => {
+		expect(getContentExtension("```python\nprint('hello')\n```")).toBe("py");
+	});
+
+	it("should detect rust", () => {
+		expect(getContentExtension("```rust\nfn main() {}\n```")).toBe("rs");
+	});
+});

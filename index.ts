@@ -151,20 +151,99 @@ function splitMessagePreservingCodeBlocks(text: string, maxLength: number): stri
 }
 
 /**
+ * Detect content type and determine appropriate file extension.
+ */
+function getContentExtension(text: string, type?: string): string {
+	// Check for code block language hints
+	const codeBlockMatch = text.match(/```(\w+)/);
+	if (codeBlockMatch) {
+		const lang = codeBlockMatch[1].toLowerCase();
+		const langMap: Record<string, string> = {
+			js: "js",
+			javascript: "js",
+			ts: "ts",
+			typescript: "ts",
+			json: "json",
+			python: "py",
+			py: "py",
+			rust: "rs",
+			rs: "rs",
+			go: "go",
+			bash: "sh",
+			sh: "sh",
+			shell: "sh",
+			zsh: "sh",
+			toml: "toml",
+			yaml: "yaml",
+			yml: "yaml",
+			xml: "xml",
+			html: "html",
+			css: "css",
+			sql: "sql",
+			md: "md",
+			markdown: "md",
+		};
+		if (langMap[lang]) {
+			return langMap[lang];
+		}
+	}
+
+	// Check for git diff output
+	if (text.includes("diff --git") || text.startsWith("diff ") || text.match(/^--- |^\+\+\+ /m)) {
+		return "diff";
+	}
+
+	// Check for git patch
+	if (text.match(/^From [a-f0-9]+ /m) || text.includes("--- a/") || text.includes("--- a\\")) {
+		return "patch";
+	}
+
+	// Check for JSON
+	const trimmed = text.trim();
+	if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+		return "json";
+	}
+	if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+		return "json";
+	}
+
+	// Check for HTML/XML
+	if (trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html") || trimmed.startsWith("<?xml")) {
+		return "html";
+	}
+
+	// Check for log files
+	if (type === "tool" && text.includes("command")) {
+		return "sh";
+	}
+
+	// Default to txt for plain text output
+	return "txt";
+}
+
+/**
  * Upload text content as a Discord attachment file.
  */
 async function uploadAsFile(
 	channel: DMChannel | TextChannel | NewsChannel,
 	text: string,
-	filename: string = "output.txt"
+	filename: string = "output.txt",
+	type?: string
 ): Promise<Message | null> {
 	try {
-		const buffer = Buffer.from(text, "utf-8");
-		const { AttachmentBuilder } = await import("discord.js");
-		const attachment = new AttachmentBuilder(buffer, { name: filename });
+		// Determine appropriate extension based on content
+		const ext = getContentExtension(text, type);
+		const finalFilename = filename.replace(/\.[^.]+$/, `.${ext}`);
 
-		log(`[${channel.id}] Uploading as file: ${filename} (${text.length} chars)`);
-		const msg = await channel.send({ attachments: [attachment] });
+		log(`[${channel.id}] Uploading as file: ${finalFilename} (${text.length} chars)`);
+		// Use files array format for discord.js
+		const msg = await channel.send({
+			content: "📎 Output attached",
+			files: [{
+				attachment: Buffer.from(text, "utf-8"),
+				name: finalFilename,
+			}],
+		});
 		log(`[${channel.id}] File uploaded successfully: ${msg.id}`);
 		return msg;
 	} catch (error) {
@@ -192,7 +271,7 @@ async function sendToDiscord(
 	// For very long messages, upload as a file instead of splitting
 	if (text.length > FILE_UPLOAD_THRESHOLD) {
 		log(`[${channel.id}] Message exceeds ${FILE_UPLOAD_THRESHOLD} chars, uploading as file`);
-		const msg = await uploadAsFile(channel, text, "output.txt");
+		const msg = await uploadAsFile(channel, text, "output.txt", options?.type);
 		if (msg) {
 			// Track the file message if needed
 			if (options?.trackInSession) {
@@ -618,7 +697,11 @@ async function main() {
 				}
 			} catch (error) {
 				console.error(`[${channelId}] Bash error:`, error);
-				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Bash error: ${error}`);
+				// Truncate error message to avoid exceeding Discord's limit
+				const errorStr = String(error);
+				const truncatedError = errorStr.length > 1800 ? errorStr.substring(0, 1800) + "... (truncated)" : errorStr;
+				const errorMessage = `❌ Bash error: ${truncatedError}`;
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, errorMessage);
 			} finally {
 				typingManager.hide(channelId);
 			}
