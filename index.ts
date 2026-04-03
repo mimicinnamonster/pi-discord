@@ -747,6 +747,14 @@ async function main() {
 			return;
 		}
 
+		// Handle /new command - start a new session (no confirmation)
+		if (message.content === "/new") {
+			log(`[${channelId}] Starting new session`);
+			sessionStore.reset(channelId);
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Started new session. What would you like to work on?");
+			return;
+		}
+
 		// Send user message to pi agent
 		try {
 			await session.sendUserMessage(message.content);

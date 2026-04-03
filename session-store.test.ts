@@ -121,6 +121,73 @@ describe("SessionStore", () => {
 			expect(store.has("any-channel")).toBe(false);
 		});
 	});
+
+	describe("Session Reset", () => {
+		it("should reset session messages when reset is called", async () => {
+			const channelId = "reset-test-channel";
+
+			// Create a session and add messages
+			const discordSession = await store.getOrCreate(channelId);
+			const { session } = discordSession;
+
+			// Verify we have a session
+			expect(session).toBeDefined();
+
+			// Simulate adding messages (in real code this happens via session.prompt)
+			session.messages.push(
+				{ role: "user", content: "Hello" } as any,
+				{ role: "assistant", content: "Hi there" } as any
+			);
+
+			// Verify messages were added
+			expect(session.messages.length).toBeGreaterThan(0);
+
+			// Call reset
+			store.reset(channelId);
+
+			// Verify messages were cleared
+			expect(session.messages.length).toBe(0);
+		});
+
+		it("should update lastActivity when reset is called", async () => {
+			const channelId = "reset-activity-channel";
+
+			// Create a session
+			const discordSession = await store.getOrCreate(channelId);
+			const afterCreate = discordSession.lastActivity;
+
+			// Wait a tiny bit to ensure time passes
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			// Capture time before reset
+			const beforeReset = Date.now();
+
+			// Reset the session
+			store.reset(channelId);
+
+			// Verify lastActivity was updated to a time >= beforeReset
+			expect(discordSession.lastActivity).toBeGreaterThanOrEqual(beforeReset);
+		});
+
+		it("should not throw when resetting non-existent session", () => {
+			// Should not throw even if channel doesn't exist
+			expect(() => store.reset("non-existent-channel")).not.toThrow();
+		});
+
+		it("should keep session in memory after reset", async () => {
+			const channelId = "reset-memory-channel";
+
+			// Create a session
+			await store.getOrCreate(channelId);
+			expect(store.has(channelId)).toBe(true);
+
+			// Reset
+			store.reset(channelId);
+
+			// Session should still be in memory
+			expect(store.has(channelId)).toBe(true);
+		});
+	});
 });
 
 describe("Concurrent Session Creation", () => {

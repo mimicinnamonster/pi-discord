@@ -273,6 +273,18 @@ export class SessionStore {
 	sessionExists(channelId: string): boolean {
 		return existsSync(this.getSessionPath(channelId));
 	}
+
+	// Reset a session (clear messages, start fresh)
+	reset(channelId: string): void {
+		const discordSession = this.sessions.get(channelId);
+		if (discordSession) {
+			this.log(`[${channelId}] Resetting session`);
+			// Clear messages array using splice (can't assign to readonly messages property)
+			discordSession.session.messages.splice(0, discordSession.session.messages.length);
+			// Update last activity
+			this.touch(channelId);
+		}
+	}
 }
 
 // ============================================================================

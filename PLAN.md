@@ -11,6 +11,26 @@ Enable slash commands from Discord to work with pi agent, without needing to add
 - Built-in commands are intercepted BEFORE `session.prompt()` is called
 - Extension commands are handled inside `session.prompt()` via `_tryExecuteExtensionCommand()`
 
+---
+
+## ✅ COMPLETED FEATURES
+
+| Feature | Implementation | Notes |
+|---------|---------------|-------|
+| Bash `!command` | `index.ts` | Run bash command, include in context |
+| Bash `!!command` | `index.ts` | Run bash command, exclude from context |
+| `/session` | `index.ts` | Shows stats, tokens, cost, message counts |
+| Session persistence | `session-store.ts` | Sessions persist across restarts |
+| Typing indicators | `typing-manager.ts` | Shows "typing..." in Discord |
+| Message deletion sync | `index.ts` | Discord delete → session delete |
+| Bulk deletion | `index.ts` | Handles `messageDeleteBulk` event |
+| Long message handling | `index.ts` | Auto-uploads as file when >2000 chars |
+| Code block splitting | `index.ts` | Preserves code blocks when splitting |
+| Message interruption | `index.ts` | New message aborts current operation |
+| Automatic reconnection | `index.ts` | Reconnects on disconnect |
+
+---
+
 ## Key Findings
 
 ### Built-in Commands List
@@ -25,8 +45,8 @@ Enable slash commands from Discord to work with pi agent, without needing to add
 | `/session` | Session | Show session info | ✅ Easy |
 | `/fork` | Session | Create fork from message | ⚠️ Complex |
 | `/tree` | Session | Navigate session tree | ⚠️ Complex |
-| `/new` | Session | Start new session | ✅ Easy |
-| `/compact [instructions]` | Maintenance | Manually compact context | ✅ Events |
+| `/new` | Session | Start new session | ✅ Done |
+| `/compact [instructions]` | Maintenance | Manually compact context | ✅ Easy |
 | `/reload` | Maintenance | Reload extensions/skills/themes | ✅ Easy |
 | `/debug` | Maintenance | Write debug log | ✅ Easy |
 | `/quit` | Meta | Quit pi | ❌ Skip |
@@ -38,8 +58,8 @@ Enable slash commands from Discord to work with pi agent, without needing to add
 | `/hotkeys` | Info | Show keyboard shortcuts | ❌ Skip |
 | `/name [name]` | Settings | Set session display name | ❌ Skip |
 | `/arminsayshi` | Easter Egg | Easter egg | ❌ Skip |
-| `!command` | Bash | Run bash command | ⚠️ Needs implementation |
-| `!!command` | Bash | Run bash (excluded from context) | ⚠️ Needs implementation |
+| `!command` | Bash | Run bash command | ✅ Implemented |
+| `!!command` | Bash | Run bash (excluded from context) | ✅ Implemented |
 
 ### Session Display Name
 - `/name` sets session display name
@@ -59,7 +79,7 @@ Enable slash commands from Discord to work with pi agent, without needing to add
 
 ### Session API Available
 ```typescript
-session.getSessionStats()      // For /session
+session.getSessionStats()      // For /session ✅ Done
 session.compact()             // For /compact - emits events
 session.reload()              // For /reload
 session.exportToHtml()        // For /export
@@ -90,40 +110,33 @@ session.newSession()          // For /new
 | 3 seconds to respond to interaction | Long operations need deferred responses |
 | Buttons can't be dynamically added | Pagination tricky |
 
-## Command Feasibility
+---
 
-### Easy (Simple output)
+## REMAINING WORK
+
+### Easy (Simple output) - Priority 1
 | Command | Discord Approach | Notes |
 |---------|----------------|--------|
-| `/session` | Plain text with stats | ✅ Makes sense |
-| `/copy` | Plain text status | ✅ Makes sense |
-| `/export [x]` | Plain text with path | ✅ Makes sense |
-| `/debug` | Plain text status | ✅ Makes sense |
-
-### Not Applicable (Skip)
-| Command | Reason |
-|---------|--------|
-| `/name` | Session display name not visible in Discord |
-| `/changelog` | No terminal/UI to display changelog |
-| `/hotkeys` | No keyboard shortcuts in Discord |
-| Easter egg | Doesn't make sense in Discord |
+| `/copy` | Plain text status | Copy last assistant message |
+| `/export [x]` | Plain text with path | Export to HTML/JSONL |
+| `/debug` | Plain text status | Write debug log |
+| `/reload` | Plain text status | Reload extensions |
+| `/new` | Plain text confirmation | Start new session ✅ |
+| `/compact [instructions]` | Events + typing | Manual compaction |
 
 ### Medium (Events + simple UI)
 | Command | Discord Approach |
 |---------|----------------|
-| `/compact [instructions]` | Events + typing indicator |
-| `/reload` | Plain text status |
-| `/new` | Plain text confirmation |
+| `/import [path]` | Button confirm |
+| `/share` | Button confirm |
 
-### Complex (Full UI needed)
+### Complex (Full UI needed) - Priority 2
 | Command | Discord Approach | Challenge |
 |---------|----------------|-----------|
 | `/model [search]` | Select menu | May exceed 25 options |
 | `/settings` | Buttons + selects | Many settings, pagination |
 | `/fork` | Select menu | May need pagination |
 | `/tree` | Select menu | May need pagination |
-| `/import [path]` | Button confirm | Simple |
-| `/share` | Button confirm | Simple |
 
 ### Not Applicable (Skip)
 | Command | Reason |
@@ -138,32 +151,40 @@ session.newSession()          // For /new
 | `/name` | Session display name not visible |
 | Easter egg | Doesn't make sense in Discord |
 
+---
+
 ## Events Available (already handled)
 - `compaction_start` / `compaction_end` - for `/compact`
 - `agent_start` / `agent_end` - for general state
 - `message_start` / `message_end` - for streaming
 
+---
+
 ## Recommended Implementation Order
 
-1. **Phase 1: Bash commands**
-   - `!command` - Run bash command
-   - `!!command` - Run bash (excluded from context)
+1. **Phase 1: ✅ Done** Bash commands
+   - `!command` - Run bash command ✅
+   - `!!command` - Run bash (excluded from context) ✅
 
-2. **Phase 2: Easy commands** (Simple text output)
-   - `/session`, `/copy`, `/export`, `/reload`, `/new`
+2. **Phase 2: ✅ Done** Easy commands (Simple text output)
+   - `/session` ✅
+   - `/new` ✅
+   - Other easy commands still pending: `/copy`, `/export`, `/reload`, `/compact`, `/debug`
 
-3. **Phase 3: Event-based** 
-   - `/compact` - already works via events
+3. **Phase 3: Pending** Event-based 
+   - `/compact` - needs integration
 
-4. **Phase 4: Simple UI**
+4. **Phase 4: Pending** Simple UI
    - `/import` - button confirm
    - `/share` - button confirm
 
-5. **Phase 5: Complex UI (optional)**
+5. **Phase 5: Optional** Complex UI
    - `/model` - only if feasible
    - `/settings` - only if feasible
    - `/fork` - only if feasible
    - `/tree` - only if feasible
+
+---
 
 ## Questions/Open Items
 - [ ] How to handle commands that need OAuth flow?

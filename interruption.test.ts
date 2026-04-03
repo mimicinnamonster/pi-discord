@@ -733,3 +733,26 @@ describe("Content extension detection", () => {
 		expect(getContentExtension("```rust\nfn main() {}\n```")).toBe("rs");
 	});
 });
+
+describe("New Session command parsing", () => {
+	it("should detect /new command", () => {
+		const content = "/new";
+		const isNew = content === "/new";
+
+		expect(isNew).toBe(true);
+	});
+
+	it("should not match /new with args", () => {
+		const content = "/new extra";
+		const isNew = content === "/new";
+
+		expect(isNew).toBe(false);
+	});
+
+	it("should not match partial commands", () => {
+		const content = "/newer";
+		const isNew = content === "/new";
+
+		expect(isNew).toBe(false);
+	});
+});
