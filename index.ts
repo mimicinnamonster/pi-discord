@@ -169,8 +169,14 @@ async function sendToDiscord(
 	// Send chunks sequentially to preserve order
 	for (const chunk of chunks) {
 		log(`[${channel.id}] Actually sending chunk: "${chunk}"`);
-		const msg = await channel.send(chunk);
-		sentMessages.push(msg);
+		try {
+			const msg = await channel.send(chunk);
+			log(`[${channel.id}] Message sent successfully: ${msg.id}`);
+			sentMessages.push(msg);
+		} catch (sendError) {
+			log(`[${channel.id}] ERROR sending message: ${sendError}`);
+			throw sendError; // Re-throw so callers can handle
+		}
 
 		// Track Discord message ID for session deletion handling
 		if (options?.trackInSession) {
@@ -565,6 +571,45 @@ async function main() {
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Bash error: ${error}`);
 			} finally {
 				typingManager.hide(channelId);
+			}
+			return;
+		}
+
+		// Handle /session command
+		if (message.content === "/session") {
+			try {
+				const stats = session.getSessionStats();
+				const sessionName = session.sessionName;
+
+				let info = "**Session Info**\n\n";
+				if (sessionName) {
+					info += `**Name:** ${sessionName}\n`;
+				}
+				info += `**File:** ${stats.sessionFile ?? "In-memory"}\n`;
+				info += `**ID:** ${stats.sessionId}\n\n`;
+
+				info += "**Messages**\n";
+				info += `User: ${stats.userMessages}\n`;
+				info += `Assistant: ${stats.assistantMessages}\n`;
+				info += `Tool Calls: ${stats.toolCalls}\n`;
+				info += `Tool Results: ${stats.toolResults}\n`;
+				info += `Total: ${stats.totalMessages}\n\n`;
+
+				info += "**Tokens**\n";
+				info += `Input: ${stats.tokens.input.toLocaleString()}\n`;
+				info += `Output: ${stats.tokens.output.toLocaleString()}\n`;
+				info += `Cache Read: ${stats.tokens.cacheRead.toLocaleString()}\n`;
+				info += `Cache Write: ${stats.tokens.cacheWrite.toLocaleString()}\n`;
+				info += `Total: ${stats.tokens.total.toLocaleString()}\n`;
+
+				if (stats.cost > 0) {
+					info += `\n**Cost:** $${stats.cost.toFixed(4)}\n`;
+				}
+
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, info);
+			} catch (error) {
+				console.error(`[${channelId}] /session error:`, error);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Error getting session info: ${error}`);
 			}
 			return;
 		}

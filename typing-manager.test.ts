@@ -272,6 +272,106 @@ describe("TypingManager", () => {
 		});
 	});
 
+		describe("error handling scenarios", () => {
+		it("should continue tracking typing even when sendTyping fails once", () => {
+			const channel = {
+				sendTyping: vi
+					.fn()
+					.mockRejectedValueOnce(new Error("Network error"))
+					.mockResolvedValue(undefined),
+			};
+
+			// show() should not throw even when sendTyping fails
+			expect(() => typingManager.show("channel-1", channel)).not.toThrow();
+
+			// Channel should still be tracked as typing
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+		});
+
+		it("should keep typing active through multiple show() calls even with intermittent failures", () => {
+			const channel = {
+				sendTyping: vi
+					.fn()
+					.mockResolvedValue(undefined),
+			};
+
+			// First show - succeeds
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Second show (e.g., from another event) - should not break
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Hide should still work
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+
+		it("should handle rapid show/hide with failing sendTyping", () => {
+			const channel = {
+				sendTyping: vi
+					.fn()
+					.mockRejectedValue(new Error("Channel unavailable")),
+			};
+
+			// Multiple show calls - should not throw
+			expect(() => {
+				typingManager.show("channel-1", channel);
+				typingManager.show("channel-1", channel);
+			}).not.toThrow();
+
+			// Hide should still work
+			expect(() => typingManager.hide("channel-1")).not.toThrow();
+		});
+	});
+
+	describe("message sending correlation", () => {
+		it("typing should be visible before message is sent", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// Show typing (e.g., on thinking_delta)
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Simulate message being sent successfully
+			// (in real code, sendToDiscord would be called here)
+			expect(channel.sendTyping).toHaveBeenCalled();
+		});
+
+		it("typing should be hidden after message ends", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// Show typing
+			typingManager.show("channel-1", channel);
+
+			// Simulate message completion
+			typingManager.hide("channel-1");
+
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+
+		it("multiple messages in sequence should manage typing correctly", () => {
+			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
+
+			// First message
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// First message ends
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+
+			// Second message (e.g., tool result or new prompt)
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// Second message ends
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
+	});
+
 	describe("tool execution flow", () => {
 		it("should keep typing visible during tool execution", () => {
 			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };

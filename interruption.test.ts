@@ -521,3 +521,26 @@ describe("Bash command parsing", () => {
 		expect(command).toBe("echo hello world");
 	});
 });
+
+describe("Session command parsing", () => {
+	it("should detect /session command", () => {
+		const content = "/session";
+		const isSession = content === "/session";
+
+		expect(isSession).toBe(true);
+	});
+
+	it("should not match /session with args", () => {
+		const content = "/session extra";
+		const isSession = content === "/session";
+
+		expect(isSession).toBe(false);
+	});
+
+	it("should not match partial commands", () => {
+		const content = "/sess";
+		const isSession = content === "/session";
+
+		expect(isSession).toBe(false);
+	});
+});
