@@ -150,6 +150,36 @@ function splitMessagePreservingCodeBlocks(text: string, maxLength: number): stri
 	return chunks;
 }
 
+/**
+ * Upload text content as a Discord attachment file.
+ */
+async function uploadAsFile(
+	channel: DMChannel | TextChannel | NewsChannel,
+	text: string,
+	filename: string = "output.txt"
+): Promise<Message | null> {
+	try {
+		const buffer = Buffer.from(text, "utf-8");
+		const { AttachmentBuilder } = await import("discord.js");
+		const attachment = new AttachmentBuilder(buffer, { name: filename });
+
+		log(`[${channel.id}] Uploading as file: ${filename} (${text.length} chars)`);
+		const msg = await channel.send({ attachments: [attachment] });
+		log(`[${channel.id}] File uploaded successfully: ${msg.id}`);
+		return msg;
+	} catch (error) {
+		log(`[${channel.id}] ERROR uploading file: ${error}`);
+		return null;
+	}
+}
+
+/**
+ * Threshold for uploading as file instead of splitting.
+ * Discord has a 2000 char limit, but files can be up to 25MB.
+ * We use a threshold of 4000 chars to avoid awkward splitting near the limit.
+ */
+const FILE_UPLOAD_THRESHOLD = 4000;
+
 async function sendToDiscord(
 	channel: DMChannel | TextChannel | NewsChannel,
 	text: string,
@@ -157,7 +187,27 @@ async function sendToDiscord(
 ): Promise<Message[]> {
 	if (!text.trim()) return [];
 
-	log(`[${channel.id}] sendToDiscord called with: "${text}" (${text.length} chars)`);
+	log(`[${channel.id}] sendToDiscord called with: "${text.substring(0, 100)}" (${text.length} chars)`);
+
+	// For very long messages, upload as a file instead of splitting
+	if (text.length > FILE_UPLOAD_THRESHOLD) {
+		log(`[${channel.id}] Message exceeds ${FILE_UPLOAD_THRESHOLD} chars, uploading as file`);
+		const msg = await uploadAsFile(channel, text, "output.txt");
+		if (msg) {
+			// Track the file message if needed
+			if (options?.trackInSession) {
+				if (!discordMessageToSession.has(channel.id)) {
+					discordMessageToSession.set(channel.id, new Map());
+				}
+				const channelMap = discordMessageToSession.get(channel.id)!;
+				const currentIndex = sessionMessageIndex.get(channel.id) ?? 0;
+				channelMap.set(msg.id, { sessionIndex: currentIndex, type: options.type ?? "unknown" });
+			}
+			return [msg];
+		}
+		// If upload failed, fall back to splitting
+		log(`[${channel.id}] File upload failed, falling back to splitting`);
+	}
 
 	const maxLength = 2000;
 	const chunks = splitMessagePreservingCodeBlocks(text, maxLength);
@@ -168,7 +218,7 @@ async function sendToDiscord(
 
 	// Send chunks sequentially to preserve order
 	for (const chunk of chunks) {
-		log(`[${channel.id}] Actually sending chunk: "${chunk}"`);
+		log(`[${channel.id}] Actually sending chunk: "${chunk.substring(0, 50)}..."`);
 		try {
 			const msg = await channel.send(chunk);
 			log(`[${channel.id}] Message sent successfully: ${msg.id}`);

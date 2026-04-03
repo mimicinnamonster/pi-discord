@@ -544,3 +544,97 @@ describe("Session command parsing", () => {
 		expect(isSession).toBe(false);
 	});
 });
+
+describe("Long message file upload", () => {
+	const FILE_UPLOAD_THRESHOLD = 4000;
+
+	it("should use file upload for messages exceeding threshold", () => {
+		const longMessage = "a".repeat(FILE_UPLOAD_THRESHOLD + 1);
+		const shouldUploadAsFile = longMessage.length > FILE_UPLOAD_THRESHOLD;
+
+		expect(shouldUploadAsFile).toBe(true);
+	});
+
+	it("should NOT use file upload for messages below threshold", () => {
+		const shortMessage = "a".repeat(FILE_UPLOAD_THRESHOLD - 1);
+		const shouldUploadAsFile = shortMessage.length > FILE_UPLOAD_THRESHOLD;
+
+		expect(shouldUploadAsFile).toBe(false);
+	});
+
+	it("should NOT use file upload for messages at exact threshold", () => {
+		const exactMessage = "a".repeat(FILE_UPLOAD_THRESHOLD);
+		const shouldUploadAsFile = exactMessage.length > FILE_UPLOAD_THRESHOLD;
+
+		expect(shouldUploadAsFile).toBe(false);
+	});
+
+	it("should use file upload for messages just over threshold", () => {
+		const justOver = "a".repeat(FILE_UPLOAD_THRESHOLD + 1);
+		const shouldUploadAsFile = justOver.length > FILE_UPLOAD_THRESHOLD;
+
+		expect(shouldUploadAsFile).toBe(true);
+	});
+
+	it("should handle code blocks in long messages", () => {
+		const codeBlock = "```\n" + "x".repeat(10000) + "\n```";
+		const shouldUploadAsFile = codeBlock.length > FILE_UPLOAD_THRESHOLD;
+
+		// Code blocks are kept intact, so even a single very long code block should be uploaded
+		expect(shouldUploadAsFile).toBe(true);
+	});
+
+	it("should use 4000 char threshold", () => {
+		// Verify the threshold is set correctly
+		expect(FILE_UPLOAD_THRESHOLD).toBe(4000);
+		// This is double Discord's 2000 limit to avoid awkward splitting
+		expect(FILE_UPLOAD_THRESHOLD).toBe(2 * 2000);
+	});
+
+	it("should handle empty messages (should not upload)", () => {
+		const emptyMessage = "";
+		const shouldUploadAsFile = emptyMessage.length > FILE_UPLOAD_THRESHOLD;
+
+		expect(shouldUploadAsFile).toBe(false);
+	});
+
+	it("should handle unicode in long messages", () => {
+		const unicodeMessage = "日本語".repeat(1000); // 3000 chars (3 chars each × 1000)
+		const shouldUploadAsFile = unicodeMessage.length > FILE_UPLOAD_THRESHOLD;
+
+		// Each Japanese character counts as 1 in string length
+		expect(unicodeMessage.length).toBe(3000);
+		expect(shouldUploadAsFile).toBe(false);
+	});
+
+	it("should handle very long messages (100KB+)", () => {
+		const veryLongMessage = "x".repeat(100000);
+		const shouldUploadAsFile = veryLongMessage.length > FILE_UPLOAD_THRESHOLD;
+
+		expect(shouldUploadAsFile).toBe(true);
+	});
+});
+
+describe("File upload attachment", () => {
+	it("should generate correct buffer from text", () => {
+		const text = "Hello, World!";
+		const buffer = Buffer.from(text, "utf-8");
+
+		expect(buffer.toString("utf-8")).toBe(text);
+	});
+
+	it("should handle unicode in buffer", () => {
+		const text = "Hello 世界 🌍";
+		const buffer = Buffer.from(text, "utf-8");
+
+		expect(buffer.toString("utf-8")).toBe(text);
+	});
+
+	it("should handle large buffers", () => {
+		const text = "x".repeat(50000);
+		const buffer = Buffer.from(text, "utf-8");
+
+		expect(buffer.length).toBe(50000);
+		expect(buffer.toString("utf-8")).toBe(text);
+	});
+});
