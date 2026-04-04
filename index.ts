@@ -6,6 +6,7 @@
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
 import { SessionStore, createSessionStore, type DiscordSession } from "./session-store";
 import { TypingManager } from "./typing-manager";
+import { getModel } from "@mariozechner/pi-ai";
 import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
@@ -154,40 +155,6 @@ function splitMessagePreservingCodeBlocks(text: string, maxLength: number): stri
  * Detect content type and determine appropriate file extension.
  */
 function getContentExtension(text: string, type?: string): string {
-	// Check for code block language hints
-	const codeBlockMatch = text.match(/```(\w+)/);
-	if (codeBlockMatch) {
-		const lang = codeBlockMatch[1].toLowerCase();
-		const langMap: Record<string, string> = {
-			js: "js",
-			javascript: "js",
-			ts: "ts",
-			typescript: "ts",
-			json: "json",
-			python: "py",
-			py: "py",
-			rust: "rs",
-			rs: "rs",
-			go: "go",
-			bash: "sh",
-			sh: "sh",
-			shell: "sh",
-			zsh: "sh",
-			toml: "toml",
-			yaml: "yaml",
-			yml: "yaml",
-			xml: "xml",
-			html: "html",
-			css: "css",
-			sql: "sql",
-			md: "md",
-			markdown: "md",
-		};
-		if (langMap[lang]) {
-			return langMap[lang];
-		}
-	}
-
 	// Check for git diff output
 	if (text.includes("diff --git") || text.startsWith("diff ") || text.match(/^--- |^\+\+\+ /m)) {
 		return "diff";
@@ -218,7 +185,7 @@ function getContentExtension(text: string, type?: string): string {
 	}
 
 	// Default to txt for plain text output
-	return "txt";
+	return "md";
 }
 
 /**
@@ -752,6 +719,51 @@ async function main() {
 			log(`[${channelId}] Starting new session`);
 			sessionStore.reset(channelId);
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Started new session. What would you like to work on?");
+			return;
+		}
+
+		// Handle /reload command - reload extensions/skills/themes
+		if (message.content === "/reload") {
+			log(`[${channelId}] Reloading extensions`);
+			try {
+				await session.reload();
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Extensions, skills, and themes reloaded.");
+			} catch (error) {
+				console.error(`[${channelId}] /reload error:`, error);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Reload failed: ${error}`);
+			}
+			return;
+		}
+
+		if (message.content === "/models") {
+			const available = await session.modelRegistry.getAvailable();
+			const availableJson = escapeForCodeBlock(JSON.stringify(available, null, 2));
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Models:\n\`\`\`json\n${availableJson}\n\`\`\``);
+			return;
+		}
+
+		if (message.content === "/model") {
+			const modelData = escapeForCodeBlock(JSON.stringify(session.model, null, 2));
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Model data:\n\`\`\`json\n${modelData}\n\`\`\``);
+			return;
+		}
+
+		if (message.content.startsWith("/model ")) {
+			const [provider, model] = message.content.replace('/model ', '').split('/');	
+			try {
+				await session.setModel(getModel(provider, model));
+				const modelData = escapeForCodeBlock(JSON.stringify(session.model, null, 2));
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Changed model:\n\`\`\`json\n${modelData}\n\`\`\``);
+			} catch (error) {
+				console.error(`[${channelId}] Error setting model "${provider}/${model}":`, error);
+				try {
+					await (channel as DMChannel | TextChannel | NewsChannel).send(
+						`❌ Sorry, I encountered an error while setting your model "${provider}/${model}".\n\`\`\`json\n${error}\`\`\``
+					);
+				} catch {
+					// Channel might be unavailable
+				}
+			}
 			return;
 		}
 

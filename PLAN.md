@@ -47,7 +47,7 @@ Enable slash commands from Discord to work with pi agent, without needing to add
 | `/tree` | Session | Navigate session tree | ⚠️ Complex |
 | `/new` | Session | Start new session | ✅ Done |
 | `/compact [instructions]` | Maintenance | Manually compact context | ✅ Easy |
-| `/reload` | Maintenance | Reload extensions/skills/themes | ✅ Easy |
+| `/reload` | Maintenance | Reload extensions/skills/themes | ✅ Done |
 | `/debug` | Maintenance | Write debug log | ✅ Easy |
 | `/quit` | Meta | Quit pi | ❌ Skip |
 | `/login` | Auth | OAuth login | ❌ Skip |
@@ -169,7 +169,7 @@ session.newSession()          // For /new
 2. **Phase 2: ✅ Done** Easy commands (Simple text output)
    - `/session` ✅
    - `/new` ✅
-   - Other easy commands still pending: `/copy`, `/export`, `/reload`, `/compact`, `/debug`
+   - Other easy commands still pending: `/copy`, `/export`, `/compact`, `/debug`
 
 3. **Phase 3: Pending** Event-based 
    - `/compact` - needs integration

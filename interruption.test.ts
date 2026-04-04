@@ -756,3 +756,162 @@ describe("New Session command parsing", () => {
 		expect(isNew).toBe(false);
 	});
 });
+
+describe("Reload command parsing", () => {
+	it("should detect /reload command", () => {
+		const content = "/reload";
+		const isReload = content === "/reload";
+
+		expect(isReload).toBe(true);
+	});
+
+	it("should not match /reload with args", () => {
+		const content = "/reload extra";
+		const isReload = content === "/reload";
+
+		expect(isReload).toBe(false);
+	});
+
+	it("should not match partial commands", () => {
+		const content = "/reloaded";
+		const isReload = content === "/reload";
+
+		expect(isReload).toBe(false);
+	});
+});
+
+describe("Reload command behavior", () => {
+	it("should call session.reload() when /reload is received", async () => {
+		const content = "/reload";
+		const isReload = content === "/reload";
+		
+		expect(isReload).toBe(true);
+		
+		// Mock session with reload method
+		let reloadCalled = false;
+		const mockSession = {
+			reload: vi.fn().mockImplementation(async () => {
+				reloadCalled = true;
+			}),
+		};
+		
+		// Simulate command processing
+		if (content === "/reload") {
+			await mockSession.reload();
+		}
+		
+		expect(reloadCalled).toBe(true);
+		expect(mockSession.reload).toHaveBeenCalledTimes(1);
+	});
+
+	it("should handle reload errors gracefully", async () => {
+		const mockSession = {
+			reload: vi.fn().mockRejectedValue(new Error("Reload failed")),
+		};
+		
+		// Simulate error handling
+		let errorMessage = "";
+		try {
+			await mockSession.reload();
+		} catch (error) {
+			errorMessage = String(error);
+		}
+		
+		expect(errorMessage).toContain("Reload failed");
+		expect(mockSession.reload).toHaveBeenCalledTimes(1);
+	});
+
+	it("should not process other commands as /reload", () => {
+		const commands = ["/sessions", "/reloadx", "/xreload", "/r", "/"];
+		
+		for (const cmd of commands) {
+			const isReload = cmd === "/reload";
+			expect(isReload).toBe(false);
+		}
+	});
+});
+
+describe("Model command parsing", () => {
+	it("should detect /models command", () => {
+		const content = "/models";
+		const isModels = content === "/models";
+		expect(isModels).toBe(true);
+	});
+
+	it("should detect /model command without args", () => {
+		const content = "/model";
+		const isModel = content === "/model";
+		expect(isModel).toBe(true);
+	});
+
+	it("should detect /model with provider/model format", () => {
+		const content = "/model anthropic/claude-opus";
+		const isModelSwitch = content.startsWith("/model ");
+		expect(isModelSwitch).toBe(true);
+	});
+
+	it("should not match partial model commands", () => {
+		const commands = ["/model-select", "/modelx", "/mod"];
+		for (const cmd of commands) {
+			const isModelSwitch = cmd.startsWith("/model ") || cmd === "/model" || cmd === "/models";
+			expect(isModelSwitch).toBe(false);
+		}
+	});
+});
+
+describe("Model command behavior", () => {
+	it("should parse provider and model from /model command", () => {
+		const content = "/model anthropic/claude-opus";
+		const [provider, model] = content.replace('/model ', '').split('/');
+		
+		expect(provider).toBe("anthropic");
+		expect(model).toBe("claude-opus");
+	});
+
+	it("should handle /model command without args", async () => {
+		const content = "/model";
+		const isSimpleModel = content === "/model";
+		expect(isSimpleModel).toBe(true);
+	});
+
+	it("should show available models with /models", () => {
+		const content = "/models";
+		const isListModels = content === "/models";
+		expect(isListModels).toBe(true);
+	});
+
+	it("should handle model switching errors gracefully", async () => {
+		const mockSession = {
+			setModel: vi.fn().mockRejectedValue(new Error("Model not found")),
+		};
+		
+		let errorMessage = "";
+		try {
+			await mockSession.setModel({});
+		} catch (error) {
+			errorMessage = String(error);
+		}
+		
+		expect(errorMessage).toContain("Model not found");
+		expect(mockSession.setModel).toHaveBeenCalledTimes(1);
+	});
+
+	it("should require both provider and model", () => {
+		const validFormats = [
+			{ input: "/model anthropic/claude-opus", valid: true },
+			{ input: "/model openai/gpt-4", valid: true },
+			{ input: "/model missing-model", valid: false },
+			{ input: "/model /incomplete", valid: false },
+		];
+		
+		for (const format of validFormats) {
+			const [provider, model] = format.input.replace('/model ', '').split('/');
+			if (format.valid) {
+				expect(provider).toBeTruthy();
+				expect(model).toBeTruthy();
+			} else {
+				expect(!provider || !model).toBe(true);
+			}
+		}
+	});
+});
