@@ -124,16 +124,34 @@ export class SessionStore {
 			sessionManager.setSessionFile(sessionPath);
 		}
 
+		// Load settings and apply overrides
+		const settingsManager = SettingsManager.create(cwd, join(homedir(), ".pi", "agent"));
+		settingsManager.applyOverrides({
+			retry: { enabled: true, maxRetries: 10 },
+		});
+
+    // Load extensions and extension runtime
+    //const extensions = await discoverAndLoadExtensions([], cwd, join(homedir(), ".pi", "agent"));
+    //console.log(extensions);
+
 		// Load or create the session file
-		const { session } = await createAgentSession({
+		const agent = await createAgentSession({
 			cwd,
 			agentDir: join(homedir(), ".pi", "agent"),
 			authStorage,
 			modelRegistry,
 			tools,
 			sessionManager,
-			settingsManager: SettingsManager.create(cwd, join(homedir(), ".pi", "agent")),
+			settingsManager,
 		});
+
+		const { session } = agent
+
+    await session.bindExtensions({});
+
+		if (agent.extensionsResult.errors.length > 0) {
+			this.log(`[${channelId}] extensions results errors: ${agent.extensionsResult.errors.map(it => `${it.error} at ${it.path}`)}`);
+		}
 
 		// Set session name for identification
 		session.setSessionName(`discord-${channelId}`);
@@ -279,8 +297,10 @@ export class SessionStore {
 		const discordSession = this.sessions.get(channelId);
 		if (discordSession) {
 			this.log(`[${channelId}] Resetting session`);
-			// Clear messages array using splice (can't assign to readonly messages property)
-			discordSession.session.messages.splice(0, discordSession.session.messages.length);
+			// Reset both the Agent state (messages) and the session manager (file state)
+			discordSession.session.agent.reset();
+			discordSession.session.sessionManager.newSession();
+
 			// Update last activity
 			this.touch(channelId);
 		}

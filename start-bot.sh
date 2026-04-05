@@ -10,4 +10,4 @@
 # Change to project directory
 cd /Users/michal/Projects/pi-discord
 
-exec ~/.bun/bin/bun run start:debug
+exec bun run dev:debug 2>&1 1> /Users/michal/Projects/pi-discord/logs.txt

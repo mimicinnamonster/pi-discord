@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { SessionStore } from "./session-store";
+import { SessionStore } from "../src/session-store";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";

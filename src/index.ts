@@ -4,12 +4,19 @@
  */
 
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
-import { SessionStore, createSessionStore, type DiscordSession } from "./session-store";
+import { createSessionStore } from "./session-store";
 import { TypingManager } from "./typing-manager";
-import { getModel } from "@mariozechner/pi-ai";
-import type { AgentSession, AgentSessionEvent } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
+import {
+	loadBranchMetadata,
+	saveBranchMetadata,
+	findCommonAncestor,
+	getMessagesBetween,
+	formatMergedMessages,
+} from "./branch-manager";
+import { execSync } from "child_process";
 
 // ============================================================================
 // Configuration
@@ -46,9 +53,6 @@ let discordClient: Client | null = null;
 const sessionStore = createSessionStore({ sessionDir, debug });
 const typingManager = new TypingManager();
 
-// Track sessions that are currently running (to allow interruption)
-const runningSessions = new Set<string>();
-
 // Track Discord message IDs to session entry indices for deletion handling
 // Map structure: channelId -> discordMessageId -> { sessionIndex, type: 'user' | 'assistant' | 'tool' | 'thinking' }
 const discordMessageToSession = new Map<string, Map<string, { sessionIndex: number; type: string }>>();
@@ -56,6 +60,10 @@ const sessionMessageIndex = new Map<string, number>(); // Track current message 
 
 // Track the last thinking message ID per channel for editing
 const lastThinkingMessageId = new Map<string, string>();
+
+// Track pending Discord message IDs being processed (for branch metadata)
+// Map structure: channelId -> discordMessageId
+const pendingDiscordMessages = new Map<string, string>();
 
 /**
  * After deleting a message at index, decrement all tracked indices higher than it.
@@ -229,7 +237,7 @@ const FILE_UPLOAD_THRESHOLD = 2000;
 async function sendToDiscord(
 	channel: DMChannel | TextChannel | NewsChannel,
 	text: string,
-	options?: { trackInSession?: boolean; type?: string }
+	options?: { trackInSession?: boolean; type?: string; replyToMessageId?: string }
 ): Promise<Message[]> {
 	if (!text.trim()) return [];
 
@@ -263,10 +271,15 @@ async function sendToDiscord(
 	const sentMessages: Message[] = [];
 
 	// Send chunks sequentially to preserve order
+	let isFirstChunk = true;
 	for (const chunk of chunks) {
 		log(`[${channel.id}] Actually sending chunk: "${chunk.substring(0, 50)}..."`);
 		try {
-			const msg = await channel.send(chunk);
+			const sendOptions = isFirstChunk && options?.replyToMessageId
+				? { content: chunk, reply: { messageReference: options.replyToMessageId } }
+				: chunk;
+			const msg = await channel.send(sendOptions);
+			isFirstChunk = false;
 			log(`[${channel.id}] Message sent successfully: ${msg.id}`);
 			sentMessages.push(msg);
 
@@ -292,23 +305,36 @@ function subscribeToSession(
 	session: AgentSession,
 	channelId: string,
 	channel: DMChannel | TextChannel | NewsChannel,
-	typingManager: TypingManager
-): void {
+	typingManager: TypingManager,
+	sessionDir: string
+): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
 	const responseBuffer: string[] = [];
 	const thinkingBuffer: string[] = [];
+	let lastUserMessageEntryId: string | undefined;
+	let lastDiscordMessageId: string | undefined;
+	let lastMessageIsReply = false;
+	let pendingDiscordMsgId: string | undefined;
+	let pendingIsReply = false;
+	// Captured at agent_end (synchronous, all messages appended) for use in .then()
+	let capturedAssistantEntryId: string | null = null;
+
 
 	session.subscribe((event: AgentSessionEvent) => {
 		switch (event.type) {
 			case "agent_start":
 				log(`[${channelId}] Agent starting...`);
 				responseBuffer.length = 0;
-				runningSessions.add(channelId);
 				// LLM is processing - show typing indicator
 				typingManager.show(channelId, channel);
 				break;
 
 			case "message_start":
-				if (event.message.role === "assistant") {
+				if (event.message.role === "user") {
+					// Capture pending discord info - entry id captured on message_end when appended
+					lastDiscordMessageId = pendingDiscordMsgId;
+					lastMessageIsReply = pendingIsReply;
+					log(`[${channelId}] User message started, discordMsg=${lastDiscordMessageId}, isReply=${lastMessageIsReply}`);
+				} else if (event.message.role === "assistant") {
 					log(`[${channelId}] Assistant message started`);
 					responseBuffer.length = 0;
 					thinkingBuffer.length = 0;
@@ -345,13 +371,23 @@ function subscribeToSession(
 						sendToDiscord(channel, `💭 Thinking\n\`\`\`\n${escapeForCodeBlock(fullThinking)}\n\`\`\``, { trackInSession: true, type: "thinking" }).catch(() => {});
 					}
 
-					// Note: The response has already been accumulated via text_delta events
-					// into responseBuffer. DO NOT push from event.message.content as that
-					// would duplicate the content (streaming + final content = double).
+					// Send response and collect Discord message IDs to be mapped at agent_end
 					const fullResponse = responseBuffer.join("");
 					if (fullResponse.trim()) {
 						log(`[${channelId}] Sending response (${fullResponse.length} chars)`);
-						sendToDiscord(channel, fullResponse, { trackInSession: true, type: "response" }).catch((error) => {
+						const replyToId = lastMessageIsReply ? lastDiscordMessageId : undefined;
+						sendToDiscord(channel, fullResponse, { trackInSession: true, type: "response", replyToMessageId: replyToId }).then((msgs) => {
+							// Use capturedAssistantEntryId set at agent_end (synchronous before this .then())
+							const assistantEntryId = capturedAssistantEntryId;
+							if (assistantEntryId && msgs.length > 0) {
+								const metadata = loadBranchMetadata(sessionDir, channelId);
+								for (const msg of msgs) {
+									metadata.discordMsgToPiEntryId.set(msg.id, assistantEntryId);
+									log(`[${channelId}] Tracked bot response ${msg.id} → Pi entry ${assistantEntryId}`);
+								}
+								saveBranchMetadata(sessionDir, channelId, metadata);
+							}
+						}).catch((error) => {
 							console.error(`[${channelId}] Failed to send response:`, error);
 						});
 					}
@@ -382,35 +418,54 @@ function subscribeToSession(
 			case "tool_execution_end":
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
 				if (event.isError) {
-					sendToDiscord(channel, "⚠️ Tool execution failed", { trackInSession: true, type: "tool-error" }).catch(() => {});
+				const result = escapeForCodeBlock(JSON.stringify(event.result, null, 2));
+					sendToDiscord(channel, `⚠️ Tool execution failed\n\`\`\`json\n${result}\n\`\`\``, { trackInSession: true, type: "tool-error" }).catch(() => {});
+					// Keep typing indicator visible during tool execution
 				}
 				break;
 
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
-				runningSessions.delete(channelId);
 				// Ensure typing is hidden (defensive, normally message_end handles this)
 				typingManager.hide(channelId);
+				// Capture assistant entry NOW (synchronous, all messages appended)
+				// The .then() callback will use this to track bot response Discord msg IDs
+				capturedAssistantEntryId = session.sessionManager.getLeafId();
 				break;
 
 			case "compaction_start":
+				typingManager.show(channelId, channel);
 				log(`[${channelId}] Compacting context...`);
 				sendToDiscord(channel, "📦 Compacting context...").catch(() => {});
 				break;
 
 			case "compaction_end":
+				typingManager.hide(channelId);
 				log(`[${channelId}] Compaction complete`);
 				break;
 
 			case "auto_retry_start":
+				typingManager.show(channelId, channel);
 				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts})`);
+				sendToDiscord(channel, `⚠️ Retrying (attempt ${event.attempt}/${event.maxAttempts})...`).catch(() => {});
 				break;
 
 			case "auto_retry_end":
+				typingManager.hide(channelId);
 				log(`[${channelId}] Retry ${event.success ? "succeeded" : "failed"}`);
+        if (!event.success) {
+          sendToDiscord(channel, "🛑 Retry failed...").catch(() => {});
+        }
 				break;
 		}
 	});
+
+	return {
+		setPendingDiscordMessageId: (id: string, isReply: boolean) => {
+			pendingDiscordMsgId = id;
+			pendingIsReply = isReply;
+		},
+	};
 }
 
 // ============================================================================
@@ -496,7 +551,22 @@ async function main() {
 
 		log(`[${channelId}] Message deleted: ${discordMessageId}`);
 
-		// Look up if we track this Discord message
+		// Clean up branch metadata
+		const metadata = loadBranchMetadata(sessionDir, channelId);
+		metadata.discordMsgToPiEntryId.delete(discordMessageId);
+		metadata.discordMsgParent.delete(discordMessageId);
+
+		// Remove labels pointing to this message
+		for (const [labelName, labelInfo] of metadata.labels) {
+			if (labelInfo.discordMessageId === discordMessageId) {
+				metadata.labels.delete(labelName);
+				log(`[${channelId}] Removed label ${labelName} (Discord message deleted)`);
+			}
+		}
+
+		saveBranchMetadata(sessionDir, channelId, metadata);
+
+		// Look up if we track this Discord message in the old tracking system
 		const channelMap = discordMessageToSession.get(channelId);
 		if (!channelMap) {
 			log(`[${channelId}] No tracked messages for this channel`);
@@ -585,9 +655,314 @@ async function main() {
 	});
 
 	// =========================================================================
+	// Branch Command Handlers
+	// =========================================================================
+
+	/**
+	 * /label [name] - Label the current message's pi entry
+	 */
+	async function handleLabel(
+		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
+		message: Message,
+		labelName?: string
+	): Promise<void> {
+		const channelId = channel.id;
+		const discordSession = sessionStore.get(channelId);
+		
+		if (!discordSession) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No session for this channel");
+			return;
+		}
+
+		const metadata = loadBranchMetadata(sessionDir, channelId);
+		
+		// Resolve target message: use the replied-to message if this is a reply,
+		// otherwise fall back to the main branch tip (most recent bot response).
+		let targetDiscordMsgId: string | undefined;
+		if (message.reference?.messageId) {
+			targetDiscordMsgId = message.reference.messageId;
+		} else if (metadata.mainBranchTip) {
+			// mainBranchTip is the assistant entry ID — find the Discord msg that maps to it
+			for (const [discordId, piId] of metadata.discordMsgToPiEntryId) {
+				if (piId === metadata.mainBranchTip) {
+					targetDiscordMsgId = discordId;
+					break;
+				}
+			}
+		}
+
+		if (!targetDiscordMsgId) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No message to label — reply to a message or send a message first");
+			return;
+		}
+
+		// Find which pi entry corresponds to the target Discord message
+		const piEntryId = metadata.discordMsgToPiEntryId.get(targetDiscordMsgId);
+		if (!piEntryId) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Target message not found in session");
+			return;
+		}
+
+		// Use provided name or auto-generate
+		const name = labelName || `label-${++metadata.labelCounter}`;
+
+		// Check if label already exists
+		if (metadata.labels.has(name)) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Label \`${name}\` already exists`);
+			return;
+		}
+
+		// Track in metadata
+		metadata.labels.set(name, {
+			piEntryId,
+			discordMessageId: targetDiscordMsgId,
+			timestamp: Date.now(),
+		});
+
+		saveBranchMetadata(sessionDir, channelId, metadata);
+		await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `✅ Labeled as \`${name}\``);
+	}
+
+	/**
+	 * /labels - Show all labels in this channel
+	 */
+	async function handleLabels(
+		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel
+	): Promise<void> {
+		const channelId = channel.id;
+		const metadata = loadBranchMetadata(sessionDir, channelId);
+
+		const lines: string[] = [];
+		
+		for (const [labelName] of metadata.labels) {
+			lines.push(`• \`${labelName}\``);
+		}
+
+		const output = lines.length > 0 
+			? lines.join("\n")
+			: "No labels found";
+
+		await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `**Labels in this channel:**\n${output}`);
+	}
+
+	/**
+	 * /merge [name] - Merge branch from labeled entry or previous message
+	 */
+	async function handleMerge(
+		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
+		message: Message,
+		labelName?: string
+	): Promise<void> {
+		const channelId = channel.id;
+		const discordSession = sessionStore.get(channelId);
+		
+		if (!discordSession) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No session for this channel");
+			return;
+		}
+
+		const { session } = discordSession;
+		const metadata = loadBranchMetadata(sessionDir, channelId);
+
+		// Determine source branch
+		let sourcePiEntryId: string | undefined;
+		
+		if (labelName) {
+			// Merge from labeled entry
+			const label = metadata.labels.get(labelName);
+			if (!label) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Label \`${labelName}\` not found`);
+				return;
+			}
+			sourcePiEntryId = label.piEntryId;
+		} else {
+			// Merge from replied-to message, or fall back to mainBranchTip
+			if (message.reference?.messageId) {
+				sourcePiEntryId = metadata.discordMsgToPiEntryId.get(message.reference.messageId);
+				if (!sourcePiEntryId) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "⚠️ Replied-to message not in session");
+					return;
+				}
+			} else {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Specify a label name or reply to the message you want to merge from");
+				return;
+			}
+		}
+
+		// Current position: if /merge is a reply, use that message's pi entry (for sub-branch merges).
+		// Otherwise fall back to mainBranchTip (main branch merges).
+		let currentPiEntryId: string | null | undefined;
+		if (message.reference?.messageId) {
+			currentPiEntryId = metadata.discordMsgToPiEntryId.get(message.reference.messageId);
+			if (!currentPiEntryId) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Replied-to message not tracked in session");
+				return;
+			}
+		} else {
+			currentPiEntryId = metadata.mainBranchTip;
+		}
+		if (!currentPiEntryId) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No current position — send a message first");
+			return;
+		}
+
+		// Find fork point (common ancestor)
+		const forkEntryId = findCommonAncestor(
+			sourcePiEntryId,
+			currentPiEntryId,
+			session.sessionManager
+		);
+
+		if (forkEntryId === currentPiEntryId) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "⚠️ Already on same branch, no merge needed");
+			return;
+		}
+
+		// Get all messages from fork point to source leaf
+		const sourceMessages = getMessagesBetween(
+			forkEntryId,
+			sourcePiEntryId,
+			session.sessionManager
+		);
+
+		// Create merge message summarizing what we're merging
+		const mergeContent = formatMergedMessages(sourceMessages);
+		const mergeMessage = `Merged from branch:\n\n${mergeContent}`;
+
+		try {
+			// Branch to current position and silently inject merged content
+			// (no LLM turn - just append to tree and sync agent context)
+			session.sessionManager.branch(currentPiEntryId);
+			const mergeEntryId = session.sessionManager.appendMessage({
+				role: "user",
+				content: mergeMessage,
+				timestamp: Date.now(),
+			});
+
+			// Sync agent's in-memory context to include the merged content
+			const ctx = session.sessionManager.buildSessionContext();
+			session.agent.state.messages = ctx.messages
+
+			const updatedMeta = loadBranchMetadata(sessionDir, channelId);
+			if (currentPiEntryId === updatedMeta.mainBranchTip) {
+				// Main branch merge: advance mainBranchTip
+				updatedMeta.mainBranchTip = mergeEntryId;
+				log(`[${channelId}] Updated main branch tip after merge to ${mergeEntryId}`);
+			} else {
+				log(`[${channelId}] Sub-branch merge at ${currentPiEntryId}, mainBranchTip unchanged`);
+			}
+			saveBranchMetadata(sessionDir, channelId, updatedMeta);
+
+			// Send confirmation and track it → mergeEntryId so replies to it continue from the merge
+			const confirmMsgs = await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Branch merged");
+			if (confirmMsgs.length > 0) {
+				const finalMeta = loadBranchMetadata(sessionDir, channelId);
+				for (const msg of confirmMsgs) {
+					finalMeta.discordMsgToPiEntryId.set(msg.id, mergeEntryId);
+					log(`[${channelId}] Tracked merge confirmation ${msg.id} → Pi entry ${mergeEntryId}`);
+				}
+				saveBranchMetadata(sessionDir, channelId, finalMeta);
+			}
+		} catch (error) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Merge failed: ${error}`);
+		}
+	}
+
+	/**
+	 * /summary [name] - Show merged branch messages (summary of changes)
+	 */
+	async function handleSummary(
+		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
+		message: Message,
+		labelName?: string
+	): Promise<void> {
+		const channelId = channel.id;
+		const discordSession = sessionStore.get(channelId);
+		
+		if (!discordSession) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No session for this channel");
+			return;
+		}
+
+		const { session } = discordSession;
+		const metadata = loadBranchMetadata(sessionDir, channelId);
+
+		// Determine source branch (same logic as merge)
+		let sourcePiEntryId: string | undefined;
+		
+		if (labelName) {
+			const label = metadata.labels.get(labelName);
+			if (!label) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Label \`${labelName}\` not found`);
+				return;
+			}
+			sourcePiEntryId = label.piEntryId;
+		} else {
+			// Source from replied-to message
+			if (message.reference?.messageId) {
+				sourcePiEntryId = metadata.discordMsgToPiEntryId.get(message.reference.messageId);
+				if (!sourcePiEntryId) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "⚠️ Replied-to message not in session");
+					return;
+				}
+			} else {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Specify a label name or reply to the message you want to summarize");
+				return;
+			}
+		}
+
+		// Current position: reply target if replying, else mainBranchTip
+		let currentPiEntryId: string | null | undefined;
+		if (message.reference?.messageId) {
+			currentPiEntryId = metadata.discordMsgToPiEntryId.get(message.reference.messageId);
+			if (!currentPiEntryId) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Replied-to message not tracked in session");
+				return;
+			}
+		} else {
+			currentPiEntryId = metadata.mainBranchTip;
+		}
+		if (!currentPiEntryId) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No current position — send a message first");
+			return;
+		}
+
+		// Find fork point
+		const forkEntryId = findCommonAncestor(
+			sourcePiEntryId,
+			currentPiEntryId,
+			session.sessionManager
+		);
+
+		if (forkEntryId === currentPiEntryId) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "⚠️ Already on same branch");
+			return;
+		}
+
+		// Get messages to summarize
+		const sourceMessages = getMessagesBetween(
+			forkEntryId,
+			sourcePiEntryId,
+			session.sessionManager
+		);
+
+		// Format and show the summary
+		const summaryContent = formatMergedMessages(sourceMessages);
+		const summaryMessage = `**Summary of branch changes:**\n\n${summaryContent}`;
+
+		try {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, summaryMessage);
+		} catch (error) {
+			console.error(`[${channelId}] Summary error:`, error);
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Summary failed: ${error}`);
+		}
+	}
+
+	// =========================================================================
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
+	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>();
 	let subscribeCount = 0;
 	let sendCount = 0;
 
@@ -599,7 +974,11 @@ async function main() {
 		const discordSession = await sessionStore.getOrCreate(channelId);
 		const { session } = discordSession;
 
-		// Track user message for deletion handling
+		// Store Discord message ID for tracking in session
+		// We'll track it when the message_start event fires
+		const currentDiscordMsgId = message.id;
+
+		// Track user message for deletion handling (old approach for assistant/tool messages)
 		// User messages are at index = session.messages.length before we add them
 		const userMessageIndex = session.messages.length;
 		if (!discordMessageToSession.has(channelId)) {
@@ -611,11 +990,16 @@ async function main() {
 		});
 
 		// Abort any ongoing session operation if user sends a new message
-		if (runningSessions.has(channelId)) {
+		if (session.isStreaming || session.isRetrying || session.isCompacting || session.isBashRunning) {
 			log(`[${channelId}] User interrupted - aborting current operation`);
 			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
 			await session.abort();
-			typingManager.hide(channelId);
+			// dont hide typing manager, fall through to sending the interrupted message to the agent
+		}
+
+		// Store the Discord message ID so it can be tracked when the user message is processed
+		if (currentDiscordMsgId) {
+			pendingDiscordMessages.set(channelId, currentDiscordMsgId);
 		}
 
 		// Subscribe to session events once
@@ -625,7 +1009,8 @@ async function main() {
 			subscribedSessions.add(channelId);
 			subscribeCount++;
 			log(`[${channelId}] Subscribing to session (total subscriptions: ${subscribeCount})`);
-			subscribeToSession(session, channelId, channel as DMChannel | TextChannel | NewsChannel, typingManager);
+			const sub = subscribeToSession(session, channelId, channel as DMChannel | TextChannel | NewsChannel, typingManager, sessionDir);
+			sessionSubscriptions.set(channelId, sub);
 		} else {
 			log(`[${channelId}] Already subscribed, skipping`);
 		}
@@ -634,6 +1019,9 @@ async function main() {
 
 		// Update last activity
 		sessionStore.touch(channelId);
+
+		// Handle reply branching - update metadata before sending message
+		const metadata = loadBranchMetadata(sessionDir, channelId);
 
 		// Handle bash commands (!command or !!command)
 		if (message.content.startsWith("!")) {
@@ -714,10 +1102,21 @@ async function main() {
 			return;
 		}
 
-		// Handle /new command - start a new session (no confirmation)
-		if (message.content === "/new") {
+		if (message.content === "/exit") {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
+			process.exit(1);
+		}
+
+		// Handle /clear command - start a new session (no confirmation)
+		if (message.content === "/clear") {
 			log(`[${channelId}] Starting new session`);
 			sessionStore.reset(channelId);
+			metadata.discordMsgToPiEntryId.clear()
+			metadata.discordMsgParent.clear()
+			metadata.mainBranchTip = null;
+			metadata.labelCounter = 0;
+			metadata.labels.clear();
+			saveBranchMetadata(sessionDir, channelId, metadata);
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Started new session. What would you like to work on?");
 			return;
 		}
@@ -736,9 +1135,21 @@ async function main() {
 		}
 
 		if (message.content === "/models") {
-			const available = await session.modelRegistry.getAvailable();
+			const available = (await session.modelRegistry.getAvailable()).map(({provider,id}) =>`${provider}/${id}`);
 			const availableJson = escapeForCodeBlock(JSON.stringify(available, null, 2));
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Models:\n\`\`\`json\n${availableJson}\n\`\`\``);
+			return;
+		}
+
+		if (message.content.startsWith("/models ")) {
+			const [provider, ...modelChunks] = message.content.replace('/models ', '').split('/');	
+      const model = modelChunks.join('/');
+      console.log({provider, model})
+			const found = (await session.modelRegistry.getAvailable()).filter(m => 
+				[m.id,m.name,m.provider].some(s => s.includes(provider || undefined) || s.includes(model || undefined))
+			).map(({provider,id}) =>`${provider}/${id}`);
+			const foundJson = escapeForCodeBlock(JSON.stringify(found, null, 2));
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Models:\n\`\`\`json\n${foundJson}\n\`\`\``);
 			return;
 		}
 
@@ -749,9 +1160,12 @@ async function main() {
 		}
 
 		if (message.content.startsWith("/model ")) {
-			const [provider, model] = message.content.replace('/model ', '').split('/');	
+			const [provider, ...modelChunks] = message.content.replace('/model ', '').split('/');	
+      const model = modelChunks.join('/');
 			try {
-				await session.setModel(getModel(provider, model));
+				const m = session.modelRegistry.find(provider, model)
+				if (!m) throw new Error(`Can't find model ${provider}/${model}`)
+				await session.setModel(m);
 				const modelData = escapeForCodeBlock(JSON.stringify(session.model, null, 2));
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Changed model:\n\`\`\`json\n${modelData}\n\`\`\``);
 			} catch (error) {
@@ -767,9 +1181,102 @@ async function main() {
 			return;
 		}
 
+		// Handle branch commands
+		if (message.content === "/label") {
+			await handleLabel(channel, message);
+			return;
+		}
+
+		if (message.content.startsWith("/label ")) {
+			const labelName = message.content.slice("/label ".length).trim();
+			await handleLabel(channel, message, labelName);
+			return;
+		}
+
+		if (message.content === "/labels") {
+			await handleLabels(channel);
+			return;
+		}
+
+		if (message.content === "/merge") {
+			await handleMerge(channel, message);
+			return;
+		}
+
+		if (message.content.startsWith("/merge ")) {
+			const labelName = message.content.slice("/merge ".length).trim();
+			await handleMerge(channel, message, labelName);
+			return;
+		}
+
+		if (message.content === "/summary") {
+			await handleSummary(channel, message);
+			return;
+		}
+
+		if (message.content.startsWith("/summary ")) {
+			const labelName = message.content.slice("/summary ".length).trim();
+			await handleSummary(channel, message, labelName);
+			return;
+		}
+		
+		// Helper: branch the session tree and sync agent's in-memory messages
+		const branchAndSync = (entryId: string) => {
+			session.sessionManager.branch(entryId);
+			const ctx = session.sessionManager.buildSessionContext();
+			session.agent.state.messages = ctx.messages
+		};
+
+		if (message.reference) {
+			// This is a reply - find the parent entry and branch there
+			const parentMsgId = message.reference.messageId;
+			const parentPiEntryId = metadata.discordMsgToPiEntryId.get(parentMsgId);
+			
+			if (parentPiEntryId) {
+				branchAndSync(parentPiEntryId);
+				log(`[${channelId}] Branched to parent entry ${parentPiEntryId}`);
+			} else {
+				// Parent not found - warn but continue
+				log(`[${channelId}] Warning: Parent message ${parentMsgId} not tracked in session`);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, 
+					`⚠️ Parent message not found in session history, continuing in main branch`);
+			}
+		} else {
+			// Non-reply: branch to persisted main branch tip (survives restarts)
+			const mainTip = metadata.mainBranchTip;
+			if (mainTip) {
+				branchAndSync(mainTip);
+				log(`[${channelId}] Branched to main branch tip ${mainTip}`);
+			} else {
+				log(`[${channelId}] Tree is empty, creating new root`);
+			}
+		}
+
+		// Tell the subscription about this Discord message before sending
+		sessionSubscriptions.get(channelId)?.setPendingDiscordMessageId(message.id, !!message.reference);
+
 		// Send user message to pi agent
 		try {
 			await session.sendUserMessage(message.content);
+
+			// Track user Discord message → user Pi entry
+			// getLeafId() is the assistant entry; its parent is the user entry
+			const assistantLeafId = session.sessionManager.getLeafId();
+			if (assistantLeafId) {
+				const assistantEntry = session.sessionManager.getEntry(assistantLeafId);
+				const userEntryId = assistantEntry?.parentId ?? assistantLeafId;
+				const metadata = loadBranchMetadata(sessionDir, channelId);
+				metadata.discordMsgToPiEntryId.set(message.id, userEntryId);
+				saveBranchMetadata(sessionDir, channelId, metadata);
+				log(`[${channelId}] Tracked Discord message ${message.id} → Pi entry ${userEntryId}`);
+				// Update persisted main branch tip for non-reply messages
+				if (!message.reference) {
+					const updatedMeta = loadBranchMetadata(sessionDir, channelId);
+					updatedMeta.mainBranchTip = assistantLeafId;
+					saveBranchMetadata(sessionDir, channelId, updatedMeta);
+					log(`[${channelId}] Updated main branch tip to ${assistantLeafId}`);
+				}
+			}
 		} catch (error) {
 			console.error(`[${channelId}] Error sending message:`, error);
 			try {

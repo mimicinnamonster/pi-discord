@@ -735,25 +735,25 @@ describe("Content extension detection", () => {
 });
 
 describe("New Session command parsing", () => {
-	it("should detect /new command", () => {
-		const content = "/new";
-		const isNew = content === "/new";
+	it("should detect /clear command", () => {
+		const content = "/clear";
+		const isClear = content === "/clear";
 
-		expect(isNew).toBe(true);
+		expect(isClear).toBe(true);
 	});
 
-	it("should not match /new with args", () => {
-		const content = "/new extra";
-		const isNew = content === "/new";
+	it("should not match /clear with args", () => {
+		const content = "/clear extra";
+		const isClear = content === "/clear";
 
-		expect(isNew).toBe(false);
+		expect(isClear).toBe(false);
 	});
 
 	it("should not match partial commands", () => {
-		const content = "/newer";
-		const isNew = content === "/new";
+		const content = "/clearing";
+		const isClear = content === "/clear";
 
-		expect(isNew).toBe(false);
+		expect(isClear).toBe(false);
 	});
 });
 

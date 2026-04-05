@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { TypingManager, type TypingChannel } from "./typing-manager";
+import { TypingManager, type TypingChannel } from "../src/typing-manager";
 
 describe("TypingManager", () => {
 	let typingManager: TypingManager;
