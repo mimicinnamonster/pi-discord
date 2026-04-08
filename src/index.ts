@@ -16,7 +16,6 @@ import {
 	getMessagesBetween,
 	formatMergedMessages,
 } from "./branch-manager";
-import { execSync } from "child_process";
 
 // ============================================================================
 // Configuration

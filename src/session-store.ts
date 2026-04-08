@@ -11,6 +11,8 @@ import {
 	SettingsManager,
 	createCodingTools,
 	type AgentSession,
+	DefaultResourceLoader,
+	discoverAndLoadExtensions,
 } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
@@ -130,9 +132,11 @@ export class SessionStore {
 			retry: { enabled: true, maxRetries: 10 },
 		});
 
-    // Load extensions and extension runtime
-    //const extensions = await discoverAndLoadExtensions([], cwd, join(homedir(), ".pi", "agent"));
-    //console.log(extensions);
+		// load resources
+		const resourceLoader = new DefaultResourceLoader({
+			appendSystemPrompt: `/n/nYou are running on Discord, use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`
+		});
+		await resourceLoader.reload()
 
 		// Load or create the session file
 		const agent = await createAgentSession({
@@ -143,6 +147,7 @@ export class SessionStore {
 			tools,
 			sessionManager,
 			settingsManager,
+			resourceLoader
 		});
 
 		const { session } = agent

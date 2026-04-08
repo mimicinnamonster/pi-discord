@@ -1,0 +1,41 @@
+{
+  "jobs": [
+    {
+      "id": "GTuO35riqY",
+      "name": "job-Da18Qi",
+      "schedule": "2026-04-07T22:45:02.589Z",
+      "prompt": "@here hello tag",
+      "enabled": false,
+      "type": "once",
+      "createdAt": "2026-04-07T22:44:57.589Z",
+      "runCount": 1,
+      "lastStatus": "success",
+      "lastRun": "2026-04-07T22:45:02.615Z"
+    },
+    {
+      "id": "9gY3P7uFvr",
+      "name": "job-vnQ9XC",
+      "schedule": "2026-04-07T22:46:27.958Z",
+      "prompt": "hello",
+      "enabled": false,
+      "type": "once",
+      "createdAt": "2026-04-07T22:46:22.958Z",
+      "runCount": 1,
+      "lastStatus": "success",
+      "lastRun": "2026-04-07T22:46:27.965Z"
+    },
+    {
+      "id": "XA_SPZMJvc",
+      "name": "hello reminder",
+      "schedule": "2026-04-07T22:49:30.746Z",
+      "prompt": "hello",
+      "enabled": false,
+      "type": "once",
+      "createdAt": "2026-04-07T22:49:25.746Z",
+      "runCount": 1,
+      "lastStatus": "success",
+      "lastRun": "2026-04-07T22:49:30.751Z"
+    }
+  ],
+  "version": 1
+}
