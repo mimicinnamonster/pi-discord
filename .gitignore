@@ -24,6 +24,7 @@ coverage/
 # Session data (local development)
 .p-discord/
 *.pi-discord
+.pi/
 
 # Environment
 .env
