@@ -22,10 +22,35 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 // Types
 // ============================================================================
 
-export interface DiscordSession {
+export class DiscordSession {
 	channelId: string;
 	session: AgentSession;
 	lastActivity: number;
+
+	constructor(channelId: string, session: AgentSession, lastActivity: number) {
+		this.channelId = channelId;
+		this.session = session;
+		this.lastActivity = lastActivity;
+	}
+
+	async setModel(provider: string, model: string) {
+		const m = this.session.modelRegistry.find(provider, model)
+		if (!m) throw new Error(`Can't find model ${provider}/${model}`)
+		await this.session.setModel(m);
+		this.session.settingsManager.applyOverrides({
+			retry: { enabled: true, maxRetries: 10 },
+		});
+	}
+
+	isModelActive() {
+		return this.session.isStreaming || this.session.isRetrying || this.session.isCompacting || this.session.isBashRunning || this.session.isRetrying;
+	}
+
+	async abortModelActivities() {
+		this.session.abortCompaction();
+		this.session.abortRetry();
+		await this.session.abort();
+	}
 }
 
 export interface SessionIndex {
@@ -107,8 +132,9 @@ export class SessionStore {
 		this.log(`Creating session for channel ${channelId}: ${sessionPath}`);
 
 		// Set up auth and model registry
-		const authStorage = AuthStorage.create(join(this.sessionDir, "auth.json"));
-		const modelRegistry = ModelRegistry.create(authStorage, join(this.sessionDir, "models.json"));
+		const agentDir = join(homedir(), ".pi", "agent");
+		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
 		// Create tools with session-specific cwd
 		const cwd = process.cwd();
@@ -208,11 +234,11 @@ export class SessionStore {
 		}
 
 		const session = await this.createPiSession(channelId, sessionPath);
-		const discordSession: DiscordSession = {
+		const discordSession = new DiscordSession(
 			channelId,
 			session,
-			lastActivity: Date.now(),
-		};
+			Date.now(),
+		);
 
 		// Store in memory
 		this.sessions.set(channelId, discordSession);

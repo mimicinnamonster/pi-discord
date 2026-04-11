@@ -445,8 +445,8 @@ function subscribeToSession(
 
 			case "auto_retry_start":
 				typingManager.show(channelId, channel);
-				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts})`);
-				sendToDiscord(channel, `⚠️ Retrying (attempt ${event.attempt}/${event.maxAttempts})...`).catch(() => {});
+				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts}). Error message: ${event.errorMessage}`);
+				sendToDiscord(channel, `⚠️ Retrying (attempt ${event.attempt}/${event.maxAttempts})...\nError:\n\`\`\`\n${escapeForCodeBlock(event.errorMessage)}\n\`\`\``).catch(() => {});
 				break;
 
 			case "auto_retry_end":
@@ -989,10 +989,10 @@ async function main() {
 		});
 
 		// Abort any ongoing session operation if user sends a new message
-		if (session.isStreaming || session.isRetrying || session.isCompacting || session.isBashRunning) {
+		if (discordSession.isModelActive()) {
 			log(`[${channelId}] User interrupted - aborting current operation`);
 			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
-			await session.abort();
+			await discordSession.abortModelActivities()
 			// dont hide typing manager, fall through to sending the interrupted message to the agent
 		}
 
@@ -1021,6 +1021,11 @@ async function main() {
 
 		// Handle reply branching - update metadata before sending message
 		const metadata = loadBranchMetadata(sessionDir, channelId);
+
+		if (message.content === "/stop") {
+			// it was interrupted already, we just do nothing
+			return;
+		}
 
 		// Handle bash commands (!command or !!command)
 		if (message.content.startsWith("!")) {
@@ -1140,6 +1145,35 @@ async function main() {
 			return;
 		}
 
+		if (message.content === "/settings") {
+			const settings = (session.settingsManager)
+			const settingsJSON = escapeForCodeBlock(JSON.stringify(settings, null, 2));
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `⚙️ Settings:\n\`\`\`json\n${settingsJSON}\n\`\`\``);
+			return;
+		}
+
+		if (message.content.startsWith("/thinking ")) {
+			const thinking = message.content.replace('/thinking ', '')
+			try {
+				console.log('setting thinking ' + thinking)
+				session.setThinkingLevel(thinking)
+				const available = session.getAvailableThinkingLevels()
+				await sendToDiscord(channel as TextChannel, `🧠 Thinking level: ${session.thinkingLevel}. Available levels: ${available.join(', ')}`)
+			} catch (error) {
+				console.error(`[${channelId}] Error setting thinking mode "${thinking}":`, error);
+				await (channel as DMChannel | TextChannel | NewsChannel).send(
+					`❌ Sorry, I encountered an error while setting thinking level "${thinking}".\n\`\`\`json\n${error}\`\`\``
+				);
+			}
+			return;
+		}
+
+		if (message.content == "/thinking") {
+			const available = session.getAvailableThinkingLevels()
+			await sendToDiscord(channel as TextChannel, `🧠 Thinking level: ${session.thinkingLevel}. Available levels: ${available.join(', ')}`)
+			return;
+		}
+
 		if (message.content.startsWith("/models ")) {
 			const [provider, ...modelChunks] = message.content.replace('/models ', '').split('/');	
       const model = modelChunks.join('/');
@@ -1162,9 +1196,7 @@ async function main() {
 			const [provider, ...modelChunks] = message.content.replace('/model ', '').split('/');	
       const model = modelChunks.join('/');
 			try {
-				const m = session.modelRegistry.find(provider, model)
-				if (!m) throw new Error(`Can't find model ${provider}/${model}`)
-				await session.setModel(m);
+				await discordSession.setModel(provider, model)
 				const modelData = escapeForCodeBlock(JSON.stringify(session.model, null, 2));
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Changed model:\n\`\`\`json\n${modelData}\n\`\`\``);
 			} catch (error) {
@@ -1221,9 +1253,14 @@ async function main() {
 		
 		// Helper: branch the session tree and sync agent's in-memory messages
 		const branchAndSync = (entryId: string) => {
-			session.sessionManager.branch(entryId);
-			const ctx = session.sessionManager.buildSessionContext();
-			session.agent.state.messages = ctx.messages
+				try {
+					session.sessionManager.branch(entryId);
+					const ctx = session.sessionManager.buildSessionContext();
+					session.agent.state.messages = ctx.messages
+					return true;
+				} catch {
+					return false;
+				}
 		};
 
 		if (message.reference) {
@@ -1231,8 +1268,7 @@ async function main() {
 			const parentMsgId = message.reference.messageId;
 			const parentPiEntryId = metadata.discordMsgToPiEntryId.get(parentMsgId);
 			
-			if (parentPiEntryId) {
-				branchAndSync(parentPiEntryId);
+			if (parentPiEntryId && branchAndSync(parentPiEntryId)) {
 				log(`[${channelId}] Branched to parent entry ${parentPiEntryId}`);
 			} else {
 				// Parent not found - warn but continue
@@ -1243,8 +1279,7 @@ async function main() {
 		} else {
 			// Non-reply: branch to persisted main branch tip (survives restarts)
 			const mainTip = metadata.mainBranchTip;
-			if (mainTip) {
-				branchAndSync(mainTip);
+			if (mainTip && branchAndSync(mainTip)) {
 				log(`[${channelId}] Branched to main branch tip ${mainTip}`);
 			} else {
 				log(`[${channelId}] Tree is empty, creating new root`);
