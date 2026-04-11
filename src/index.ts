@@ -347,6 +347,7 @@ function subscribeToSession(
 
 			case "message_update": {
 				const assistantEvent = event.assistantMessageEvent;
+				log(`[${channelId}] message_update type: ${assistantEvent?.type}`);
 				if (assistantEvent?.type === "text_delta") {
 					log(`[${channelId}] text_delta: "${assistantEvent.delta}" (${assistantEvent.delta?.length || 0} chars)`);
 					responseBuffer.push(assistantEvent.delta);
@@ -389,7 +390,13 @@ function subscribeToSession(
 						}).catch((error) => {
 							console.error(`[${channelId}] Failed to send response:`, error);
 						});
+					} else if (event.message.stopReason === "error" && event.message.errorMessage) {
+						// SEND ERROR TO DISCORD
+						console.error(`[${channelId}] Model Error: ${event.message.errorMessage}`);
+						log(`[${channelId}] Sending error response: ${event.message.errorMessage}`);
+						sendToDiscord(channel, `❌ **Model Error**\n\`\`\`\n${escapeForCodeBlock(event.message.errorMessage)}\n\`\`\``, { trackInSession: true, type: "response" }).catch(() => {});
 					}
+
 					responseBuffer.length = 0;
 					thinkingBuffer.length = 0;
 					// LLM finished generating - stop typing
