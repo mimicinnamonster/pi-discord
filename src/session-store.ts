@@ -54,7 +54,7 @@ export class DiscordSession {
 }
 
 export interface SessionIndex {
-	sessions: Record<string, { channelId: string; sessionFile: string; lastActivity: number }>;
+	sessions: Record<string, { channelId: string; sessionFile: string; lastActivity: number; model?: string }>;
 }
 
 // ============================================================================
@@ -234,6 +234,19 @@ export class SessionStore {
 		}
 
 		const session = await this.createPiSession(channelId, sessionPath);
+
+		// Restore persisted model if available
+		if (indexed?.model) {
+			this.log(`[${channelId}] Restoring model: ${indexed.model}`);
+			const [provider, modelId] = indexed.model.split('/');
+			const m = session.modelRegistry.find(provider, modelId);
+			if (m) {
+				await session.setModel(m);
+			} else {
+				this.log(`[${channelId}] Warning: Persisted model ${indexed.model} not found in registry`);
+			}
+		}
+
 		const discordSession = new DiscordSession(
 			channelId,
 			session,
@@ -263,11 +276,17 @@ export class SessionStore {
 
 			// Update index
 			const index = this.loadIndex();
-			index.sessions[channelId] = {
-				channelId,
-				sessionFile: this.getSessionPath(channelId),
-				lastActivity: discordSession.lastActivity,
-			};
+			if (index.sessions[channelId]) {
+				index.sessions[channelId].lastActivity = discordSession.lastActivity;
+				this.saveIndex(index);
+			}
+		}
+	}
+
+	updateModel(channelId: string, model: string): void {
+		const index = this.loadIndex();
+		if (index.sessions[channelId]) {
+			index.sessions[channelId].model = model;
 			this.saveIndex(index);
 		}
 	}
@@ -291,11 +310,9 @@ export class SessionStore {
 		const index = this.loadIndex();
 
 		for (const [channelId, discordSession] of this.sessions) {
-			index.sessions[channelId] = {
-				channelId,
-				sessionFile: this.getSessionPath(channelId),
-				lastActivity: discordSession.lastActivity,
-			};
+			if (index.sessions[channelId]) {
+				index.sessions[channelId].lastActivity = discordSession.lastActivity;
+			}
 			discordSession.session.dispose();
 		}
 

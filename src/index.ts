@@ -1197,6 +1197,7 @@ async function main() {
       const model = modelChunks.join('/');
 			try {
 				await discordSession.setModel(provider, model)
+				sessionStore.updateModel(channelId, `${provider}/${model}`);
 				const modelData = escapeForCodeBlock(JSON.stringify(session.model, null, 2));
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Changed model:\n\`\`\`json\n${modelData}\n\`\`\``);
 			} catch (error) {
