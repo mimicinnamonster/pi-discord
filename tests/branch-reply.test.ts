@@ -506,6 +506,14 @@ function simulateMerge(
 	const mergeEntryId = sm.appendEntry("user", `Merged from branch:\n\n${mergeContent}`);
 
 	const meta = loadBranchMetadata(sessionDir, channelId);
+
+	// Remap current tip (mirroring index.ts handleMerge)
+	for (const [discordId, piId] of meta.discordMsgToPiEntryId) {
+		if (piId === currentPiEntryId) {
+			meta.discordMsgToPiEntryId.set(discordId, mergeEntryId);
+		}
+	}
+
 	if (currentPiEntryId === meta.mainBranchTip) {
 		// Main branch merge: advance mainBranchTip
 		meta.mainBranchTip = mergeEntryId;

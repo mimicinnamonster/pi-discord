@@ -850,6 +850,16 @@ async function main() {
 			session.agent.state.messages = ctx.messages
 
 			const updatedMeta = loadBranchMetadata(sessionDir, channelId);
+
+			// Remap the current tip Discord message to the merge entry,
+			// so subsequent replies to the merged tip continue from the merge result.
+			for (const [discordId, piId] of updatedMeta.discordMsgToPiEntryId) {
+				if (piId === currentPiEntryId) {
+					updatedMeta.discordMsgToPiEntryId.set(discordId, mergeEntryId);
+					log(`[${channelId}] Remapped current tip ${discordId} → merge entry ${mergeEntryId}`);
+				}
+			}
+
 			if (currentPiEntryId === updatedMeta.mainBranchTip) {
 				// Main branch merge: advance mainBranchTip
 				updatedMeta.mainBranchTip = mergeEntryId;
@@ -1030,7 +1040,7 @@ async function main() {
 		const metadata = loadBranchMetadata(sessionDir, channelId);
 
 		if (message.content === "/stop") {
-			// it was interrupted already, we just do nothing
+			typingManager.hide(channelId);
 			return;
 		}
 
@@ -1075,6 +1085,23 @@ async function main() {
 		}
 
 		// Handle /session command
+		if (message.content === "/cwd" || message.content.startsWith("/cwd ")) {
+			if (message.content === "/cwd") {
+				const cwd = session.sessionManager.getCwd();
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `📂 Current working directory:\n\`${cwd}\``);
+			} else {
+				const newCwd = message.content.slice("/cwd ".length).trim();
+				try {
+					await sessionStore.changeCwd(channelId, newCwd);
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `✅ Changed working directory to:\n\`${newCwd}\``);
+				} catch (error) {
+					console.error(`[${channelId}] /cwd error:`, error);
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Error changing directory: ${error}`);
+				}
+			}
+			return;
+		}
+
 		if (message.content === "/session") {
 			try {
 				const stats = session.getSessionStats();

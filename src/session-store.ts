@@ -54,7 +54,7 @@ export class DiscordSession {
 }
 
 export interface SessionIndex {
-	sessions: Record<string, { channelId: string; sessionFile: string; lastActivity: number; model?: string }>;
+	sessions: Record<string, { channelId: string; sessionFile: string; lastActivity: number; model?: string; cwd?: string }>;
 }
 
 // ============================================================================
@@ -128,7 +128,7 @@ export class SessionStore {
 	// Session Management
 	// ============================================================================
 
-	private async createPiSession(channelId: string, sessionPath: string): Promise<AgentSession> {
+	private async createPiSession(channelId: string, sessionPath: string, cwdOverride?: string): Promise<AgentSession> {
 		this.log(`Creating session for channel ${channelId}: ${sessionPath}`);
 
 		// Set up auth and model registry
@@ -136,24 +136,26 @@ export class SessionStore {
 		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
 		const modelRegistry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
 
-		// Create tools with session-specific cwd
-		const cwd = process.cwd();
-		const tools = createCodingTools(cwd);
-
-		// Create or open session manager
+		// Create or open session manager first to determine the CWD
 		let sessionManager: SessionManager;
 		if (existsSync(sessionPath)) {
 			this.log(`Opening existing session: ${sessionPath}`);
-			sessionManager = SessionManager.open(sessionPath, this.sessionDir);
+			sessionManager = SessionManager.open(sessionPath, this.sessionDir, cwdOverride);
 		} else {
 			this.log(`Creating new session: ${sessionPath}`);
-			sessionManager = SessionManager.create(cwd, this.sessionDir);
+			sessionManager = SessionManager.create(process.cwd(), this.sessionDir);
 			// Set the session file path to our custom path
 			sessionManager.setSessionFile(sessionPath);
 		}
 
+		const cwd = sessionManager.getCwd();
+		this.log(`Using CWD for session: ${cwd}`);
+
+		// Create tools with session-specific cwd
+		const tools = createCodingTools(cwd);
+
 		// Load settings and apply overrides
-		const settingsManager = SettingsManager.create(cwd, join(homedir(), ".pi", "agent"));
+		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({
 			retry: { enabled: true, maxRetries: 10 },
 		});
@@ -233,7 +235,7 @@ export class SessionStore {
 			this.log(`Creating new session for channel ${channelId}: ${sessionPath}`);
 		}
 
-		const session = await this.createPiSession(channelId, sessionPath);
+		const session = await this.createPiSession(channelId, sessionPath, indexed?.cwd);
 
 		// Restore persisted model if available
 		if (indexed?.model) {
@@ -256,9 +258,11 @@ export class SessionStore {
 		// Store in memory
 		this.sessions.set(channelId, discordSession);
 
-		// Update index with session file path
+		// Update index with session file path and preserve other metadata
 		const newIndex = this.loadIndex();
+		const currentMeta = newIndex.sessions[channelId] || {};
 		newIndex.sessions[channelId] = {
+			...currentMeta,
 			channelId,
 			sessionFile: sessionPath,
 			lastActivity: discordSession.lastActivity,
@@ -341,6 +345,19 @@ export class SessionStore {
 	}
 
 	// Reset a session (clear messages, start fresh)
+	async changeCwd(channelId: string, newCwd: string): Promise<void> {
+		const expandedPath = newCwd.startsWith("~") 
+			? join(homedir(), newCwd.slice(1)) 
+			: newCwd;
+
+		const index = this.loadIndex();
+		if (index.sessions[channelId]) {
+			index.sessions[channelId].cwd = expandedPath;
+			this.saveIndex(index);
+		}
+		this.dispose(channelId);
+	}
+
 	reset(channelId: string): void {
 		const discordSession = this.sessions.get(channelId);
 		if (discordSession) {
