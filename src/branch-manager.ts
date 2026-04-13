@@ -215,11 +215,11 @@ export function formatMergedMessages(entries: SessionEntry[]): string {
 					contentStr = msg.content;
 				} else if (Array.isArray(msg.content)) {
 					// Handle array content (assistant messages)
-					// Filter to text content only
+					// Filter to text content only and trim each part
 					const textParts: string[] = [];
 					for (const part of msg.content) {
 						if (typeof part === "object" && "type" in part && part.type === "text" && "text" in part) {
-							textParts.push((part as any).text);
+							textParts.push((part as any).text.trim());
 						}
 					}
 					contentStr = textParts.join(" ");
@@ -277,6 +277,8 @@ export function areOnSameBranch(
 	entryId2: string,
 	sessionManager: SessionManager
 ): boolean {
+	if (entryId1 === entryId2) return true;
+
 	// Get path from root to entryId1
 	const path1 = new Set<string>();
 	let current = entryId1;
@@ -287,10 +289,17 @@ export function areOnSameBranch(
 		current = entry.parentId;
 	}
 
-	// Check if entryId2 is in path1
+	// One is an ancestor of the other if:
+	// 1. entryId2 is in entryId1's ancestor chain
+	// 2. entryId1 is in entryId2's ancestor chain
+
+	// Check if entryId2 is an ancestor of entryId1
+	if (path1.has(entryId2)) return true;
+
+	// Check if entryId1 is an ancestor of entryId2
 	current = entryId2;
 	while (current) {
-		if (path1.has(current)) return true;
+		if (current === entryId1) return true;
 		const entry = sessionManager.getEntry(current);
 		if (!entry || !entry.parentId) break;
 		current = entry.parentId;

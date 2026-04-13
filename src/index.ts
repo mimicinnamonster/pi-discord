@@ -60,6 +60,9 @@ const sessionMessageIndex = new Map<string, number>(); // Track current message 
 // Track the last thinking message ID per channel for editing
 const lastThinkingMessageId = new Map<string, string>();
 
+// Track previous token counts per channel for utilization alerts
+const previousTokens = new Map<string, { input: number; output: number; total: number }>();
+
 // Track pending Discord message IDs being processed (for branch metadata)
 // Map structure: channelId -> discordMessageId
 const pendingDiscordMessages = new Map<string, string>();
@@ -232,6 +235,57 @@ async function uploadAsFile(
  * We use 2000 to trigger file upload before splitting would fail.
  */
 const FILE_UPLOAD_THRESHOLD = 2000;
+
+/**
+ * Generates a token utilization status message.
+ * Returns null if no previous data exists to compare against.
+ */
+export function generateTokenStatsMessage(
+	channelId: string, 
+	session: AgentSession, 
+	prevTokens: Map<string, { input: number; output: number; total: number }>
+): { message: string; shouldAlert: boolean } | null {
+	const stats = session.getSessionStats();
+	const prev = prevTokens.get(channelId);
+	const currentInput = stats.tokens.input;
+	const currentOutput = stats.tokens.output;
+	const currentTotal = stats.tokens.total;
+	const maxWindow = session.model?.contextWindow || 128000;
+
+	const inputUsagePct = (currentInput / maxWindow) * 100;
+	const outputUsagePct = (currentOutput / maxWindow) * 100;
+	const totalUsagePct = (currentTotal / maxWindow) * 100;
+
+	let shouldAlert = false;
+	let deltaIn = "N/A";
+	let deltaOut = "N/A";
+	let deltaTotal = "N/A";
+
+	if (prev) {
+		const inputDelta = Math.abs(currentInput - prev.input);
+		const outputDelta = Math.abs(currentOutput - prev.output);
+		const totalDelta = Math.abs(currentTotal - prev.total);
+		
+		const dInPct = (inputDelta / maxWindow) * 100;
+		const dOutPct = (outputDelta / maxWindow) * 100;
+		const dTotalPct = (totalDelta / maxWindow) * 100;
+
+		deltaIn = `Δ${dInPct.toFixed(2)}%`;
+		deltaOut = `Δ${dOutPct.toFixed(2)}%`;
+		deltaTotal = `Δ${dTotalPct.toFixed(2)}%`;
+
+		if (dInPct >= 1 || dOutPct >= 1 || dTotalPct >= 1) {
+			shouldAlert = true;
+		}
+	}
+
+	const message = `📊 **Token Utilization**\n` +
+		`**In:** **${inputUsagePct.toFixed(2)}%** | ${currentInput.toLocaleString()} tok | ${deltaIn}\n` +
+		`**Out:** **${outputUsagePct.toFixed(2)}%** | ${currentOutput.toLocaleString()} tok | ${deltaOut}\n` +
+		`**Total:** **${totalUsagePct.toFixed(2)}%** | ${currentTotal.toLocaleString()} / ${maxWindow.toLocaleString()} tok | ${deltaTotal}`;
+
+	return { message, shouldAlert };
+}
 
 async function sendToDiscord(
 	channel: DMChannel | TextChannel | NewsChannel,
@@ -437,6 +491,23 @@ function subscribeToSession(
 				// Capture assistant entry NOW (synchronous, all messages appended)
 				// The .then() callback will use this to track bot response Discord msg IDs
 				capturedAssistantEntryId = session.sessionManager.getLeafId();
+
+				// Token utilization alert
+				try {
+					const statsResult = generateTokenStatsMessage(channelId, session, previousTokens);
+					if (statsResult && statsResult.shouldAlert) {
+						sendToDiscord(channel, statsResult.message, { trackInSession: false }).catch(() => {});
+					}
+					
+					const stats = session.getSessionStats();
+					previousTokens.set(channelId, { 
+						input: stats.tokens.input, 
+						output: stats.tokens.output, 
+						total: stats.tokens.total 
+					});
+				} catch (e) {
+					log(`[${channelId}] Error calculating token utilization: ${e}`);
+				}
 				break;
 
 			case "compaction_start":
@@ -1098,6 +1169,18 @@ async function main() {
 					console.error(`[${channelId}] /cwd error:`, error);
 					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Error changing directory: ${error}`);
 				}
+			}
+			return;
+		}
+
+		if (message.content === "/stats") {
+			const discordSession = await sessionStore.getOrCreate(channelId);
+			const { session } = discordSession;
+			const statsResult = generateTokenStatsMessage(channelId, session, previousTokens);
+			if (statsResult) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, statsResult.message);
+			} else {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No token stats available for this session.");
 			}
 			return;
 		}
