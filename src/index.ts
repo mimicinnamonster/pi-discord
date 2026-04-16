@@ -63,6 +63,9 @@ const lastThinkingMessageId = new Map<string, string>();
 // Track previous token counts per channel for utilization alerts
 const previousTokens = new Map<string, { input: number; output: number; total: number }>();
 
+// Track queued prompts per channel
+const promptQueue = new Map<string, string[]>();
+
 // Track pending Discord message IDs being processed (for branch metadata)
 // Map structure: channelId -> discordMessageId
 const pendingDiscordMessages = new Map<string, string>();
@@ -507,6 +510,26 @@ function subscribeToSession(
 					});
 				} catch (e) {
 					log(`[${channelId}] Error calculating token utilization: ${e}`);
+				}
+
+				// Process queued prompts
+				try {
+					const queue = promptQueue.get(channelId);
+					if (queue && queue.length > 0) {
+						const nextPrompt = queue.shift();
+						if (nextPrompt) {
+							promptQueue.set(channelId, queue);
+							log(`[${channelId}] Processing queued prompt: ${nextPrompt.slice(0, 50)}...`);
+							
+							// Send notification about queued prompt being executed
+							await sendToDiscord(channel, `🚀 **Executing queued prompt:**\n${nextPrompt.length > 200 ? nextPrompt.slice(0, 200) + '...' : nextPrompt}`, { trackInSession: false });
+							
+							// Send the queued prompt to the agent
+							await session.sendUserMessage(nextPrompt);
+						}
+					}
+				} catch (e) {
+					log(`[${channelId}] Error processing queue: ${e}`);
 				}
 				break;
 
@@ -1117,6 +1140,7 @@ async function main() {
 				`• \`/cwd\` - Show current working directory\n` +
 				`• \`/cwd [path]\` - Change session working directory\n` +
 				`• \`/stats\` - Show token utilization and changes\n` +
+				`• \`/queue [prompt]\` - Queue a prompt to run after current task\n` +
 				`• \`/clear\` - Reset session and start fresh\n` +
 				`• \`/reload\` - Reload extensions, skills, and themes\n` +
 				`• \`/exit\` - Shut down the bot\n` +
@@ -1135,6 +1159,29 @@ async function main() {
 				`• \`!command\` - Execute bash command (added to context)\n` +
 				`• \`!!command\` - Execute bash command (hidden from context)`;
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, helpText);
+			return;
+		}
+
+		if (message.content === "/queue" || message.content.startsWith("/queue ")) {
+			const prompt = message.content.slice("/queue ".length).trim();
+			if (!prompt) {
+				const queue = promptQueue.get(channelId) || [];
+				if (queue.length === 0) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "📭 Queue is empty");
+				} else {
+					const queueText = queue.map((p, i) => `${i + 1}. ${p.length > 80 ? p.slice(0, 80) + '...' : p}`).join('\n');
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `📋 **Queued prompts** (${queue.length}):\n${queueText}`);
+				}
+				return;
+			}
+
+			// Add to queue
+			if (!promptQueue.has(channelId)) {
+				promptQueue.set(channelId, []);
+			}
+			promptQueue.get(channelId)!.push(prompt);
+			const position = promptQueue.get(channelId)!.length;
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `📥 Prompt queued (#${position}): ${prompt.length > 100 ? prompt.slice(0, 100) + '...' : prompt}`);
 			return;
 		}
 
@@ -1265,6 +1312,7 @@ async function main() {
 			metadata.mainBranchTip = null;
 			metadata.labelCounter = 0;
 			metadata.labels.clear();
+			promptQueue.delete(channelId); // Clear queued prompts
 			saveBranchMetadata(sessionDir, channelId, metadata);
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Started new session. What would you like to work on?");
 			return;
