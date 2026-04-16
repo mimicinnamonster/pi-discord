@@ -1110,6 +1110,34 @@ async function main() {
 		// Handle reply branching - update metadata before sending message
 		const metadata = loadBranchMetadata(sessionDir, channelId);
 
+		if (message.content === "/help") {
+			const helpText = `📖 **pi-discord Help Guide**\n\n` +
+				`**General Commands**\n` +
+				`• \`/session\` - Show session statistics and info\n` +
+				`• \`/cwd\` - Show current working directory\n` +
+				`• \`/cwd [path]\` - Change session working directory\n` +
+				`• \`/stats\` - Show token utilization and changes\n` +
+				`• \`/clear\` - Reset session and start fresh\n` +
+				`• \`/reload\` - Reload extensions, skills, and themes\n` +
+				`• \`/exit\` - Shut down the bot\n` +
+				`• \`/stop\` - Stop current agent operation\n\n` +
+				`**Model & Settings**\n` +
+				`• \`/models\` - List available models\n` +
+				`• \`/model [provider/id]\` - Change current model\n` +
+				`• \`/thinking [level]\` - Set thinking level (e.g., \`/thinking high\`)\n` +
+				`• \`/settings\` - Show current agent settings\n\n` +
+				`**Branching & History**\n` +
+				`• \`/label [name]\` - Label current position (or replied-to msg)\n` +
+				`• \`/labels\` - List all labels in this channel\n` +
+				`• \`/merge [name]\` - Merge branch from label or reply\n` +
+				`• \`/summary [name]\` - Summarize changes from a branch\n\n` +
+				`**Bash Integration**\n` +
+				`• \`!command\` - Execute bash command (added to context)\n` +
+				`• \`!!command\` - Execute bash command (hidden from context)`;
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, helpText);
+			return;
+		}
+
 		if (message.content === "/stop") {
 			typingManager.hide(channelId);
 			return;

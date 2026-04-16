@@ -162,7 +162,13 @@ export class SessionStore {
 
 		// load resources
 		const resourceLoader = new DefaultResourceLoader({
-			appendSystemPrompt: `/n/nYou are running on Discord, use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`
+			appendSystemPrompt: [`/n/nYou are running on Discord, use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
+			systemPromptOverride: (basePrompt) => {
+				if (!basePrompt) return basePrompt;
+				const now = new Date();
+				const localDate = now.toLocaleDateString('en-CA');
+				return basePrompt.replace(/Current date: \d{4}-\d{2}-\d{2}/, `Current date: ${localDate}`);
+			}
 		});
 		await resourceLoader.reload()
 

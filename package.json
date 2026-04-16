@@ -14,7 +14,7 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.66.1",
+    "@mariozechner/pi-coding-agent": "^0.67.5",
     "discord.js": "^14.26.2"
   },
   "devDependencies": {
