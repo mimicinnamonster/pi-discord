@@ -17,6 +17,11 @@
     "@mariozechner/pi-coding-agent": "^0.67.5",
     "discord.js": "^14.26.2"
   },
+  "patch": {
+    "@mariozechner/pi-ai@npm:0.67.5": [
+      "./patches/@mariozechner%2Fpi-ai@0.67.5.patch"
+    ]
+  },
   "devDependencies": {
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^22.19.17",
@@ -25,5 +30,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "patchedDependencies": {
+    "@mariozechner/pi-ai@0.67.5": "patches/@mariozechner%2Fpi-ai@0.67.5.patch"
   }
 }

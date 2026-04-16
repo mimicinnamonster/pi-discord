@@ -1,0 +1,39 @@
+diff --git a/dist/providers/google-gemini-cli.js b/dist/providers/google-gemini-cli.js
+index 85e8d251ecc2154c1bf0f380958569dc27afb1cd..2acb6f98475229b04ab8ddba7d647c75bd158c64 100644
+--- a/dist/providers/google-gemini-cli.js
++++ b/dist/providers/google-gemini-cli.js
+@@ -685,7 +685,7 @@ export function buildRequest(model, context, projectId, options = {}, isAntigrav
+             // Cast to any since our GoogleThinkingLevel mirrors Google's ThinkingLevel enum values
+             generationConfig.thinkingConfig.thinkingLevel = options.thinking.level;
+         }
+-        else if (options.thinking.budgetTokens !== undefined) {
++        else if (options.thinking.budgetTokens !== undefined && options.thinking.budgetTokens >= 0) {
+             generationConfig.thinkingConfig.thinkingBudget = options.thinking.budgetTokens;
+         }
+     }
+diff --git a/dist/providers/google-vertex.js b/dist/providers/google-vertex.js
+index 7ae5b8e4f9c90e7165c7a68d5836a95a0cf9d4a9..a9c49fb4bb74fd285f8eeeb9c931a3a497d53e56 100644
+--- a/dist/providers/google-vertex.js
++++ b/dist/providers/google-vertex.js
+@@ -330,7 +330,7 @@ function buildParams(model, context, options = {}) {
+         if (options.thinking.level !== undefined) {
+             thinkingConfig.thinkingLevel = THINKING_LEVEL_MAP[options.thinking.level];
+         }
+-        else if (options.thinking.budgetTokens !== undefined) {
++        else if (options.thinking.budgetTokens !== undefined && options.thinking.budgetTokens >= 0) {
+             thinkingConfig.thinkingBudget = options.thinking.budgetTokens;
+         }
+         config.thinkingConfig = thinkingConfig;
+diff --git a/dist/providers/google.js b/dist/providers/google.js
+index ffbd23864245e420c14b01e6fe2eee6a24128be5..2e5ac23362deee919d2dc2a55b1695c7df33d9e3 100644
+--- a/dist/providers/google.js
++++ b/dist/providers/google.js
+@@ -285,7 +285,7 @@ function buildParams(model, context, options = {}) {
+             // Cast to any since our GoogleThinkingLevel mirrors Google's ThinkingLevel enum values
+             thinkingConfig.thinkingLevel = options.thinking.level;
+         }
+-        else if (options.thinking.budgetTokens !== undefined) {
++        else if (options.thinking.budgetTokens !== undefined && options.thinking.budgetTokens >= 0) {
+             thinkingConfig.thinkingBudget = options.thinking.budgetTokens;
+         }
+         config.thinkingConfig = thinkingConfig;
