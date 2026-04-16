@@ -1299,6 +1299,11 @@ async function main() {
 		}
 
 		if (message.content === "/exit") {
+			const queue = promptQueue.get(channelId);
+			if (queue && queue.length > 0) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `⚠️ **Exiting with ${queue.length} queued prompt(s) that will be lost:**\n${queue.map((p, i) => `${i + 1}. ${p.length > 80 ? p.slice(0, 80) + '...' : p}`).join('\n')}`);
+				promptQueue.delete(channelId);
+			}
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
 			process.exit(1);
 		}
