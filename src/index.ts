@@ -714,6 +714,26 @@ async function main() {
 	});
 
 	// =========================================================================
+	// Channel Rename Handler
+	// =========================================================================
+	discordClient.on("channelUpdate", async (oldChannel, newChannel) => {
+		// Only track text channels and DMs
+		if (oldChannel.type !== ChannelType.GuildText && oldChannel.type !== ChannelType.DM) {
+			return;
+		}
+
+		const channelId = oldChannel.id;
+		const oldName = oldChannel.type === ChannelType.DM ? "DM" : (oldChannel as TextChannel).name;
+		const newName = newChannel.type === ChannelType.DM ? "DM" : (newChannel as TextChannel).name;
+
+		if (oldName !== newName) {
+			log(`[${channelId}] Channel renamed: "${oldName}" → "${newName}"`);
+			// Session tracking uses channelId which doesn't change, so no action needed
+			log(`[${channelId}] Session tracking continues normally (tracked by channelId, not name)`);
+		}
+	});
+
+	// =========================================================================
 	// Branch Command Handlers
 	// =========================================================================
 
@@ -1096,6 +1116,7 @@ async function main() {
 			const helpText = `📖 **pi-discord Help Guide**\n\n` +
 				`**General Commands**\n` +
 				`• \`/session\` - Show session statistics and info\n` +
+				`• \`/channel\` - Show current channel info (ID, name)\n` +
 				`• \`/cwd\` - Show current working directory\n` +
 				`• \`/cwd [path]\` - Change session working directory\n` +
 				`• \`/stats\` - Show token utilization and changes\n` +
@@ -1118,6 +1139,16 @@ async function main() {
 				`• \`!command\` - Execute bash command (added to context)\n` +
 				`• \`!!command\` - Execute bash command (hidden from context)`;
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, helpText);
+			return;
+		}
+
+		if (message.content === "/channel") {
+			const channelInfo = `📌 **Channel Info**\n` +
+				`**ID:** \`${channelId}\`\n` +
+				`**Name:** ${channel.type === ChannelType.DM ? 'DM' : `\`${(channel as TextChannel).name}\``}\n` +
+				`**Type:** ${ChannelType[channel.type]}\n` +
+				`**Session tracked:** ✅ (by channelId, survives renames)`;
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, channelInfo);
 			return;
 		}
 
