@@ -8,7 +8,8 @@ export interface TypingChannel {
 }
 
 export class TypingManager {
-	private activeTyping = new Map<string, NodeJS.Timeout>();
+	private activeTyping = new Map<string, { interval: NodeJS.Timeout; version: number }>();
+	private versionCounter = 0;
 	private readonly TYPING_DURATION_MS = 5000;
 
 	/**
@@ -16,25 +17,37 @@ export class TypingManager {
 	 * Automatically stops after TYPING_DURATION_MS to prevent stuck typing.
 	 */
 	show(channelId: string, channel: TypingChannel): void {
-		// Clear any existing timeout for this channel
+		// Clear any existing interval for this channel
 		this.clearTimeout(channelId);
+
+		// Assign a unique version so stale catch handlers can't affect newer intervals
+		this.versionCounter++;
+		const version = this.versionCounter;
 
 		console.log(`[typing-manager] Showing typing for ${channelId}`);
 
-		// Start typing
+		// Start typing immediately
 		channel.sendTyping().catch(() => {
-			// Channel might be unavailable, ignore
-			this.activeTyping.delete(channelId);
+			// Only clear if our version is still the active one
+			// (a newer show() call may have replaced us)
+			const active = this.activeTyping.get(channelId);
+			if (active?.version === version) {
+				this.clearTimeout(channelId);
+			}
 		});
 
 		// Set up recurring typing to keep it alive
 		const interval = setInterval(() => {
 			channel.sendTyping().catch(() => {
-				this.clearTimeout(channelId);
+				// Only clear if our version is still the active one
+				const active = this.activeTyping.get(channelId);
+				if (active?.version === version) {
+					this.clearTimeout(channelId);
+				}
 			});
 		}, this.TYPING_DURATION_MS);
 
-		this.activeTyping.set(channelId, interval);
+		this.activeTyping.set(channelId, { interval, version });
 	}
 
 	/**
@@ -48,7 +61,7 @@ export class TypingManager {
 	private clearTimeout(channelId: string): void {
 		const existing = this.activeTyping.get(channelId);
 		if (existing) {
-			clearInterval(existing);
+			clearInterval(existing.interval);
 			this.activeTyping.delete(channelId);
 		}
 	}

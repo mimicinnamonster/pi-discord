@@ -110,7 +110,7 @@ describe("TypingManager", () => {
 			expect(typingManager.isTyping("channel-2")).toBe(false);
 		});
 
-		it("should handle channel sendTyping failures gracefully", async () => {
+		it("should clean up typing when all sendTyping calls fail (channel truly unavailable)", async () => {
 			const failingChannel = {
 				sendTyping: vi.fn().mockRejectedValue(new Error("Channel unavailable")),
 			};
@@ -118,10 +118,10 @@ describe("TypingManager", () => {
 			// Should not throw
 			expect(() => typingManager.show("channel-1", failingChannel)).not.toThrow();
 
-			// Wait for the async catch to execute
+			// Wait for the initial sendTyping catch to execute
 			await new Promise((resolve) => setTimeout(resolve, 10));
 
-			// Channel should be removed from tracking on failure
+			// Channel should be cleaned up since initial sendTyping failed (version matches)
 			expect(typingManager.isTyping("channel-1")).toBe(false);
 		});
 	});
@@ -284,7 +284,7 @@ describe("TypingManager", () => {
 			// show() should not throw even when sendTyping fails
 			expect(() => typingManager.show("channel-1", channel)).not.toThrow();
 
-			// Channel should still be tracked as typing
+			// Channel should still be tracked as typing (version check prevents stale catch from clearing)
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 		});
 
@@ -323,7 +323,66 @@ describe("TypingManager", () => {
 
 			// Hide should still work
 			expect(() => typingManager.hide("channel-1")).not.toThrow();
+			expect(typingManager.isTyping("channel-1")).toBe(false);
 		});
+
+		it("stale sendTyping rejection must not orphan the active interval", async () => {
+				// Simulate the exact race condition:
+				// show() #1 starts sendTyping -> delayed rejection
+				// show() #2 replaces the interval
+				// show() #1's rejection fires -> must NOT delete show() #2's interval
+				let rejectA!: (e: Error) => void;
+				const channel = {
+					sendTyping: vi.fn()
+						.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectA = reject; }))
+					.mockResolvedValue(undefined),
+				};
+
+				// show() #1 - interval A created, sendTyping request A pending
+				typingManager.show("channel-1", channel);
+				expect(typingManager.isTyping("channel-1")).toBe(true);
+
+				// show() #2 - interval B created (replaces A), sendTyping request B resolves immediately
+				typingManager.show("channel-1", channel);
+				expect(typingManager.isTyping("channel-1")).toBe(true);
+
+				// Now reject request A (stale) - this is the race condition
+				rejectA(new Error("Network error"));
+				await new Promise((r) => setTimeout(r, 10));
+
+				// CRITICAL: typing must still be tracked (interval B not orphaned)
+				expect(typingManager.isTyping("channel-1")).toBe(true);
+
+				// And hide() must still work (can clear interval B)
+				typingManager.hide("channel-1");
+				expect(typingManager.isTyping("channel-1")).toBe(false);
+			});
+
+			it("stale interval sendTyping rejection must not clear newer interval", async () => {
+				// Similar race but with the interval callback's sendTyping rejection
+				let rejectFirst!: (e: Error) => void;
+				const channel = {
+					sendTyping: vi.fn()
+						.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectFirst = reject; }))
+					.mockResolvedValue(undefined),
+				};
+
+				// show() with a sendTyping that will be rejected later
+				typingManager.show("channel-1", channel);
+
+				// Immediately show() again (replaces interval)
+				typingManager.show("channel-1", channel);
+				expect(typingManager.isTyping("channel-1")).toBe(true);
+
+				// Reject the first sendTyping (from show() #1)
+				rejectFirst(new Error("Network error"));
+				await new Promise((r) => setTimeout(r, 10));
+
+				// Typing must still be tracked and hideable
+				expect(typingManager.isTyping("channel-1")).toBe(true);
+				typingManager.hide("channel-1");
+				expect(typingManager.isTyping("channel-1")).toBe(false);
+			});
 	});
 
 	describe("message sending correlation", () => {
