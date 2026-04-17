@@ -143,7 +143,7 @@ export class SessionStore {
 			sessionManager = SessionManager.open(sessionPath, this.sessionDir, cwdOverride);
 		} else {
 			this.log(`Creating new session: ${sessionPath}`);
-			sessionManager = SessionManager.create(process.cwd(), this.sessionDir);
+			sessionManager = SessionManager.create(cwdOverride || process.cwd(), this.sessionDir);
 			// Set the session file path to our custom path
 			sessionManager.setSessionFile(sessionPath);
 		}
