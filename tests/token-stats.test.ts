@@ -46,7 +46,8 @@ describe("Token Stats", () => {
 			expect(result).not.toBeNull();
 			expect(result!.message).toContain("25.0%");
 			expect(result!.message).toContain("32,000 / 128,000");
-			expect(result!.message).toContain("95,000 tok");
+			expect(result!.message).toContain("50,000 tok (lifetime)");
+			expect(result!.message).toContain("30,000 tok (lifetime)");
 		});
 
 		it("should not exceed 100% context usage", () => {
@@ -58,11 +59,9 @@ describe("Token Stats", () => {
 			const result = generateTokenStatsMessage("ch1", session, prev);
 			expect(result).not.toBeNull();
 			expect(result!.message).toContain("78.1%");
-			// Lifetime tokens can exceed context window but percentage is correct
-			expect(result!.message).toContain("95,000 tok");
 		});
 
-		it("should show N/A deltas when no previous data", () => {
+		it("should show N/A delta when no previous data", () => {
 			const session = mockSession({
 				tokens: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, total: 1500 },
 				contextUsage: { tokens: 1500, contextWindow: 128000, percent: 1.17 },
@@ -79,12 +78,11 @@ describe("Token Stats", () => {
 				tokens: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, total: 1500 },
 				contextUsage: { tokens: 32000, contextWindow: 128000, percent: 25 },
 			});
-			const prev = new Map<string, { contextPercent: number; cumulativeTotal: number }>();
-			prev.set("ch1", { contextPercent: 20, cumulativeTotal: 1000 });
+			const prev = new Map<string, { contextPercent: number }>();
+			prev.set("ch1", { contextPercent: 20 });
 			const result = generateTokenStatsMessage("ch1", session, prev);
 			expect(result).not.toBeNull();
 			expect(result!.message).toContain("Δ5.00%");
-			expect(result!.message).toContain("+500 tok");
 		});
 
 		it("should alert when context delta >= 1%", () => {
@@ -92,8 +90,8 @@ describe("Token Stats", () => {
 				tokens: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, total: 1500 },
 				contextUsage: { tokens: 32000, contextWindow: 128000, percent: 25 },
 			});
-			const prev = new Map<string, { contextPercent: number; cumulativeTotal: number }>();
-			prev.set("ch1", { contextPercent: 23.5, cumulativeTotal: 1000 });
+			const prev = new Map<string, { contextPercent: number }>();
+			prev.set("ch1", { contextPercent: 23.5 });
 			const result = generateTokenStatsMessage("ch1", session, prev);
 			expect(result!.shouldAlert).toBe(true);
 		});
@@ -103,14 +101,13 @@ describe("Token Stats", () => {
 				tokens: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, total: 1500 },
 				contextUsage: { tokens: 32000, contextWindow: 128000, percent: 25 },
 			});
-			const prev = new Map<string, { contextPercent: number; cumulativeTotal: number }>();
-			prev.set("ch1", { contextPercent: 24.5, cumulativeTotal: 1000 });
+			const prev = new Map<string, { contextPercent: number }>();
+			prev.set("ch1", { contextPercent: 24.5 });
 			const result = generateTokenStatsMessage("ch1", session, prev);
 			expect(result!.shouldAlert).toBe(false);
 		});
 
 		it("should never show context utilization above 100% even with large lifetime tokens", () => {
-			// Simulate a long session where cumulative tokens far exceed context window
 			const session = mockSession({
 				tokens: { input: 200000, output: 150000, cacheRead: 50000, cacheWrite: 20000, total: 420000 },
 				contextUsage: { tokens: 110000, contextWindow: 128000, percent: 85.9 },
@@ -118,13 +115,13 @@ describe("Token Stats", () => {
 			const prev = new Map();
 			const result = generateTokenStatsMessage("ch1", session, prev);
 			expect(result).not.toBeNull();
-			// Context % is within bounds
 			expect(result!.message).toContain("85.9%");
-			// But lifetime tokens far exceed context window (this is correct)
-			expect(result!.message).toContain("420,000 tok");
+			// Lifetime In/Out far exceed context window (this is correct)
+			expect(result!.message).toContain("200,000 tok (lifetime)");
+			expect(result!.message).toContain("150,000 tok (lifetime)");
 		});
 
-		it("should format message with Context and Lifetime lines", () => {
+		it("should format message with In, Out, and Context lines", () => {
 			const session = mockSession({
 				tokens: { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, total: 1500 },
 				contextUsage: { tokens: 32000, contextWindow: 128000, percent: 25 },
@@ -135,7 +132,6 @@ describe("Token Stats", () => {
 			expect(result!.message).toMatch(/\*\*In:\*\*/);
 			expect(result!.message).toMatch(/\*\*Out:\*\*/);
 			expect(result!.message).toMatch(/\*\*Context:\*\*/);
-			expect(result!.message).toMatch(/\*\*Lifetime:\*\*/);
 		});
 	});
 });
