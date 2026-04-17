@@ -62,7 +62,7 @@ const sessionMessageIndex = new Map<string, number>(); // Track current message 
 const lastThinkingMessageId = new Map<string, string>();
 
 // Track previous token counts per channel for utilization alerts
-const previousTokens = new Map<string, { contextPercent: number }>();
+const previousTokens = new Map<string, { contextPercent: number; inputTokens: number; outputTokens: number }>();
 
 // Track queued prompts per channel
 const promptQueue = new Map<string, string[]>();
@@ -250,6 +250,8 @@ function updatePreviousTokens(
 	const contextPercent = contextUsage?.percent ?? 0;
 	previousTokens.set(channelId, {
 		contextPercent,
+		inputTokens: stats.tokens.input,
+		outputTokens: stats.tokens.output,
 	});
 }
 
