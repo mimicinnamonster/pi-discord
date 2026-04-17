@@ -418,17 +418,6 @@ function subscribeToSession(
 						sendToDiscord(channel, `❌ **Model Error**\n\`\`\`\n${escapeForCodeBlock(event.message.errorMessage)}\n\`\`\``, { trackInSession: true, type: "response" }).catch(() => {});
 					}
 
-					// Show token utilization stats after each assistant response
-					try {
-						const statsResult = generateTokenStatsMessage(channelId, session, previousTokens);
-						if (statsResult && statsResult.shouldAlert) {
-							sendToDiscord(channel, statsResult.message, { trackInSession: false }).catch(() => {});
-						}
-						updatePreviousTokens(channelId, session);
-					} catch (e) {
-						log(`[${channelId}] Error calculating token utilization on message_end: ${e}`);
-					}
-
 					responseBuffer.length = 0;
 					thinkingBuffer.length = 0;
 					// LLM finished generating - stop typing
