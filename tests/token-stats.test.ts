@@ -132,6 +132,8 @@ describe("Token Stats", () => {
 			const prev = new Map();
 			const result = generateTokenStatsMessage("ch1", session, prev);
 			expect(result!.message).toMatch(/📊 \*\*Token Utilization\*\*/);
+			expect(result!.message).toMatch(/\*\*In:\*\*/);
+			expect(result!.message).toMatch(/\*\*Out:\*\*/);
 			expect(result!.message).toMatch(/\*\*Context:\*\*/);
 			expect(result!.message).toMatch(/\*\*Lifetime:\*\*/);
 		});
