@@ -32,13 +32,13 @@ export function generateTokenStatsMessage(
 	if (prev) {
 		const inputDelta = inputTokens - prev.inputTokens;
 		const outputDelta = outputTokens - prev.outputTokens;
-		const contextDeltaPct = Math.abs(contextPct - prev.contextPercent);
+		const contextDeltaPct = (contextPct - prev.contextPercent);
 
 		deltaIn = `+${inputDelta.toLocaleString()}`;
 		deltaOut = `+${outputDelta.toLocaleString()}`;
 		deltaContext = `Δ${contextDeltaPct.toFixed(2)}%`;
 
-		if (contextDeltaPct >= 1) {
+		if (Math.abs(contextDeltaPct) >= 1) {
 			shouldAlert = true;
 		}
 	}

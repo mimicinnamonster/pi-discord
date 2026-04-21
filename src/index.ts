@@ -577,10 +577,10 @@ async function main() {
 		// Ignore bot messages
 		if (message.author.bot) return;
 
-		// Ignore messages without content
-		if (!message.content?.trim()) return;
+		// If there's no text AND no attachments, ignore the message
+		if (!message.content?.trim() && message.attachments.size === 0) return;
 
-		log(`[${message.channelId}] Message from ${message.author.tag}: ${message.content.slice(0, 100)}...`);
+		log(`[${message.channelId}] Message from ${message.author.tag}: ${message.content?.slice(0, 100) || "[No text]"}...`);
 
 		// Handle DM channels
 		if (message.channel.type === ChannelType.DM) {
@@ -1112,6 +1112,22 @@ async function main() {
 		// Handle reply branching - update metadata before sending message
 		const metadata = loadBranchMetadata(sessionDir, channelId);
 
+		// Prepare content for the agent (text + images)
+		const agentContent: any[] = [];
+		if (message.content?.trim()) {
+			agentContent.push({ type: "text", text: message.content });
+		}
+
+		// Add image attachments
+		message.attachments.forEach(attachment => {
+			if (attachment.contentType?.startsWith('image/')) {
+				agentContent.push({
+					type: "image_url",
+					image_url: { url: attachment.url },
+				});
+			}
+		});
+
 		if (message.content === "/help") {
 			const helpText = `📖 **pi-discord Help Guide**\n\n` +
 				`**General Commands**\n` +
@@ -1483,7 +1499,7 @@ async function main() {
 
 		// Send user message to pi agent
 		try {
-			await session.sendUserMessage(message.content);
+			await session.sendUserMessage(agentContent.length > 0 ? agentContent : message.content);
 
 			// Track user Discord message → user Pi entry
 			// getLeafId() is the assistant entry; its parent is the user entry
