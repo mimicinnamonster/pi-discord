@@ -37,6 +37,10 @@ export class DiscordSession {
 		const m = this.session.modelRegistry.find(provider, model)
 		if (!m) throw new Error(`Can't find model ${provider}/${model}`)
 		await this.session.setModel(m);
+		this.applyRetryOverrides();
+	}
+
+	private applyRetryOverrides() {
 		this.session.settingsManager.applyOverrides({
 			retry: { enabled: true, maxRetries: 10 },
 		});
@@ -154,6 +158,31 @@ export class SessionStore {
 		// Create tools with session-specific cwd
 		const tools = createCodingTools(cwd);
 
+		// Add custom remember tool
+		const rememberTool = {
+			name: "remember",
+			description: "Save important information to long-term session memory. Use this to remember user preferences, project details, or key decisions. The memory is stored as a list of bullet points in the system prompt.",
+			parameters: {
+				type: "object",
+				properties: {
+					memory: {
+						type: "string",
+						description: "The information to remember, formatted as bullet points.",
+					},
+				},
+				required: ["memory"],
+			},
+			execute: async ({ memory }, { session }) => {
+				const memoryContent = `\n\nagent memory:\n${memory}`;
+				try {
+					await session.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
+					return "✅ Memory updated successfully.";
+				} catch (error) {
+					return `❌ Failed to update memory: ${error}`;
+				}
+			},
+		};
+
 		// Load settings and apply overrides
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		settingsManager.applyOverrides({
@@ -167,7 +196,9 @@ export class SessionStore {
 				if (!basePrompt) return basePrompt;
 				const now = new Date();
 				const localDate = now.toLocaleDateString('en-CA');
-				return basePrompt.replace(/Current date: \d{4}-\d{2}-\d{2}/, `Current date: ${localDate}`);
+				let prompt = basePrompt.replace(/Current date: \d{4}-\d{2}-\d{2}/, `Current date: ${localDate}`);
+
+				return prompt;
 			}
 		});
 		await resourceLoader.reload()
@@ -179,6 +210,7 @@ export class SessionStore {
 			authStorage,
 			modelRegistry,
 			tools,
+			customTools: [rememberTool],
 			sessionManager,
 			settingsManager,
 			resourceLoader
@@ -194,6 +226,20 @@ export class SessionStore {
 
 		// Set session name for identification
 		session.setSessionName(`discord-${channelId}`);
+
+		// Restore agent memory from session file if it exists
+		try {
+			const systemPrompt = await session.getSystemPrompt();
+			if (systemPrompt) {
+				const memoryMarker = "agent memory:";
+				const memoryIndex = systemPrompt.indexOf(memoryMarker);
+				if (memoryIndex !== -1) {
+					this.log(`[${channelId}] Restored memory from system prompt`);
+				}
+			}
+		} catch (error) {
+			this.log(`[${channelId}] Failed to check for restored memory: ${error}`);
+		}
 
 		return session;
 	}

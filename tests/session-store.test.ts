@@ -122,6 +122,20 @@ describe("SessionStore", () => {
 		});
 	});
 
+	describe("Retry Settings Persistence", () => {
+		it("should apply maxRetries override and persist it through setModel", async () => {
+			const channelId = "retry-test-channel";
+			const discordSession = await store.getOrCreate(channelId);
+			
+			// Initial check (should be 10 from createPiSession)
+			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
+
+			// Simulate setModel which re-applies overrides
+			await discordSession.setModel("google", "gemma-4-31b-it");
+			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
+		});
+	});
+
 	describe("Session Reset", () => {
 		it("should reset session messages when reset is called", async () => {
 			const channelId = "reset-test-channel";

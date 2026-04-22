@@ -446,9 +446,13 @@ function subscribeToSession(
 			case "tool_execution_end":
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
 				if (event.isError) {
-				const result = escapeForCodeBlock(JSON.stringify(event.result, null, 2));
+					const result = escapeForCodeBlock(JSON.stringify(event.result, null, 2));
 					sendToDiscord(channel, `⚠️ Tool execution failed\n\`\`\`json\n${result}\n\`\`\``, { trackInSession: true, type: "tool-error" }).catch(() => {});
-					// Keep typing indicator visible during tool execution
+				} else {
+					// Send success result for tools like 'remember'
+					if (typeof event.result === 'string' && event.result.startsWith('✅')) {
+						sendToDiscord(channel, event.result, { trackInSession: true, type: "tool-success" }).catch(() => {});
+					}
 				}
 				break;
 
@@ -1048,6 +1052,12 @@ async function main() {
 	}
 
 	// =========================================================================
+	// Tools
+	// =========================================================================
+	// Note: handleRemember is now handled by the session tool definition in session-store.ts
+	// and routed via tool_execution_end in subscribeToSession.
+
+	// =========================================================================
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
@@ -1337,6 +1347,11 @@ async function main() {
 			log(`[${channelId}] Reloading extensions`);
 			try {
 				await session.reload();
+				// Re-apply retry overrides after reload as it wipes in-memory settings
+				const discordSession = sessionStore.get(channelId);
+				if (discordSession) {
+					discordSession.applyRetryOverrides();
+				}
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Extensions, skills, and themes reloaded.");
 			} catch (error) {
 				console.error(`[${channelId}] /reload error:`, error);
@@ -1499,7 +1514,7 @@ async function main() {
 
 		// Send user message to pi agent
 		try {
-			await session.sendUserMessage(agentContent.length > 0 ? agentContent : message.content);
+			await session.sendUserMessage(agentContent.length > 0 ? agentContent : (message.content || ""));
 
 			// Track user Discord message → user Pi entry
 			// getLeafId() is the assistant entry; its parent is the user entry
