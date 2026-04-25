@@ -14,6 +14,7 @@ import {
 	DefaultResourceLoader,
 	discoverAndLoadExtensions,
 } from "@mariozechner/pi-coding-agent";
+import mcpAdapter from "pi-mcp-adapter";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -152,11 +153,13 @@ export class SessionStore {
 			sessionManager.setSessionFile(sessionPath);
 		}
 
-		const cwd = sessionManager.getCwd();
+		const cwd = sessionManager.getCwd() || process.cwd();
 		this.log(`Using CWD for session: ${cwd}`);
 
-		// Create tools with session-specific cwd
-		const tools = createCodingTools(cwd);
+		// Tool allowlist - use string names as per v0.68.0+ API
+		// Pass undefined to use default built-in tools, or explicit list like ["read", "bash", "edit", "write"]
+		// Note: createCodingTools() returns Tool[] but createAgentSession now expects string[]
+		const tools: string[] | undefined = undefined;
 
 		// Add custom remember tool
 		const rememberTool = {
@@ -191,6 +194,9 @@ export class SessionStore {
 
 		// load resources
 		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
 			appendSystemPrompt: [`/n/nYou are running on Discord, use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
 			systemPromptOverride: (basePrompt) => {
 				if (!basePrompt) return basePrompt;
@@ -201,7 +207,11 @@ export class SessionStore {
 				return prompt;
 			}
 		});
-		await resourceLoader.reload()
+		try {
+			await resourceLoader.reload();
+		} catch (error) {
+			this.log(`Failed to reload resources: ${error}`);
+		}
 
 		// Load or create the session file
 		const agent = await createAgentSession({
@@ -218,7 +228,9 @@ export class SessionStore {
 
 		const { session } = agent
 
-    await session.bindExtensions({});
+    await session.bindExtensions({
+        mcp: mcpAdapter,
+    });
 
 		if (agent.extensionsResult.errors.length > 0) {
 			this.log(`[${channelId}] extensions results errors: ${agent.extensionsResult.errors.map(it => `${it.error} at ${it.path}`)}`);
@@ -229,7 +241,7 @@ export class SessionStore {
 
 		// Restore agent memory from session file if it exists
 		try {
-			const systemPrompt = await session.getSystemPrompt();
+			const systemPrompt = session.systemPrompt;
 			if (systemPrompt) {
 				const memoryMarker = "agent memory:";
 				const memoryIndex = systemPrompt.indexOf(memoryMarker);
