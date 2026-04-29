@@ -1129,14 +1129,43 @@ async function main() {
 		}
 
 		// Add image attachments
-		message.attachments.forEach(attachment => {
-			if (attachment.contentType?.startsWith('image/')) {
-				agentContent.push({
-					type: "image_url",
-					image_url: { url: attachment.url },
-				});
+		log(`[${channelId}] Processing ${message.attachments?.size ?? 0} attachments`);
+		if (message.attachments) {
+			for (const attachment of message.attachments.values()) {
+				log(`[${channelId}] Attachment found: ${JSON.stringify({ id: attachment?.id, url: attachment?.url, contentType: attachment?.contentType })}`);
+				if (!attachment || !attachment.url) {
+					log(`[${channelId}] Attachment missing URL!`);
+					continue;
+				}
+
+				const urlWithoutQuery = attachment.url.split('?')[0];
+				const isImage = attachment.contentType?.startsWith('image/') || 
+								 /\.(jpg|jpeg|png|gif|webp)$/i.test(urlWithoutQuery);
+				
+				if (isImage) {
+					const mimeType = attachment.contentType || 
+									 (urlWithoutQuery.endsWith('.png') ? 'image/png' : 
+									  urlWithoutQuery.endsWith('.gif') ? 'image/gif' : 
+									  urlWithoutQuery.endsWith('.webp') ? 'image/webp' : 'image/jpeg');
+					try {
+						const response = await fetch(attachment.url);
+						const buffer = await response.arrayBuffer();
+						const base64Data = Buffer.from(buffer).toString('base64');
+						log(`[${channelId}] Base64 conversion: length=${base64Data.length}, snippet=${base64Data.slice(0, 30)}...`);
+						log(`[${channelId}] Adding image attachment: ${attachment.url} (MIME: ${mimeType})`);
+						agentContent.push({
+							type: "image",
+							data: base64Data,
+							mimeType: mimeType,
+						});
+					} catch (e) {
+						log(`[${channelId}] Failed to fetch image ${attachment.url}: ${e}`);
+					}
+				} else {
+					log(`[${channelId}] Skipping non-image attachment: ${attachment.url} (MIME: ${attachment.contentType})`);
+				}
 			}
-		});
+		}
 
 		if (message.content === "/help") {
 			const helpText = `📖 **pi-discord Help Guide**\n\n` +

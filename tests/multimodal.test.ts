@@ -19,8 +19,9 @@ describe("Multimodal Content Preparation", () => {
 		message.attachments.forEach(attachment => {
 			if (attachment.contentType?.startsWith('image/')) {
 				agentContent.push({
-					type: "image_url",
-					image_url: { url: attachment.url },
+					type: "image",
+					data: "base64-mock-data",
+					mimeType: attachment.contentType,
 				});
 			}
 		});
@@ -46,7 +47,7 @@ describe("Multimodal Content Preparation", () => {
 		};
 		const result = prepareAgentContent(message);
 		expect(result).toEqual([
-			{ type: "image_url", image_url: { url: "https://example.com/img1.png" } }
+			{ type: "image", data: "base64-mock-data", mimeType: "image/png" }
 		]);
 	});
 
@@ -61,8 +62,8 @@ describe("Multimodal Content Preparation", () => {
 		const result = prepareAgentContent(message);
 		expect(result).toEqual([
 			{ type: "text", text: "Look at this!" },
-			{ type: "image_url", image_url: { url: "https://example.com/img1.jpg" } },
-			{ type: "image_url", image_url: { url: "https://example.com/img2.webp" } }
+			{ type: "image", data: "base64-mock-data", mimeType: "image/jpeg" },
+			{ type: "image", data: "base64-mock-data", mimeType: "image/webp" }
 		]);
 	});
 
@@ -77,7 +78,7 @@ describe("Multimodal Content Preparation", () => {
 		const result = prepareAgentContent(message);
 		expect(result).toEqual([
 			{ type: "text", text: "Here is a file" },
-			{ type: "image_url", image_url: { url: "https://example.com/img.png" } }
+			{ type: "image", data: "base64-mock-data", mimeType: "image/png" }
 		]);
 	});
 
