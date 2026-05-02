@@ -1153,11 +1153,13 @@ async function main() {
 						const base64Data = Buffer.from(buffer).toString('base64');
 						log(`[${channelId}] Base64 conversion: length=${base64Data.length}, snippet=${base64Data.slice(0, 30)}...`);
 						log(`[${channelId}] Adding image attachment: ${attachment.url} (MIME: ${mimeType})`);
-						agentContent.push({
+						const imagePart = {
 							type: "image",
 							data: base64Data,
 							mimeType: mimeType,
-						});
+						};
+						log(`[${channelId}] imagePart data starts with: ${base64Data.startsWith('http') ? 'URL (WRONG)' : 'Base64 (CORRECT)'}`);
+						agentContent.push(imagePart);
 					} catch (e) {
 						log(`[${channelId}] Failed to fetch image ${attachment.url}: ${e}`);
 					}
@@ -1543,7 +1545,25 @@ async function main() {
 
 		// Send user message to pi agent
 		try {
-			await session.sendUserMessage(agentContent.length > 0 ? agentContent : (message.content || ""));
+			const finalContent: any[] = [];
+			
+			if (agentContent.length > 0) {
+				finalContent.push(...agentContent);
+			} else if (message.content) {
+				finalContent.push({ type: "text", text: message.content });
+			} else {
+				finalContent.push({ type: "text", text: " " });
+			}
+
+			log(`[${channelId}] Sending content to agent. Type: array (length ${finalContent.length})`);
+			if (finalContent.length > 0) {
+				finalContent.forEach((part, i) => {
+					if (part.type === 'image') {
+						log(`[${channelId}] Part ${i} (image) data snippet: ${part.data?.slice(0, 50)}...`);
+					}
+				});
+			}
+			await session.sendUserMessage(finalContent);
 
 			// Track user Discord message → user Pi entry
 			// getLeafId() is the assistant entry; its parent is the user entry

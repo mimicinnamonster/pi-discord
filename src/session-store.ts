@@ -66,6 +66,48 @@ export interface SessionIndex {
 // Session Store Class
 // ============================================================================
 
+// ============================================================================
+// Tool Logic
+// ============================================================================
+
+// NOTE: executeLookAtFile is now defined inline in createPiSession so it has
+// access to sessionRef for sendUserMessage (avoiding image-in-tool-result crashes
+// with text-only models). The standalone function is kept for unit testing.
+
+/** Reads and validates an image file. Exported for unit testing. */
+export async function readImageFile(args: { path: string }, cwd: string): Promise<{ absolutePath: string; base64Data: string; mimeType: string }> {
+	const fs = await import("fs");
+	const pathMod = await import("path");
+
+	const absolutePath = args.path.startsWith("~")
+		? pathMod.join(homedir(), args.path.slice(1))
+		: pathMod.resolve(cwd, args.path);
+
+	if (!fs.existsSync(absolutePath)) {
+		throw new Error(`FILE_NOT_FOUND: ${absolutePath}`);
+	}
+
+	const ext = pathMod.extname(absolutePath).toLowerCase();
+	const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+	if (!imageExts.includes(ext)) {
+		throw new Error(`UNSUPPORTED_FORMAT: ${ext}. Supported: ${imageExts.join(', ')}`);
+	}
+
+	const buffer = fs.readFileSync(absolutePath);
+	const base64Data = buffer.toString('base64');
+
+	const mimeTypes: Record<string, string> = {
+		'.jpg': 'image/jpeg',
+		'.jpeg': 'image/jpeg',
+		'.png': 'image/png',
+		'.gif': 'image/gif',
+		'.webp': 'image/webp',
+	};
+	const mimeType = mimeTypes[ext] || 'image/jpeg';
+
+	return { absolutePath, base64Data, mimeType };
+}
+
 export class SessionStore {
 	private sessions = new Map<string, DiscordSession>();
 	private pendingSessions = new Map<string, Promise<DiscordSession>>();
@@ -162,6 +204,7 @@ export class SessionStore {
 		const tools: string[] | undefined = undefined;
 
 		// Add custom remember tool
+		let sessionRef: AgentSession | undefined;
 		const rememberTool = {
 			name: "remember",
 			description: "Save important information to long-term session memory. Use this to remember user preferences, project details, or key decisions. The memory is stored as a list of bullet points in the system prompt.",
@@ -175,10 +218,10 @@ export class SessionStore {
 				},
 				required: ["memory"],
 			},
-			execute: async ({ memory }, { session }) => {
+			execute: async (_toolCallId: string, { memory }: { memory: string }) => {
 				const memoryContent = `\n\nagent memory:\n${memory}`;
 				try {
-					await session.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
+					await sessionRef!.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
 					return "✅ Memory updated successfully.";
 				} catch (error) {
 					return `❌ Failed to update memory: ${error}`;
@@ -186,15 +229,55 @@ export class SessionStore {
 			},
 		};
 
+		const lookAtFileTool = {
+			name: "look_at_file",
+			description: "Read a local image file from disk and 'see' it. Use this when you need to analyze a photo, screenshot, or image file on the local filesystem.",
+			parameters: {
+				type: "object",
+				properties: {
+					path: {
+						type: "string",
+						description: "Absolute path to the image file (e.g. /Users/michal/Pictures/error.png).",
+					},
+				},
+				required: ["path"],
+			},
+			execute: async (_toolCallId: string, { path }: { path: string }) => {
+				try {
+					const { absolutePath, base64Data, mimeType } = await readImageFile({ path }, sessionRef!.sessionManager.getCwd());
+
+					// Inject the image via sendUserMessage (like Discord attachments) so it
+					// arrives as a user message, not tool result content. This avoids crashes
+					// with text-only models that can't handle image parts in tool results.
+					await sessionRef!.sendUserMessage([
+						{ type: "text", text: `[Attached Image: ${absolutePath}]` },
+						{ type: "image", data: base64Data, mimeType: mimeType }
+					], { deliverAs: "nextTurn" });
+
+					// Return proper content array — Google provider requires arrays for toolResult
+					return { content: [{ type: "text", text: `✅ Image loaded from: ${absolutePath}` }] };
+				} catch (error: any) {
+					const msg = error?.message || String(error);
+					const text = msg.startsWith("FILE_NOT_FOUND:")
+						? `❌ File not found at path: ${msg.slice("FILE_NOT_FOUND:".length).trim()}`
+						: msg.startsWith("UNSUPPORTED_FORMAT:")
+						? `❌ ${msg.slice("UNSUPPORTED_FORMAT:".length).trim()}`
+						: `❌ Error reading image file: ${msg}`;
+					return { content: [{ type: "text", text }] };
+				}
+			},
+		};
+
 		// Load settings and apply overrides
-		const settingsManager = SettingsManager.create(cwd, agentDir);
+		const finalCwd = cwd || process.cwd();
+		const settingsManager = SettingsManager.create(finalCwd, agentDir);
 		settingsManager.applyOverrides({
 			retry: { enabled: true, maxRetries: 10 },
 		});
 
 		// load resources
 		const resourceLoader = new DefaultResourceLoader({
-			cwd,
+			cwd: finalCwd,
 			agentDir,
 			settingsManager,
 			appendSystemPrompt: [`/n/nYou are running on Discord, use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
@@ -210,7 +293,7 @@ export class SessionStore {
 		try {
 			await resourceLoader.reload();
 		} catch (error) {
-			this.log(`Failed to reload resources: ${error}`);
+			this.log(`[${channelId}] Warning: Failed to reload resources (this may affect some automatic tool/resource discovery): ${error}`);
 		}
 
 		// Load or create the session file
@@ -220,13 +303,15 @@ export class SessionStore {
 			authStorage,
 			modelRegistry,
 			tools,
-			customTools: [rememberTool],
+			customTools: [rememberTool, lookAtFileTool],
 			sessionManager,
 			settingsManager,
 			resourceLoader
 		});
 
 		const { session } = agent
+
+		sessionRef = session;
 
     await session.bindExtensions({
         mcp: mcpAdapter,
