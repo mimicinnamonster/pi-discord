@@ -15,12 +15,19 @@ export class TypingManager {
 	/**
 	 * Show typing indicator for a channel.
 	 * Automatically stops after TYPING_DURATION_MS to prevent stuck typing.
+	 *
+	 * This method is idempotent: if typing is already active for this channel,
+	 * it won't reset the interval. The interval fires every TYPING_DURATION_MS
+	 * and handles refreshing, preventing Discord rate-limit issues from rapid
+	 * thinking_delta events.
 	 */
 	show(channelId: string, channel: TypingChannel): void {
-		// Clear any existing interval for this channel
-		this.clearTimeout(channelId);
+		// If typing is already active, just log and return — the interval handles refreshes
+		if (this.activeTyping.has(channelId)) {
+			return;
+		}
 
-		// Assign a unique version so stale catch handlers can't affect newer intervals
+		// Assign a unique version for this show() instance
 		this.versionCounter++;
 		const version = this.versionCounter;
 
@@ -28,22 +35,16 @@ export class TypingManager {
 
 		// Start typing immediately
 		channel.sendTyping().catch(() => {
-			// Only clear if our version is still the active one
-			// (a newer show() call may have replaced us)
-			const active = this.activeTyping.get(channelId);
-			if (active?.version === version) {
-				this.clearTimeout(channelId);
-			}
+			// Log failure but DON'T stop the interval — transient errors (rate limits,
+			// network blips) shouldn't permanently kill the typing indicator.
+			console.log(`[typing-manager] Failed to send typing for ${channelId}`);
 		});
 
 		// Set up recurring typing to keep it alive
 		const interval = setInterval(() => {
 			channel.sendTyping().catch(() => {
-				// Only clear if our version is still the active one
-				const active = this.activeTyping.get(channelId);
-				if (active?.version === version) {
-					this.clearTimeout(channelId);
-				}
+				// Same as above: log but don't destroy the interval.
+				console.log(`[typing-manager] Failed to send typing (interval) for ${channelId}`);
 			});
 		}, this.TYPING_DURATION_MS);
 

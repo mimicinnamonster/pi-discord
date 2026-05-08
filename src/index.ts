@@ -421,9 +421,8 @@ function subscribeToSession(
 
 					responseBuffer.length = 0;
 					thinkingBuffer.length = 0;
-					// LLM finished generating - stop typing
-					// (Don't stop on agent_end as it comes after message_end)
-					typingManager.hide(channelId);
+					// Don't hide typing on message_end — it fires mid-turn for tool calls,
+					// causing flickering. agent_end handles the final cleanup.
 				}
 				break;
 

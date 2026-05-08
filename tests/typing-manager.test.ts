@@ -23,7 +23,7 @@ describe("TypingManager", () => {
 	});
 
 	describe("show()", () => {
-		it("should call sendTyping on the channel", () => {
+		it("should call sendTyping on the channel once for first show", () => {
 			typingManager.show("channel-1", mockChannel);
 
 			expect(mockChannel.sendTyping).toHaveBeenCalledTimes(1);
@@ -32,6 +32,26 @@ describe("TypingManager", () => {
 		it("should mark channel as typing", () => {
 			typingManager.show("channel-1", mockChannel);
 
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+		});
+
+		it("should be idempotent — second show() does not call sendTyping again", () => {
+			typingManager.show("channel-1", mockChannel);
+			typingManager.show("channel-1", mockChannel);
+
+			// sendTyping only called once — second show() is a no-op
+			expect(mockChannel.sendTyping).toHaveBeenCalledTimes(1);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+		});
+
+		it("should re-activate after hide()", () => {
+			typingManager.show("channel-1", mockChannel);
+			typingManager.hide("channel-1");
+			const callCount = mockChannel.sendTyping.mock.calls.length;
+
+			typingManager.show("channel-1", mockChannel);
+
+			expect(mockChannel.sendTyping).toHaveBeenCalledTimes(callCount + 1);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 		});
 	});
@@ -110,7 +130,7 @@ describe("TypingManager", () => {
 			expect(typingManager.isTyping("channel-2")).toBe(false);
 		});
 
-		it("should clean up typing when all sendTyping calls fail (channel truly unavailable)", async () => {
+		it("should keep typing active even when sendTyping fails", async () => {
 			const failingChannel = {
 				sendTyping: vi.fn().mockRejectedValue(new Error("Channel unavailable")),
 			};
@@ -121,7 +141,11 @@ describe("TypingManager", () => {
 			// Wait for the initial sendTyping catch to execute
 			await new Promise((resolve) => setTimeout(resolve, 10));
 
-			// Channel should be cleaned up since initial sendTyping failed (version matches)
+			// Channel should STILL be tracked — transient failures don't kill the interval
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
+			// hide() must still work
+			typingManager.hide("channel-1");
 			expect(typingManager.isTyping("channel-1")).toBe(false);
 		});
 	});
@@ -151,6 +175,7 @@ describe("TypingManager", () => {
 			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
 
 			// Simulate: agent_start, then message_start (both call show)
+			// With idempotent show(), second and third calls are no-ops
 			typingManager.show("channel-1", channel);
 			typingManager.show("channel-1", channel);
 			typingManager.show("channel-1", channel);
@@ -190,15 +215,6 @@ describe("TypingManager", () => {
 			typingManager.hide("channel-1");
 			expect(typingManager.isTyping("channel-1")).toBe(false);
 		});
-
-		it("should call sendTyping multiple times (for recurring indicator)", () => {
-			const channel = { sendTyping: vi.fn().mockResolvedValue(undefined) };
-
-			typingManager.show("channel-1", channel);
-
-			// Initial call
-			expect(channel.sendTyping).toHaveBeenCalledTimes(1);
-		});
 	});
 
 	describe("thinking_delta event flow", () => {
@@ -220,7 +236,7 @@ describe("TypingManager", () => {
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 
-			// Multiple thinking_delta events - typing should persist
+			// Multiple thinking_delta events — idempotent show() keeps typing active
 			typingManager.show("channel-1", channel);
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
@@ -272,7 +288,7 @@ describe("TypingManager", () => {
 		});
 	});
 
-		describe("error handling scenarios", () => {
+	describe("error handling scenarios", () => {
 		it("should continue tracking typing even when sendTyping fails once", () => {
 			const channel = {
 				sendTyping: vi
@@ -284,11 +300,11 @@ describe("TypingManager", () => {
 			// show() should not throw even when sendTyping fails
 			expect(() => typingManager.show("channel-1", channel)).not.toThrow();
 
-			// Channel should still be tracked as typing (version check prevents stale catch from clearing)
+			// Channel should still be tracked as typing (failures don't kill the interval)
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 		});
 
-		it("should keep typing active through multiple show() calls even with intermittent failures", () => {
+		it("should keep typing active through multiple show() calls", () => {
 			const channel = {
 				sendTyping: vi
 					.fn()
@@ -299,7 +315,7 @@ describe("TypingManager", () => {
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 
-			// Second show (e.g., from another event) - should not break
+			// Second show (e.g., from another event) - idempotent, no-op
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 
@@ -321,68 +337,40 @@ describe("TypingManager", () => {
 				typingManager.show("channel-1", channel);
 			}).not.toThrow();
 
+			// Typing stays active because failures don't kill the interval
+			expect(typingManager.isTyping("channel-1")).toBe(true);
+
 			// Hide should still work
 			expect(() => typingManager.hide("channel-1")).not.toThrow();
 			expect(typingManager.isTyping("channel-1")).toBe(false);
 		});
 
-		it("stale sendTyping rejection must not orphan the active interval", async () => {
-				// Simulate the exact race condition:
-				// show() #1 starts sendTyping -> delayed rejection
-				// show() #2 replaces the interval
-				// show() #1's rejection fires -> must NOT delete show() #2's interval
-				let rejectA!: (e: Error) => void;
-				const channel = {
-					sendTyping: vi.fn()
-						.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectA = reject; }))
+		it("stale sendTyping rejection must not affect active interval", async () => {
+			// With idempotent show(), the second call is a no-op, so the first
+			// interval is the only one. A stale rejection from the first show()
+			// won't clear the interval because we no longer clear on failure.
+			let rejectA!: (e: Error) => void;
+			const channel = {
+				sendTyping: vi.fn()
+					.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectA = reject; }))
 					.mockResolvedValue(undefined),
-				};
+			};
 
-				// show() #1 - interval A created, sendTyping request A pending
-				typingManager.show("channel-1", channel);
-				expect(typingManager.isTyping("channel-1")).toBe(true);
+			// show() - creates interval, sendTyping request pending
+			typingManager.show("channel-1", channel);
+			expect(typingManager.isTyping("channel-1")).toBe(true);
 
-				// show() #2 - interval B created (replaces A), sendTyping request B resolves immediately
-				typingManager.show("channel-1", channel);
-				expect(typingManager.isTyping("channel-1")).toBe(true);
+			// Reject the sendTyping (stale or current, it doesn't matter — failures don't clear)
+			rejectA(new Error("Network error"));
+			await new Promise((r) => setTimeout(r, 10));
 
-				// Now reject request A (stale) - this is the race condition
-				rejectA(new Error("Network error"));
-				await new Promise((r) => setTimeout(r, 10));
+			// Typing must still be tracked (interval not destroyed)
+			expect(typingManager.isTyping("channel-1")).toBe(true);
 
-				// CRITICAL: typing must still be tracked (interval B not orphaned)
-				expect(typingManager.isTyping("channel-1")).toBe(true);
-
-				// And hide() must still work (can clear interval B)
-				typingManager.hide("channel-1");
-				expect(typingManager.isTyping("channel-1")).toBe(false);
-			});
-
-			it("stale interval sendTyping rejection must not clear newer interval", async () => {
-				// Similar race but with the interval callback's sendTyping rejection
-				let rejectFirst!: (e: Error) => void;
-				const channel = {
-					sendTyping: vi.fn()
-						.mockImplementationOnce(() => new Promise<void>((_, reject) => { rejectFirst = reject; }))
-					.mockResolvedValue(undefined),
-				};
-
-				// show() with a sendTyping that will be rejected later
-				typingManager.show("channel-1", channel);
-
-				// Immediately show() again (replaces interval)
-				typingManager.show("channel-1", channel);
-				expect(typingManager.isTyping("channel-1")).toBe(true);
-
-				// Reject the first sendTyping (from show() #1)
-				rejectFirst(new Error("Network error"));
-				await new Promise((r) => setTimeout(r, 10));
-
-				// Typing must still be tracked and hideable
-				expect(typingManager.isTyping("channel-1")).toBe(true);
-				typingManager.hide("channel-1");
-				expect(typingManager.isTyping("channel-1")).toBe(false);
-			});
+			// And hide() must still work
+			typingManager.hide("channel-1");
+			expect(typingManager.isTyping("channel-1")).toBe(false);
+		});
 	});
 
 	describe("message sending correlation", () => {
@@ -439,7 +427,7 @@ describe("TypingManager", () => {
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 
-			// LLM calls a tool (tool_execution_start) - typing should continue
+			// LLM calls a tool (tool_execution_start) - idempotent, typing persists
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 
@@ -471,7 +459,7 @@ describe("TypingManager", () => {
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 
-			// Second tool starts (LLM calls another tool)
+			// Second tool starts (LLM calls another tool) - idempotent
 			typingManager.show("channel-1", channel);
 			expect(typingManager.isTyping("channel-1")).toBe(true);
 

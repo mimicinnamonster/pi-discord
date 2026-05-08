@@ -14,13 +14,13 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.70.2",
-    "discord.js": "^14.26.3",
-    "pi-mcp-adapter": "^2.4.2"
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "discord.js": "^14.26.4",
+    "pi-mcp-adapter": "^2.5.4"
   },
   "devDependencies": {
     "@sinclair/typebox": "^0.34.49",
-    "@types/node": "^25.6.0",
+    "@types/node": "^25.6.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   },

@@ -21,9 +21,9 @@ vi.mock("@mariozechner/pi-coding-agent", () => {
 			},
 			extensionsResult: { errors: [] },
 		}),
-		DefaultResourceLoader: vi.fn().mockImplementation(() => ({
-			reload: vi.fn().mockResolvedValue(undefined),
-		})),
+		DefaultResourceLoader: vi.fn().mockImplementation(function() {
+			return { reload: vi.fn().mockResolvedValue(undefined) };
+		}),
 	};
 });
 
