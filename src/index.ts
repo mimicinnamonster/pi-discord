@@ -329,46 +329,20 @@ function subscribeToSession(
 	typingManager: TypingManager,
 	sessionDir: string
 ): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
-	// Use a direct fetch to the Discord REST API for typing indicator,
-	// bypassing Discord.js's broken sendTyping() which hangs forever.
+	// Use discordClient.rest.post() for typing indicator — same REST client that
+	// works for sending messages, unlike channel.sendTyping() which hangs.
 	const typingChannel: TypingChannel = {
 		triggerTyping: async () => {
 			try {
-				const token = discordClient?.token;
-				if (!token) {
-					console.log(`[typing-manager] No bot token available for typing in ${channelId}`);
+				if (!discordClient) {
+					console.log(`[typing-manager] No discordClient for typing in ${channelId}`);
 					return false;
 				}
-				const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/typing`, {
-					method: "POST",
-					headers: {
-						"Authorization": `Bot ${token}`,
-						"Content-Type": "application/json",
-					},
-				});
-				if (res.status === 429) {
-					// Rate limited — retry once after Retry-After header
-					const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
-					console.log(`[typing-manager] Typing API 429 for ${channelId}, retrying in ${retryAfter}s`);
-					await new Promise(r => setTimeout(r, retryAfter * 1000));
-					const retryRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/typing`, {
-						method: "POST",
-						headers: {
-							"Authorization": `Bot ${token}`,
-							"Content-Type": "application/json",
-						},
-					});
-					if (!retryRes.ok) {
-						console.log(`[typing-manager] Typing retry returned ${retryRes.status} for ${channelId}`);
-					}
-					return retryRes.ok;
-				}
-				if (!res.ok) {
-					console.log(`[typing-manager] Typing API returned ${res.status} for ${channelId}`);
-				}
-				return res.ok;
+				const { Routes } = await import("discord.js");
+				await discordClient.rest.post(Routes.channelTyping(channelId));
+				return true;
 			} catch (err: any) {
-				console.log(`[typing-manager] Typing fetch error for ${channelId}: ${err?.message || err}`);
+				console.log(`[typing-manager] Typing error for ${channelId}: ${err?.message || err}`);
 				return false;
 			}
 		},
