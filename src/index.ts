@@ -334,12 +334,18 @@ function subscribeToSession(
 	const typingChannel: TypingChannel = {
 		triggerTyping: async () => {
 			try {
+				const { Routes } = await import("discord.js");
 				if (!discordClient) {
 					console.log(`[typing-manager] No discordClient for typing in ${channelId}`);
 					return false;
 				}
-				const { Routes } = await import("discord.js");
+				if (!discordClient.rest) {
+					console.log(`[typing-manager] discordClient.rest is undefined for ${channelId}`);
+					return false;
+				}
+				console.log(`[typing-manager] About to post typing for ${channelId}...`);
 				await discordClient.rest.post(Routes.channelTyping(channelId));
+				console.log(`[typing-manager] Typing posted successfully for ${channelId}`);
 				return true;
 			} catch (err: any) {
 				console.log(`[typing-manager] Typing error for ${channelId}: ${err?.message || err}`);
