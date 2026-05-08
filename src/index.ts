@@ -334,27 +334,18 @@ function subscribeToSession(
 	const typingChannel: TypingChannel = {
 		triggerTyping: async () => {
 			const token = discordClient?.token;
-			if (!token) {
-				console.log(`[typing-manager] No token`);
-				return false;
-			}
-			// Use fetch with a timeout to detect if the endpoint hangs
-			const controller = new AbortController();
-			const timeout = setTimeout(() => controller.abort(), 3000);
+			if (!token) return false;
 			try {
 				const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/typing`, {
 					method: "POST",
-					signal: controller.signal,
-					headers: {
-						"Authorization": `Bot ${token}`,
-					},
+					headers: { "Authorization": `Bot ${token}` },
 				});
-				clearTimeout(timeout);
-				console.log(`[typing-manager] API returned ${res.status} for ${channelId}`);
+				if (res.status === 429) {
+					// Rate limited — interval will retry in 5s
+					return false;
+				}
 				return res.ok;
-			} catch (err: any) {
-				clearTimeout(timeout);
-				console.log(`[typing-manager] Typing error: ${err?.name || err?.message || err}`);
+			} catch {
 				return false;
 			}
 		},
