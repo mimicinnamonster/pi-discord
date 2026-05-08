@@ -4,7 +4,8 @@
  */
 
 export interface TypingChannel {
-	sendTyping(): Promise<void>;
+	/** HTTP endpoint to trigger typing indicator. Returns true on success. */
+	triggerTyping(): Promise<boolean>;
 }
 
 export class TypingManager {
@@ -32,27 +33,21 @@ export class TypingManager {
 		const version = this.versionCounter;
 
 		console.log(`[typing-manager] Showing typing for ${channelId}`);
-		console.log(`[typing-manager] Channel has sendTyping: ${typeof channel.sendTyping}`);
 
-		// Start typing immediately - log what sendTyping returns
-		const sendResult = channel.sendTyping();
-		console.log(`[typing-manager] sendTyping() returned: ${typeof sendResult}, isThenable: ${typeof sendResult?.then}`);
-		if (sendResult && typeof sendResult.then === 'function') {
-			sendResult.then(() => {
-				console.log(`[typing-manager] Initial typing sent successfully for ${channelId}`);
-			}).catch((err: any) => {
-				console.log(`[typing-manager] Failed to send typing for ${channelId}: ${err?.message || err}`);
-			});
-		}
+		// Start typing immediately
+		channel.triggerTyping().then((ok) => {
+			console.log(`[typing-manager] Initial typing ${ok ? "sent" : "failed"} for ${channelId}`);
+		}).catch((err) => {
+			console.log(`[typing-manager] Failed to send typing for ${channelId}: ${err?.message || err}`);
+		});
 
-		// Set up recurring typing to keep it alive - same approach
+		// Set up recurring typing to keep it alive
 		const interval = setInterval(() => {
-			const intervalResult = channel.sendTyping();
-			if (intervalResult && typeof intervalResult.then === 'function') {
-				intervalResult.catch((err: any) => {
-					console.log(`[typing-manager] Failed to send typing (interval) for ${channelId}: ${err?.message || err}`);
-				});
-			}
+			channel.triggerTyping().then((ok) => {
+				if (!ok) console.log(`[typing-manager] Interval typing failed for ${channelId}`);
+			}).catch((err) => {
+				console.log(`[typing-manager] Failed to send typing (interval) for ${channelId}: ${err?.message || err}`);
+			});
 		}, this.TYPING_DURATION_MS);
 
 		this.activeTyping.set(channelId, { interval, version });
@@ -60,7 +55,7 @@ export class TypingManager {
 
 	/**
 	 * Hide typing indicator for a channel.
-	 * Called when we know the LLM has finished (message_end).
+	 * Called when we know the LLM has finished (agent_end).
 	 */
 	hide(channelId: string): void {
 		this.clearTimeout(channelId);

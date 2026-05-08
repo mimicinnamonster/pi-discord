@@ -329,6 +329,33 @@ function subscribeToSession(
 	typingManager: TypingManager,
 	sessionDir: string
 ): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
+	// Use a direct fetch to the Discord REST API for typing indicator,
+	// bypassing Discord.js's broken sendTyping() which hangs forever.
+	const typingChannel: TypingChannel = {
+		triggerTyping: async () => {
+			try {
+				const token = discordClient?.token;
+				if (!token) {
+					console.log(`[typing-manager] No bot token available for typing in ${channelId}`);
+					return false;
+				}
+				const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/typing`, {
+					method: "POST",
+					headers: {
+						"Authorization": `Bot ${token}`,
+						"Content-Type": "application/json",
+					},
+				});
+				if (!res.ok) {
+					console.log(`[typing-manager] Typing API returned ${res.status} for ${channelId}`);
+				}
+				return res.ok;
+			} catch (err: any) {
+				console.log(`[typing-manager] Typing fetch error for ${channelId}: ${err?.message || err}`);
+				return false;
+			}
+		},
+	};
 	const responseBuffer: string[] = [];
 	const thinkingBuffer: string[] = [];
 	let lastUserMessageEntryId: string | undefined;
@@ -346,7 +373,7 @@ function subscribeToSession(
 				log(`[${channelId}] Agent starting...`);
 				responseBuffer.length = 0;
 				// LLM is processing - show typing indicator
-				typingManager.show(channelId, channel);
+				typingManager.show(channelId, typingChannel);
 				break;
 
 			case "message_start":
@@ -363,7 +390,7 @@ function subscribeToSession(
 					const currentIdx = (sessionMessageIndex.get(channelId) ?? 0) + 1;
 					sessionMessageIndex.set(channelId, currentIdx);
 					// LLM is generating response - show typing indicator
-					typingManager.show(channelId, channel);
+					typingManager.show(channelId, typingChannel);
 				}
 				break;
 
@@ -377,7 +404,7 @@ function subscribeToSession(
 				if (assistantEvent?.type === "thinking_delta") {
 					log(`[${channelId}] thinking_delta: "${assistantEvent.delta}"`);
 					// Show typing indicator when thinking starts
-					typingManager.show(channelId, channel);
+					typingManager.show(channelId, typingChannel);
 					thinkingBuffer.push(assistantEvent.delta);
 					// Only send when thinking is complete (on message_end) to avoid spam
 				}
@@ -434,7 +461,7 @@ function subscribeToSession(
 				sessionMessageIndex.set(channelId, currentIdx);
 				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``, { trackInSession: true, type: "tool" }).catch(() => {});
 				// Keep typing indicator visible during tool execution
-				typingManager.show(channelId, channel);
+				typingManager.show(channelId, typingChannel);
 				break;
 			}
 
@@ -496,7 +523,7 @@ function subscribeToSession(
 				break;
 
 			case "compaction_start":
-				typingManager.show(channelId, channel);
+				typingManager.show(channelId, typingChannel);
 				log(`[${channelId}] Compacting context...`);
 				sendToDiscord(channel, "📦 Compacting context...").catch(() => {});
 				break;
@@ -507,7 +534,7 @@ function subscribeToSession(
 				break;
 
 			case "auto_retry_start":
-				typingManager.show(channelId, channel);
+				typingManager.show(channelId, typingChannel);
 				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts}). Error message: ${event.errorMessage}`);
 				sendToDiscord(channel, `⚠️ Retrying (attempt ${event.attempt}/${event.maxAttempts})...\nError:\n\`\`\`\n${escapeForCodeBlock(event.errorMessage)}\n\`\`\``).catch(() => {});
 				break;
@@ -1249,7 +1276,7 @@ async function main() {
 			}
 
 			log(`[${channelId}] Executing bash command: ${command}`);
-			typingManager.show(channelId, channel);
+			typingManager.show(channelId, typingChannel);
 
 			try {
 				const output: string[] = [];
