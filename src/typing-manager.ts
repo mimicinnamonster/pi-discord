@@ -34,21 +34,25 @@ export class TypingManager {
 		console.log(`[typing-manager] Showing typing for ${channelId}`);
 		console.log(`[typing-manager] Channel has sendTyping: ${typeof channel.sendTyping}`);
 
-		// Start typing immediately
-		Promise.resolve(channel.sendTyping()).then(() => {
-			console.log(`[typing-manager] Initial typing sent successfully for ${channelId}`);
-		}).catch((err: any) => {
-			// Log failure but DON'T stop the interval — transient errors (rate limits,
-			// network blips) shouldn't permanently kill the typing indicator.
-			console.log(`[typing-manager] Failed to send typing for ${channelId}: ${err?.message || err}`);
-		});
-
-		// Set up recurring typing to keep it alive
-		const interval = setInterval(() => {
-			Promise.resolve(channel.sendTyping()).catch((err: any) => {
-				// Same as above: log but don't destroy the interval.
-				console.log(`[typing-manager] Failed to send typing (interval) for ${channelId}: ${err?.message || err}`);
+		// Start typing immediately - log what sendTyping returns
+		const sendResult = channel.sendTyping();
+		console.log(`[typing-manager] sendTyping() returned: ${typeof sendResult}, isThenable: ${typeof sendResult?.then}`);
+		if (sendResult && typeof sendResult.then === 'function') {
+			sendResult.then(() => {
+				console.log(`[typing-manager] Initial typing sent successfully for ${channelId}`);
+			}).catch((err: any) => {
+				console.log(`[typing-manager] Failed to send typing for ${channelId}: ${err?.message || err}`);
 			});
+		}
+
+		// Set up recurring typing to keep it alive - same approach
+		const interval = setInterval(() => {
+			const intervalResult = channel.sendTyping();
+			if (intervalResult && typeof intervalResult.then === 'function') {
+				intervalResult.catch((err: any) => {
+					console.log(`[typing-manager] Failed to send typing (interval) for ${channelId}: ${err?.message || err}`);
+				});
+			}
 		}, this.TYPING_DURATION_MS);
 
 		this.activeTyping.set(channelId, { interval, version });
