@@ -333,22 +333,28 @@ function subscribeToSession(
 	// works for sending messages, unlike channel.sendTyping() which hangs.
 	const typingChannel: TypingChannel = {
 		triggerTyping: async () => {
+			const token = discordClient?.token;
+			if (!token) {
+				console.log(`[typing-manager] No token`);
+				return false;
+			}
+			// Use fetch with a timeout to detect if the endpoint hangs
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 3000);
 			try {
-				const { Routes } = await import("discord.js");
-				if (!discordClient) {
-					console.log(`[typing-manager] No discordClient for typing in ${channelId}`);
-					return false;
-				}
-				if (!discordClient.rest) {
-					console.log(`[typing-manager] discordClient.rest is undefined for ${channelId}`);
-					return false;
-				}
-				console.log(`[typing-manager] About to post typing for ${channelId}...`);
-				await discordClient.rest.post(Routes.channelTyping(channelId));
-				console.log(`[typing-manager] Typing posted successfully for ${channelId}`);
-				return true;
+				const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/typing`, {
+					method: "POST",
+					signal: controller.signal,
+					headers: {
+						"Authorization": `Bot ${token}`,
+					},
+				});
+				clearTimeout(timeout);
+				console.log(`[typing-manager] API returned ${res.status} for ${channelId}`);
+				return res.ok;
 			} catch (err: any) {
-				console.log(`[typing-manager] Typing error for ${channelId}: ${err?.message || err}`);
+				clearTimeout(timeout);
+				console.log(`[typing-manager] Typing error: ${err?.name || err?.message || err}`);
 				return false;
 			}
 		},
