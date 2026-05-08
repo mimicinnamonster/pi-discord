@@ -346,6 +346,23 @@ function subscribeToSession(
 						"Content-Type": "application/json",
 					},
 				});
+				if (res.status === 429) {
+					// Rate limited — retry once after Retry-After header
+					const retryAfter = parseInt(res.headers.get("Retry-After") || "1", 10);
+					console.log(`[typing-manager] Typing API 429 for ${channelId}, retrying in ${retryAfter}s`);
+					await new Promise(r => setTimeout(r, retryAfter * 1000));
+					const retryRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/typing`, {
+						method: "POST",
+						headers: {
+							"Authorization": `Bot ${token}`,
+							"Content-Type": "application/json",
+						},
+					});
+					if (!retryRes.ok) {
+						console.log(`[typing-manager] Typing retry returned ${retryRes.status} for ${channelId}`);
+					}
+					return retryRes.ok;
+				}
 				if (!res.ok) {
 					console.log(`[typing-manager] Typing API returned ${res.status} for ${channelId}`);
 				}

@@ -11,7 +11,9 @@ export interface TypingChannel {
 export class TypingManager {
 	private activeTyping = new Map<string, { interval: NodeJS.Timeout; version: number }>();
 	private versionCounter = 0;
-	private readonly TYPING_DURATION_MS = 5000;
+	// Discord typing rate limit is 1 per 5 seconds. Use 6s to stay safe,
+	// then retry once after a 429 backoff.
+	private readonly TYPING_DURATION_MS = 6000;
 
 	/**
 	 * Show typing indicator for a channel.
