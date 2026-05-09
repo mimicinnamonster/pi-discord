@@ -207,7 +207,7 @@ export class SessionStore {
 		let sessionRef: AgentSession | undefined;
 		const rememberTool = {
 			name: "remember",
-			description: "Save important information to long-term session memory. Use this to remember user preferences, project details, or key decisions. The memory is stored as a list of bullet points in the system prompt.",
+			description: "Save info that lasts only for this session (lost on /clear or restart).",
 			parameters: {
 				type: "object",
 				properties: {
