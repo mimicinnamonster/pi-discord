@@ -54,19 +54,19 @@ describe("Remember Tool Registration", () => {
 
 		// Mimic the implementation from session-store.ts exactly
 		const executeRemember = async ({ memory }: { memory: string }, context: { session: any }) => {
-			const session = context.session; // Extract session from context
+			const session = context.session;
 			const memoryContent = `\n\nagent memory:\n${memory}`;
 			try {
 				await session.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
-				return "✅ Memory updated successfully.";
+				return { content: [{ type: "text", text: "✅ Memory updated successfully." }] };
 			} catch (error) {
-				return `❌ Failed to update memory: ${error}`;
+				return { content: [{ type: "text", text: `❌ Failed to update memory: ${error}` }] };
 			}
 		};
 
 		const result = await executeRemember({ memory: "Test memory" }, { session: mockSession });
 
-		expect(result).toBe("✅ Memory updated successfully.");
+		expect(result).toEqual({ content: [{ type: "text", text: "✅ Memory updated successfully." }] });
 		expect(mockSession.updateSystemPrompt).toHaveBeenCalledWith(
 			`\n\nagent memory:\nTest memory`,
 			{ append: true, replaceMarker: "agent memory:" }

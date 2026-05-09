@@ -222,9 +222,9 @@ export class SessionStore {
 				const memoryContent = `\n\nagent memory:\n${memory}`;
 				try {
 					await sessionRef!.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
-					return "✅ Memory updated successfully.";
+					return { content: [{ type: "text", text: "✅ Memory updated successfully." }] };
 				} catch (error) {
-					return `❌ Failed to update memory: ${error}`;
+					return { content: [{ type: "text", text: `❌ Failed to update memory: ${error}` }] };
 				}
 			},
 		};

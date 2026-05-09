@@ -329,8 +329,8 @@ function subscribeToSession(
 	typingManager: TypingManager,
 	sessionDir: string
 ): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
-	// Use discordClient.rest.post() for typing indicator — same REST client that
-	// works for sending messages, unlike channel.sendTyping() which hangs.
+	// Direct fetch to Discord typing endpoint — bypasses Discord.js's sendTyping()
+	// which wraps the REST client and can cause issues with rate-limit retries.
 	const typingChannel: TypingChannel = {
 		triggerTyping: async () => {
 			const token = discordClient?.token;
@@ -341,7 +341,7 @@ function subscribeToSession(
 					headers: { "Authorization": `Bot ${token}` },
 				});
 				if (res.status === 429) {
-					// Rate limited — interval will retry in 5s
+					// Rate limited — Discord keeps the limit per token, just skip
 					return false;
 				}
 				return res.ok;
@@ -1448,12 +1448,10 @@ async function main() {
 		}
 
 		if (message.content.startsWith("/models ")) {
-			const [provider, ...modelChunks] = message.content.replace('/models ', '').split('/');	
-      const model = modelChunks.join('/');
-      console.log({provider, model})
-			const found = (await session.modelRegistry.getAvailable()).filter(m => 
-				[m.id,m.name,m.provider].some(s => s.includes(provider || undefined) || s.includes(model || undefined))
-			).map(({provider,id}) =>`${provider}/${id}`);
+			const search = message.content.replace("/models ", "").trim();
+			const available = await session.modelRegistry.getAvailable();
+			const { filterModels } = await import("./model-utils.js");
+			const found = filterModels(available, search).map(({provider,id}) =>`${provider}/${id}`);
 			const foundJson = escapeForCodeBlock(JSON.stringify(found, null, 2));
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Models:\n\`\`\`json\n${foundJson}\n\`\`\``);
 			return;
@@ -1466,18 +1464,25 @@ async function main() {
 		}
 
 		if (message.content.startsWith("/model ")) {
-			const [provider, ...modelChunks] = message.content.replace('/model ', '').split('/');	
-      const model = modelChunks.join('/');
+			const search = message.content.replace("/model ", "").trim();
 			try {
-				await discordSession.setModel(provider, model)
-				sessionStore.updateModel(channelId, `${provider}/${model}`);
+				const available = await session.modelRegistry.getAvailable();
+				const { findModel } = await import("./model-utils.js");
+				const m = findModel(available, search);
+
+				if (!m) {
+					throw new Error(`No model matching "${search}" found among available models`);
+				}
+
+				await discordSession.setModel(m.provider, m.id);
+				sessionStore.updateModel(channelId, `${m.provider}/${m.id}`);
 				const modelData = escapeForCodeBlock(JSON.stringify(session.model, null, 2));
-				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Changed model:\n\`\`\`json\n${modelData}\n\`\`\``);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Changed to ${m.provider}/${m.id}:\n\`\`\`json\n${modelData}\n\`\`\``);
 			} catch (error) {
-				console.error(`[${channelId}] Error setting model "${provider}/${model}":`, error);
+				console.error(`[${channelId}] Error setting model from "${search}":`, error);
 				try {
 					await (channel as DMChannel | TextChannel | NewsChannel).send(
-						`❌ Sorry, I encountered an error while setting your model "${provider}/${model}".\n\`\`\`json\n${error}\`\`\``
+						`❌ Sorry, I encountered an error while setting your model "${search}".\n\`\`\`json\n${error}\`\`\``
 					);
 				} catch {
 					// Channel might be unavailable
