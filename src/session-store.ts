@@ -207,7 +207,7 @@ export class SessionStore {
 		let sessionRef: AgentSession | undefined;
 		const rememberTool = {
 			name: "remember",
-			description: "Save info that lasts only for this session (lost on /clear or restart).",
+			description: "Temporary session memory. Adds info to the system prompt for this session only (lost on /clear or restart). Use to remember tasks, preferences, or key facts the agent should track and focus on during this conversation.",
 			parameters: {
 				type: "object",
 				properties: {

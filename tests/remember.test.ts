@@ -43,7 +43,7 @@ describe("Remember Tool Registration", () => {
 		const rememberTool = tools.find((t: any) => t.name === "remember");
 		
 		expect(rememberTool).toBeDefined();
-		expect(rememberTool.description).toContain("lasts only for this session");
+		expect(rememberTool.description).toContain("Temporary session memory");
 		expect(rememberTool.parameters.required).toContain("memory");
 	});
 
