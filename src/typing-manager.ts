@@ -9,50 +9,30 @@ export interface TypingChannel {
 }
 
 export class TypingManager {
-	private activeTyping = new Map<string, { interval: NodeJS.Timeout; version: number }>();
+	private activeTyping = new Map<string, { timeout: NodeJS.Timeout; version: number }>();
 	private versionCounter = 0;
-	// Discord typing rate limit is 1 per 5 seconds. Use 6s to stay safe,
-	// then retry once after a 429 backoff.
-	private readonly TYPING_DURATION_MS = 6000;
 
 	/**
 	 * Show typing indicator for a channel.
-	 * Automatically stops after TYPING_DURATION_MS to prevent stuck typing.
+	 *
+	 * Sends a single typing request. Discord keeps the indicator visible
+	 * for ~10 seconds. No interval to avoid Discord's strict 429 rate limit.
 	 *
 	 * This method is idempotent: if typing is already active for this channel,
-	 * it won't reset the interval. The interval fires every TYPING_DURATION_MS
-	 * and handles refreshing, preventing Discord rate-limit issues from rapid
-	 * thinking_delta events.
+	 * it does nothing.
 	 */
 	show(channelId: string, channel: TypingChannel): void {
-		// If typing is already active, just log and return — the interval handles refreshes
 		if (this.activeTyping.has(channelId)) {
 			return;
 		}
 
-		// Assign a unique version for this show() instance
-		this.versionCounter++;
-		const version = this.versionCounter;
-
 		console.log(`[typing-manager] Showing typing for ${channelId}`);
+		channel.triggerTyping();
 
-		// Start typing immediately
-		channel.triggerTyping().then((ok) => {
-			console.log(`[typing-manager] Initial typing ${ok ? "sent" : "failed"} for ${channelId}`);
-		}).catch((err) => {
-			console.log(`[typing-manager] Failed to send typing for ${channelId}: ${err?.message || err}`);
+		this.activeTyping.set(channelId, {
+			timeout: setTimeout(() => this.hide(channelId), 10000),
+			version: this.versionCounter++,
 		});
-
-		// Set up recurring typing to keep it alive
-		const interval = setInterval(() => {
-			channel.triggerTyping().then((ok) => {
-				if (!ok) console.log(`[typing-manager] Interval typing failed for ${channelId}`);
-			}).catch((err) => {
-				console.log(`[typing-manager] Failed to send typing (interval) for ${channelId}: ${err?.message || err}`);
-			});
-		}, this.TYPING_DURATION_MS);
-
-		this.activeTyping.set(channelId, { interval, version });
 	}
 
 	/**
@@ -60,13 +40,9 @@ export class TypingManager {
 	 * Called when we know the LLM has finished (agent_end).
 	 */
 	hide(channelId: string): void {
-		this.clearTimeout(channelId);
-	}
-
-	private clearTimeout(channelId: string): void {
 		const existing = this.activeTyping.get(channelId);
 		if (existing) {
-			clearInterval(existing.interval);
+			clearTimeout(existing.timeout);
 			this.activeTyping.delete(channelId);
 		}
 	}
@@ -83,7 +59,7 @@ export class TypingManager {
 	 */
 	dispose(): void {
 		for (const channelId of this.activeTyping.keys()) {
-			this.clearTimeout(channelId);
+			this.hide(channelId);
 		}
 	}
 }
