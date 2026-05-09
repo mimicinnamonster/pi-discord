@@ -218,10 +218,20 @@ export class SessionStore {
 				},
 				required: ["memory"],
 			},
-			execute: async (_toolCallId: string, { memory }: { memory: string }) => {
-				const memoryContent = `\n\nagent memory:\n${memory}`;
+					execute: async (_toolCallId: string, { memory }: { memory: string }) => {
 				try {
-					await sessionRef!.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
+					const memoryBlock = `agent memory:\n${memory}`;
+					const current = sessionRef!["agent"].state.systemPrompt;
+					const marker = "agent memory:";
+					const markerIndex = current.indexOf(marker);
+					if (markerIndex !== -1) {
+						// Replace from the marker, strip trailing newlines from existing prefix
+						const base = current.slice(0, markerIndex).replace(/\n+$/, "");
+						sessionRef!["agent"].state.systemPrompt = base + `\n\n${memoryBlock}`;
+					} else {
+						// Append
+						sessionRef!["agent"].state.systemPrompt = current + `\n\n${memoryBlock}`;
+					}
 					return { content: [{ type: "text", text: "✅ Memory updated successfully." }] };
 				} catch (error) {
 					return { content: [{ type: "text", text: `❌ Failed to update memory: ${error}` }] };

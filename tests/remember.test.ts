@@ -47,29 +47,58 @@ describe("Remember Tool Registration", () => {
 		expect(rememberTool.parameters.required).toContain("memory");
 	});
 
-	it("should execute the remember tool and call updateSystemPrompt", async () => {
-		const mockSession = {
-			updateSystemPrompt: vi.fn().mockResolvedValue(undefined),
-		};
+	it("should execute the remember tool and modify the system prompt", async () => {
+		// Mock agent with a modifiable system prompt
+		const agent = { state: { systemPrompt: "Default prompt" } };
 
-		// Mimic the implementation from session-store.ts exactly
-		const executeRemember = async ({ memory }: { memory: string }, context: { session: any }) => {
-			const session = context.session;
-			const memoryContent = `\n\nagent memory:\n${memory}`;
+		// Mimic the current implementation from session-store.ts
+		const executeRemember = async ({ memory }: { memory: string }) => {
 			try {
-				await session.updateSystemPrompt(memoryContent, { append: true, replaceMarker: "agent memory:" });
+				const memoryBlock = `agent memory:\n${memory}`;
+				const current = agent.state.systemPrompt;
+				const marker = "agent memory:";
+				const markerIndex = current.indexOf(marker);
+				if (markerIndex !== -1) {
+					const base = current.slice(0, markerIndex).replace(/\n+$/, "");
+					agent.state.systemPrompt = base + `\n\n${memoryBlock}`;
+				} else {
+					agent.state.systemPrompt = current + `\n\n${memoryBlock}`;
+				}
 				return { content: [{ type: "text", text: "✅ Memory updated successfully." }] };
 			} catch (error) {
 				return { content: [{ type: "text", text: `❌ Failed to update memory: ${error}` }] };
 			}
 		};
 
-		const result = await executeRemember({ memory: "Test memory" }, { session: mockSession });
+		const result = await executeRemember({ memory: "Focused on tests" });
 
 		expect(result).toEqual({ content: [{ type: "text", text: "✅ Memory updated successfully." }] });
-		expect(mockSession.updateSystemPrompt).toHaveBeenCalledWith(
-			`\n\nagent memory:\nTest memory`,
-			{ append: true, replaceMarker: "agent memory:" }
-		);
+		expect(agent.state.systemPrompt).toBe("Default prompt\n\nagent memory:\nFocused on tests");
+	});
+
+	it("should replace existing memory on second call", async () => {
+		const agent = { state: { systemPrompt: "Default\n\nagent memory:\nOld memory" } };
+
+		const executeRemember = async ({ memory }: { memory: string }) => {
+			try {
+				const memoryBlock = `agent memory:\n${memory}`;
+				const current = agent.state.systemPrompt;
+				const marker = "agent memory:";
+				const markerIndex = current.indexOf(marker);
+				if (markerIndex !== -1) {
+					const base = current.slice(0, markerIndex).replace(/\n+$/, "");
+					agent.state.systemPrompt = base + `\n\n${memoryBlock}`;
+				} else {
+					agent.state.systemPrompt = current + `\n\n${memoryBlock}`;
+				}
+				return { content: [{ type: "text", text: "✅ Memory updated successfully." }] };
+			} catch (error) {
+				return { content: [{ type: "text", text: `❌ Failed to update memory: ${error}` }] };
+			}
+		};
+
+		await executeRemember({ memory: "New memory content" });
+
+		expect(agent.state.systemPrompt).toBe("Default\n\nagent memory:\nNew memory content");
 	});
 });
