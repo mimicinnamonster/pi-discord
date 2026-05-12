@@ -247,7 +247,7 @@ export class SessionStore {
 				properties: {
 					path: {
 						type: "string",
-						description: "Absolute path to the image file (e.g. /Users/michal/Pictures/error.png).",
+						description: "Absolute path to the image file (e.g. ~/Pictures/error.png).",
 					},
 				},
 				required: ["path"],

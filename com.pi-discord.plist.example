@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.michal.pi-discord</string>
+    <string>com.pi-discord</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/michal/Projects/pi-discord/start-bot.sh</string>
+        <string>/PATH/TO/pi-discord/start-bot.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -17,20 +17,20 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/michal/Projects/pi-discord/logs.txt</string>
+    <string>/PATH/TO/pi-discord/logs.txt</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/michal/Projects/pi-discord/logs.txt</string>
+    <string>/PATH/TO/pi-discord/logs.txt</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/michal/Projects/pi-discord</string>
+    <string>/PATH/TO/pi-discord</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>DISCORD_DEBUG</key>
         <string>true</string>
         <key>PATH</key>
-        <string>/Users/michal/.local/share/mise/shims:/Users/michal/.local/share/mise/installs/node/25.9.0/bin:/Users/michal/.local/share/mise/installs/bun/1.3.11/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/sbin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 </dict>
 </plist>

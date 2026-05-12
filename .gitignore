@@ -36,5 +36,20 @@ bun.lockb
 
 # Logs
 logs.txt
-logs.txt
 log.txt
+
+# Personal/deployment config files (machine-specific)
+com.michal.pi-discord.plist
+start-bot.sh
+AGENTS.md
+
+# Notes & task data (personal)
+Notes/
+tasks.json
+
+# Subtitle files (downloaded artifacts)
+subs_p4AzAaJ8Ick.en-orig.vtt
+subs_p4AzAaJ8Ick.en.vtt
+
+# package-lock.json not needed when using bun
+package-lock.json
