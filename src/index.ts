@@ -752,8 +752,9 @@ async function main() {
 
 		if (oldName !== newName) {
 			log(`[${channelId}] Channel renamed: "${oldName}" → "${newName}"`);
-			// Session tracking uses channelId which doesn't change, so no action needed
-			log(`[${channelId}] Session tracking continues normally (tracked by channelId, not name)`);
+			// Update the channel name in session store so the system prompt reflects the rename
+			sessionStore.setChannelName(channelId, newName);
+			log(`[${channelId}] Updated session channel name to "${newName}"`);
 		}
 	});
 
@@ -1085,12 +1086,22 @@ async function main() {
 	let subscribeCount = 0;
 	let sendCount = 0;
 
+	function getChannelDisplayName(channel: DMChannel | TextChannel | NewsChannel | ThreadChannel): string {
+		if (channel.type === ChannelType.DM) {
+			const dmChannel = channel as DMChannel;
+			return dmChannel.recipient?.username || "DM";
+		}
+		return ((channel as TextChannel | NewsChannel | ThreadChannel).name) || "Unknown";
+	}
+
 	async function handleMessage(
 		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
 		message: any
 	): Promise<void> {
 		const channelId = channel.id;
-		const discordSession = await sessionStore.getOrCreate(channelId);
+		const channelName = getChannelDisplayName(channel);
+		sessionStore.setChannelName(channelId, channelName);
+		const discordSession = await sessionStore.getOrCreate(channelId, channelName);
 		const { session } = discordSession;
 
 		// Store Discord message ID for tracking in session
@@ -1375,7 +1386,8 @@ async function main() {
 				promptQueue.delete(channelId);
 			}
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
-			process.exit(1);
+			shutdown();
+			return;
 		}
 
 		// Handle /clear command - start a new session (no confirmation)
@@ -1561,7 +1573,13 @@ async function main() {
 			if (mainTip && branchAndSync(mainTip)) {
 				log(`[${channelId}] Branched to main branch tip ${mainTip}`);
 			} else {
-				log(`[${channelId}] Tree is empty, creating new root`);
+				// mainBranchTip is stale (e.g. after crash/restart) — try latest leaf
+				const leafId = session.sessionManager.getLeafId();
+				if (leafId && branchAndSync(leafId)) {
+					log(`[${channelId}] mainBranchTip stale, branched to latest leaf ${leafId}`);
+				} else {
+					log(`[${channelId}] Tree is empty, creating new root`);
+				}
 			}
 		}
 

@@ -113,6 +113,7 @@ export class SessionStore {
 	private pendingSessions = new Map<string, Promise<DiscordSession>>();
 	private sessionDir: string;
 	private debug: boolean;
+	private channelNames = new Map<string, string>();
 
 	constructor(options?: { sessionDir?: string; debug?: boolean }) {
 		this.sessionDir = options?.sessionDir || join(homedir(), ".pi-discord", "sessions");
@@ -175,7 +176,7 @@ export class SessionStore {
 	// Session Management
 	// ============================================================================
 
-	private async createPiSession(channelId: string, sessionPath: string, cwdOverride?: string): Promise<AgentSession> {
+	private async createPiSession(channelId: string, sessionPath: string, channelName?: string, cwdOverride?: string): Promise<AgentSession> {
 		this.log(`Creating session for channel ${channelId}: ${sessionPath}`);
 
 		// Set up auth and model registry
@@ -285,17 +286,30 @@ export class SessionStore {
 			retry: { enabled: true, maxRetries: 10 },
 		});
 
+		// Store channel name if provided
+		if (channelName) {
+			this.channelNames.set(channelId, channelName);
+		}
+
 		// load resources
+		const getChannelName = () => this.channelNames.get(channelId) || channelName || "Discord";
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: finalCwd,
 			agentDir,
 			settingsManager,
-			appendSystemPrompt: [`/n/nYou are running on Discord, use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
+			appendSystemPrompt: [`\n\nYou are running on Discord (in a channel named "${getChannelName()}"), use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
 			systemPromptOverride: (basePrompt) => {
 				if (!basePrompt) return basePrompt;
 				const now = new Date();
 				const localDate = now.toLocaleDateString('en-CA');
 				let prompt = basePrompt.replace(/Current date: \d{4}-\d{2}-\d{2}/, `Current date: ${localDate}`);
+
+				// Dynamically update channel name (handles renames)
+				const chanName = getChannelName();
+				prompt = prompt.replace(
+					/You are running on Discord \(in a channel named "[^"]*"\)/,
+					`You are running on Discord (in a channel named "${chanName}")`
+				);
 
 				return prompt;
 			}
@@ -351,7 +365,15 @@ export class SessionStore {
 		return session;
 	}
 
-	async getOrCreate(channelId: string): Promise<DiscordSession> {
+	setChannelName(channelId: string, name: string): void {
+		this.channelNames.set(channelId, name);
+	}
+
+	getChannelName(channelId: string): string {
+		return this.channelNames.get(channelId) || "Discord";
+	}
+
+	async getOrCreate(channelId: string, channelName?: string): Promise<DiscordSession> {
 		// Fast path: already in memory
 		const existing = this.sessions.get(channelId);
 		if (existing) {
@@ -368,7 +390,7 @@ export class SessionStore {
 
 		this.log(`[${channelId}] getOrCreate: creating new session (${this.pendingSessions.size} pending)`);
 		// Create new session (only one per channel)
-		const createPromise = this.doCreateSession(channelId);
+		const createPromise = this.doCreateSession(channelId, channelName);
 		this.pendingSessions.set(channelId, createPromise);
 
 		try {
@@ -380,13 +402,24 @@ export class SessionStore {
 		}
 	}
 
-	private async doCreateSession(channelId: string): Promise<DiscordSession> {
+	private async doCreateSession(channelId: string, channelName?: string): Promise<DiscordSession> {
 		const index = this.loadIndex();
 		const indexed = index.sessions[channelId];
 
 		// Use stored session file path if available, otherwise use default
-		const sessionPath = indexed?.sessionFile || this.getSessionPath(channelId);
-		const exists = existsSync(sessionPath);
+		const defaultPath = this.getSessionPath(channelId);
+		const sessionPath = indexed?.sessionFile || defaultPath;
+
+		// Check if the session file actually exists at the stored path
+		let sessionFile = sessionPath;
+		let exists = existsSync(sessionFile);
+
+		// If the stored path doesn't exist (e.g., after home dir rename), use default
+		if (!exists && indexed?.sessionFile) {
+			this.log(`Session file not found at ${sessionPath}, trying default path ${defaultPath}`);
+			sessionFile = defaultPath;
+			exists = existsSync(sessionFile);
+		}
 
 		if (exists) {
 			this.log(`Found existing session for channel ${channelId}: ${sessionPath}`);
@@ -394,7 +427,7 @@ export class SessionStore {
 			this.log(`Creating new session for channel ${channelId}: ${sessionPath}`);
 		}
 
-		const session = await this.createPiSession(channelId, sessionPath, indexed?.cwd);
+		const session = await this.createPiSession(channelId, sessionFile, channelName, indexed?.cwd);
 
 		// Restore persisted model if available
 		if (indexed?.model) {
@@ -423,7 +456,7 @@ export class SessionStore {
 		newIndex.sessions[channelId] = {
 			...currentMeta,
 			channelId,
-			sessionFile: sessionPath,
+			sessionFile: sessionFile,
 			lastActivity: discordSession.lastActivity,
 		};
 		this.saveIndex(newIndex);
