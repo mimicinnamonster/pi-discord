@@ -10,6 +10,7 @@ import { generateTokenStatsMessage } from "./token-stats";
 import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
+import { writeFileSync, readFileSync, existsSync } from "fs";
 import {
 	loadBranchMetadata,
 	saveBranchMetadata,
@@ -64,8 +65,30 @@ const lastThinkingMessageId = new Map<string, string>();
 // Track previous token counts per channel for utilization alerts
 const previousTokens = new Map<string, { contextPercent: number; inputTokens: number; outputTokens: number }>();
 
-// Track queued prompts per channel
+// Track queued prompts per channel (persisted to disk)
 const promptQueue = new Map<string, string[]>();
+
+function savePromptQueue(): void {
+	try {
+		const obj: Record<string, string[]> = {};
+		for (const [ch, q] of promptQueue) {
+			if (q.length > 0) obj[ch] = q;
+		}
+		writeFileSync(join(sessionDir, "queues.json"), JSON.stringify(obj, null, 2));
+	} catch {}
+}
+
+function loadPromptQueue(): void {
+	try {
+		const path = join(sessionDir, "queues.json");
+		if (existsSync(path)) {
+			const obj = JSON.parse(readFileSync(path, "utf-8"));
+			for (const [ch, q] of Object.entries(obj)) {
+				promptQueue.set(ch, q as string[]);
+			}
+		}
+	} catch {}
+}
 
 // Track pending Discord message IDs being processed (for branch metadata)
 // Map structure: channelId -> discordMessageId
@@ -502,6 +525,7 @@ function subscribeToSession(
 						const nextPrompt = queue.shift();
 						if (nextPrompt) {
 							promptQueue.set(channelId, queue);
+							savePromptQueue();
 							log(`[${channelId}] Processing queued prompt: ${nextPrompt.slice(0, 50)}...`);
 							
 							// Send notification about queued prompt being executed
@@ -1259,6 +1283,7 @@ async function main() {
 			}
 			promptQueue.get(channelId)!.push(prompt);
 			const position = promptQueue.get(channelId)!.length;
+			savePromptQueue();
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `📥 Prompt queued (#${position}): ${prompt.length > 100 ? prompt.slice(0, 100) + '...' : prompt}`);
 			return;
 		}
@@ -1383,6 +1408,7 @@ async function main() {
 				promptQueue.delete(channelId);
 			}
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
+			savePromptQueue();
 			shutdown();
 			return;
 		}
@@ -1397,6 +1423,7 @@ async function main() {
 			metadata.labelCounter = 0;
 			metadata.labels.clear();
 			promptQueue.delete(channelId); // Clear queued prompts
+			savePromptQueue();
 			saveBranchMetadata(sessionDir, channelId, metadata);
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Started new session. What would you like to work on?");
 			return;
@@ -1659,6 +1686,17 @@ async function main() {
 
 	process.on("SIGINT", shutdown);
 	process.on("SIGTERM", shutdown);
+
+	// Restore persisted prompt queues from disk
+	loadPromptQueue();
+
+	// Pre-create sessions for channels with queued prompts so they survive restarts
+	for (const chId of promptQueue.keys()) {
+		console.log(`[discord] Pre-creating session for channel ${chId} (${promptQueue.get(chId)?.length || 0} queued prompts)`);
+		sessionStore.getOrCreate(chId).catch((err) => {
+			console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
+		});
+	}
 
 	console.log("[discord] Bot is ready and listening for messages!");
 }
