@@ -91,20 +91,6 @@ function loadPromptQueue(): void {
 }
 
 /** Persist a channel as having active scheduled prompts so sessions are restored on restart */
-function markChannelScheduled(channelId: string): void {
-	try {
-		const path = join(sessionDir, "schedules.json");
-		let channels: string[] = [];
-		if (existsSync(path)) {
-			channels = JSON.parse(readFileSync(path, "utf-8"));
-		}
-		if (!channels.includes(channelId)) {
-			channels.push(channelId);
-			writeFileSync(path, JSON.stringify(channels, null, 2));
-		}
-	} catch {}
-}
-
 /** Load and restore sessions for channels with persisted scheduled prompts */
 function restoreScheduledSessions(): void {
 	try {
