@@ -108,14 +108,20 @@ function markChannelScheduled(channelId: string): void {
 /** Load and restore sessions for channels with persisted scheduled prompts */
 function restoreScheduledSessions(): void {
 	try {
-		const path = join(sessionDir, "schedules.json");
+		const path = join(sessionDir, "..", ".pi", "schedule-prompts.json");
 		if (existsSync(path)) {
-			const channels: string[] = JSON.parse(readFileSync(path, "utf-8"));
-			for (const chId of channels) {
-				console.log(`[discord] Pre-creating session for scheduled channel ${chId}`);
-				sessionStore.getOrCreate(chId).catch((err) => {
-					console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
-				});
+			const data = JSON.parse(readFileSync(path, "utf-8"));
+			const jobs = data.jobs || [];
+			for (const job of jobs) {
+				// Extract channel ID from description field: "channel:ID - ..."
+				const match = job.description?.match(/^channel:([0-9]+)/);
+				if (match) {
+					const chId = match[1];
+					console.log(`[discord] Pre-creating session for scheduled channel ${chId} (job: ${job.name || job.id})`);
+					sessionStore.getOrCreate(chId).catch((err) => {
+						console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
+					});
+				}
 			}
 		}
 	} catch {}
