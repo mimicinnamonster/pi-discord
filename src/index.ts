@@ -1281,7 +1281,6 @@ async function main() {
 			}
 
 			log(`[${channelId}] Executing bash command: ${command}`);
-			typingManager.show(channelId, typingChannel);
 
 			try {
 				const output: string[] = [];
@@ -1302,8 +1301,6 @@ async function main() {
 				const truncatedError = errorStr.length > 1800 ? errorStr.substring(0, 1800) + "... (truncated)" : errorStr;
 				const errorMessage = `❌ Bash error: ${truncatedError}`;
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, errorMessage);
-			} finally {
-				typingManager.hide(channelId);
 			}
 			return;
 		}
@@ -1572,14 +1569,17 @@ async function main() {
 			const mainTip = metadata.mainBranchTip;
 			if (mainTip && branchAndSync(mainTip)) {
 				log(`[${channelId}] Branched to main branch tip ${mainTip}`);
-			} else {
-				// mainBranchTip is stale (e.g. after crash/restart) — try latest leaf
+			} else if (mainTip) {
+				// mainBranchTip exists but entry is missing (crash/restart) — try latest leaf
 				const leafId = session.sessionManager.getLeafId();
 				if (leafId && branchAndSync(leafId)) {
 					log(`[${channelId}] mainBranchTip stale, branched to latest leaf ${leafId}`);
 				} else {
 					log(`[${channelId}] Tree is empty, creating new root`);
 				}
+			} else {
+				// mainBranchTip is null (e.g. after /clear) — start fresh
+				log(`[${channelId}] Tree is empty, creating new root`);
 			}
 		}
 
