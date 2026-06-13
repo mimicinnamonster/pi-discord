@@ -90,6 +90,37 @@ function loadPromptQueue(): void {
 	} catch {}
 }
 
+/** Persist a channel as having active scheduled prompts so sessions are restored on restart */
+function markChannelScheduled(channelId: string): void {
+	try {
+		const path = join(sessionDir, "schedules.json");
+		let channels: string[] = [];
+		if (existsSync(path)) {
+			channels = JSON.parse(readFileSync(path, "utf-8"));
+		}
+		if (!channels.includes(channelId)) {
+			channels.push(channelId);
+			writeFileSync(path, JSON.stringify(channels, null, 2));
+		}
+	} catch {}
+}
+
+/** Load and restore sessions for channels with persisted scheduled prompts */
+function restoreScheduledSessions(): void {
+	try {
+		const path = join(sessionDir, "schedules.json");
+		if (existsSync(path)) {
+			const channels: string[] = JSON.parse(readFileSync(path, "utf-8"));
+			for (const chId of channels) {
+				console.log(`[discord] Pre-creating session for scheduled channel ${chId}`);
+				sessionStore.getOrCreate(chId).catch((err) => {
+					console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
+				});
+			}
+		}
+	} catch {}
+}
+
 // Track pending Discord message IDs being processed (for branch metadata)
 // Map structure: channelId -> discordMessageId
 const pendingDiscordMessages = new Map<string, string>();
@@ -1689,6 +1720,9 @@ async function main() {
 
 	// Restore persisted prompt queues from disk
 	loadPromptQueue();
+
+	// Restore sessions for channels with scheduled prompts
+	restoreScheduledSessions();
 
 	// Pre-create sessions for channels with queued prompts so they survive restarts
 	for (const chId of promptQueue.keys()) {
