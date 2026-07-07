@@ -10,7 +10,7 @@ import { generateTokenStatsMessage } from "./token-stats";
 import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
-import { writeFileSync, readFileSync, existsSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, readdirSync } from "fs";
 import {
 	loadBranchMetadata,
 	saveBranchMetadata,
@@ -90,27 +90,115 @@ function loadPromptQueue(): void {
 	} catch {}
 }
 
-/** Persist a channel as having active scheduled prompts so sessions are restored on restart */
-/** Load and restore sessions for channels with persisted scheduled prompts */
-function restoreScheduledSessions(): void {
+/** Build a map of session UUID → channel ID by scanning Discord session files. */
+function buildSessionChannelMap(): Map<string, string> {
+	const uuidToChannel = new Map<string, string>();
+	const sessionDir = join(homedir(), ".pi-discord", "sessions");
+	if (!existsSync(sessionDir)) return uuidToChannel;
 	try {
-		const path = join(sessionDir, "..", ".pi", "schedule-prompts.json");
-		if (existsSync(path)) {
-			const data = JSON.parse(readFileSync(path, "utf-8"));
-			const jobs = data.jobs || [];
-			for (const job of jobs) {
-				// Extract channel ID from description field: "channel:ID - ..."
-				const match = job.description?.match(/^channel:([0-9]+)/);
-				if (match) {
-					const chId = match[1];
-					console.log(`[discord] Pre-creating session for scheduled channel ${chId} (job: ${job.name || job.id})`);
-					sessionStore.getOrCreate(chId).catch((err) => {
-						console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
-					});
-				}
-			}
+		for (const file of readdirSync(sessionDir)) {
+			const match = file.match(/^discord-(\d+)\.jsonl$/);
+			if (!match) continue;
+			const chId = match[1];
+			try {
+				const firstLine = readFileSync(join(sessionDir, file), "utf-8").split("\n")[0];
+				const meta = JSON.parse(firstLine);
+				if (meta.id) uuidToChannel.set(meta.id, chId);
+			} catch {}
 		}
 	} catch {}
+	return uuidToChannel;
+}
+
+/**
+ * Restore sessions for channels with scheduled prompts.
+ *
+ * On startup, reads schedule-prompts.json, strips session-scoping so jobs fire
+ * regardless of which pi session created them, and pre-creates Discord sessions
+ * for every channel that has an enabled cron job — so the pi-schedule-prompt
+ * scheduler has a live session to fire into.
+ */
+function restoreScheduledSessions(): void {
+	try {
+		const path = join(process.cwd(), ".pi", "schedule-prompts.json");
+		if (!existsSync(path)) return;
+
+		const data = JSON.parse(readFileSync(path, "utf-8"));
+		const jobs: any[] = data.jobs || [];
+		if (jobs.length === 0) return;
+
+		// Build UUID → channelId map from existing Discord sessions
+		const uuidToChannel = buildSessionChannelMap();
+
+		let dirty = false;
+		const channelsToCreate = new Set<string>();
+
+		for (const job of jobs) {
+			// --- Resolve channel from description (persisted format) ---
+			const descMatch = job.description?.match(/^channel:(\d+)/);
+			if (descMatch) {
+				channelsToCreate.add(descMatch[1]);
+			}
+
+			// --- Resolve channel from session UUID (first-time after creation) ---
+			if (job.session) {
+				const chId = uuidToChannel.get(job.session);
+				if (chId) {
+					channelsToCreate.add(chId);
+					// Persist the channel association so we don't need the UUID next time
+					if (!job.description?.startsWith("channel:")) {
+						job.description = `channel:${chId} - ${job.description || "auto"}`;
+					}
+				}
+				delete job.session;
+				dirty = true;
+			}
+		}
+
+		if (dirty) {
+			writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+			console.log(`[discord] Stripped session field from jobs, identified ${channelsToCreate.size} channel(s) for scheduled prompts`);
+		}
+
+		for (const chId of channelsToCreate) {
+			console.log(`[discord] Pre-creating session for scheduled channel ${chId}`);
+			sessionStore.getOrCreate(chId).catch((err) => {
+				console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
+			});
+		}
+	} catch {}
+}
+
+/**
+ * Periodically ensure that every enabled cron job has a live Discord session.
+ *
+ * pi-schedule-prompt only fires while a session is open in this directory.
+ * Since pi-discord creates sessions on-demand when users chat, cron jobs at
+ * quiet hours would be silently skipped. This keeper checks every 60 seconds
+ * and creates sessions for any channel that has an enabled scheduled job but
+ * no active session.
+ */
+function startSessionKeeper(): void {
+	setInterval(() => {
+		try {
+			const path = join(process.cwd(), ".pi", "schedule-prompts.json");
+			if (!existsSync(path)) return;
+
+			const data = JSON.parse(readFileSync(path, "utf-8"));
+			const jobs: any[] = data.jobs || [];
+
+			for (const job of jobs) {
+				if (!job.enabled) continue;
+				const descMatch = job.description?.match(/^channel:(\d+)/);
+				if (!descMatch) continue;
+				const chId = descMatch[1];
+				if (!sessionStore.has(chId)) {
+					console.log(`[discord] Session keeper: creating session for channel ${chId} (job: ${job.name || job.id})`);
+					sessionStore.getOrCreate(chId).catch(() => {});
+				}
+			}
+		} catch {}
+	}, 60_000);
 }
 
 // Track pending Discord message IDs being processed (for branch metadata)
@@ -1166,8 +1254,20 @@ async function main() {
 			type: "user"
 		});
 
-		// Abort any ongoing session operation if user sends a new message
-		if (discordSession.isModelActive()) {
+		// Check for non-interrupting commands (slash commands that should not abort the agent)
+		const isNonInterruptingCommand = message.content === "/queue" || message.content.startsWith("/queue ") ||
+			message.content === "/label" || message.content.startsWith("/label ") ||
+			message.content === "/labels" ||
+			message.content === "/cwd" || message.content.startsWith("/cwd ") ||
+			message.content === "/channel" ||
+			message.content === "/help" ||
+			message.content === "/session" ||
+			message.content === "/models" || message.content.startsWith("/models ") ||
+			message.content === "/model" || message.content.startsWith("/model ") ||
+			message.content === "/settings";
+
+		// Only abort if the agent is active AND this is not a non-interrupting command
+		if (discordSession.isModelActive() && !isNonInterruptingCommand) {
 			log(`[${channelId}] User interrupted - aborting current operation`);
 			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
 			await discordSession.abortModelActivities()
@@ -1715,6 +1815,9 @@ async function main() {
 
 	// Restore sessions for channels with scheduled prompts
 	restoreScheduledSessions();
+
+	// Keep sessions alive for enabled cron jobs (pi-schedule-prompt only fires while a session is open)
+	startSessionKeeper();
 
 	// Pre-create sessions for channels with queued prompts so they survive restarts
 	for (const chId of promptQueue.keys()) {
