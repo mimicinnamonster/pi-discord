@@ -68,6 +68,9 @@ const previousTokens = new Map<string, { contextPercent: number; inputTokens: nu
 // Track queued prompts per channel (persisted to disk)
 const promptQueue = new Map<string, string[]>();
 
+// Track active session labels per channel (set via /label or /session [label])
+const sessionLabels = new Map<string, string>();
+
 function savePromptQueue(): void {
 	try {
 		const obj: Record<string, string[]> = {};
@@ -1371,8 +1374,8 @@ async function main() {
 				`• \`/thinking [level]\` - Set thinking level (e.g., \`/thinking high\`)\n` +
 				`• \`/settings\` - Show current agent settings\n\n` +
 				`**Branching & History**\n` +
-				`• \`/label [name]\` - Label current position (or replied-to msg)\n` +
-				`• \`/labels\` - List all labels in this channel\n` +
+				`• \`/label [name]\` - Label current session for /resume [label]\n` +
+				`• \`/labels\` - List all closed/labeled sessions\n` +
 				`• \`/merge [name]\` - Merge branch from label or reply\n` +
 				`• \`/summary [name]\` - Summarize changes from a branch\n\n` +
 				`**Bash Integration**\n` +
@@ -1547,6 +1550,13 @@ async function main() {
 			const label = message.content.slice("/session".length).trim() || undefined;
 			try {
 				const closedSessionId = await sessionStore.closeAndNewSession(channelId, label);
+
+				// Label the new active session too
+				if (label) {
+					sessionLabels.set(channelId, label);
+				} else {
+					sessionLabels.delete(channelId);
+				}
 
 				// Clear branch metadata for new session
 				const meta = loadBranchMetadata(sessionDir, channelId);
@@ -1752,14 +1762,27 @@ async function main() {
 		}
 
 		// Handle branch commands
+		// Session label: /label shows current, /label [name] sets it
 		if (message.content === "/label") {
-			await handleLabel(channel, message);
+			const currentLabel = sessionLabels.get(channelId);
+			if (currentLabel) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`🏷 Session label: \`${currentLabel}\` (use \`/resume ${currentLabel}\` to return later)`
+				);
+			} else {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					"🏷 No session label set. Use `/label <name>` to set one, then `/session` to close and label it."
+				);
+			}
 			return;
 		}
 
 		if (message.content.startsWith("/label ")) {
 			const labelName = message.content.slice("/label ".length).trim();
-			await handleLabel(channel, message, labelName);
+			sessionLabels.set(channelId, labelName);
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+				`🏷 Session labeled \`${labelName}\`. Use \`/session\` to close and save, then \`/resume ${labelName}\` to return.`
+			);
 			return;
 		}
 
