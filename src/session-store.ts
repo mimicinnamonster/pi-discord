@@ -30,6 +30,7 @@ export interface ClosedSessionInfo {
 	sessionName: string;
 	closedAt: number;
 	label?: string;
+}
 
 export class DiscordSession {
 	channelId: string;

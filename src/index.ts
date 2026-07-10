@@ -1549,6 +1549,10 @@ async function main() {
 		if (message.content === "/session" || message.content.startsWith("/session ")) {
 			const label = message.content.slice("/session".length).trim() || undefined;
 			try {
+				// Get stats before closing
+				const currentLabel = sessionLabels.get(channelId);
+				const stats = session.getSessionStats();
+				
 				const closedSessionId = await sessionStore.closeAndNewSession(channelId, label);
 
 				// Label the new active session too
@@ -1573,9 +1577,15 @@ async function main() {
 				sessionMessageIndex.delete(channelId);
 				discordMessageToSession.delete(channelId);
 
-				const labelStr = label ? ` labeled "${label}"` : "";
+				const msgs = [];
+				if (currentLabel) msgs.push(`🏷 \`${currentLabel}\``);
+				msgs.push(`💬 ${stats.totalMessages} msgs`);
+				if (stats.contextUsage?.percent != null) {
+					msgs.push(`📊 ${Math.round(stats.contextUsage.percent)}% ctx`);
+				}
+				msgs.push(label ? `🏷 "${label}" → /resume ${label}` : `/resume ${closedSessionId.substring(0, 8)}...`);
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
-					`✅ Closed session${labelStr} \`${closedSessionId}\`\nStarted a fresh session. Use \`/resume ${label || closedSessionId}\` to go back.`
+					`✅ Closed session ${msgs.join(' · ')}`
 				);
 			} catch (error) {
 				console.error(`[${channelId}] /session error:`, error);
