@@ -1255,7 +1255,8 @@ async function main() {
 		});
 
 		// Check for non-interrupting commands (slash commands that should not abort the agent)
-		const isNonInterruptingCommand = message.content === "/new" ||
+		const isNonInterruptingCommand = message.content === "/session" || message.content.startsWith("/session ") ||
+			message.content === "/new" ||
 			message.content === "/resume" || message.content.startsWith("/resume ") ||
 			message.content === "/queue" || message.content.startsWith("/queue ") ||
 			message.content === "/label" || message.content.startsWith("/label ") ||
@@ -1358,8 +1359,8 @@ async function main() {
 				`• \`/cwd [path]\` - Change session working directory\n` +
 				`• \`/stats\` - Show token utilization and changes\n` +
 				`• \`/queue [prompt]\` - Queue a prompt to run after current task\n` +
-				`• \`/new\` - Close current session and start a fresh one\n` +
-				`• \`/resume [id]\` - Resume a previously closed session\n` +
+				`• \`/session [label]\` - Close current session (label for /resume [label])\n` +
+				`• \`/resume [id or label]\` - Resume a previously closed session\n` +
 				`• \`/clear\` - Reset session and start fresh\n` +
 				`• \`/reload\` - Reload extensions, skills, and themes\n` +
 				`• \`/exit\` - Shut down the bot\n` +
@@ -1540,10 +1541,12 @@ async function main() {
 			return;
 		}
 
-		// Handle /new command - close current session and start a fresh one
-		if (message.content === "/new") {
+		// Handle /session command - close current session and start a fresh one
+		// /session [label] also labels the session for easy /resume [label]
+		if (message.content === "/session" || message.content.startsWith("/session ")) {
+			const label = message.content.slice("/session".length).trim() || undefined;
 			try {
-				const closedSessionId = await sessionStore.closeAndNewSession(channelId);
+				const closedSessionId = await sessionStore.closeAndNewSession(channelId, label);
 
 				// Clear branch metadata for new session
 				const meta = loadBranchMetadata(sessionDir, channelId);
@@ -1560,13 +1563,14 @@ async function main() {
 				sessionMessageIndex.delete(channelId);
 				discordMessageToSession.delete(channelId);
 
+				const labelStr = label ? ` labeled "${label}"` : "";
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
-					`✅ Closed session \`${closedSessionId}\`\nStarted a fresh session. Use \`/resume ${closedSessionId}\` to go back.`
+					`✅ Closed session${labelStr} \`${closedSessionId}\`\nStarted a fresh session. Use \`/resume ${label || closedSessionId}\` to go back.`
 				);
 			} catch (error) {
-				console.error(`[${channelId}] /new error:`, error);
+				console.error(`[${channelId}] /session error:`, error);
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
-					`❌ Error creating new session: ${error}`
+					`❌ Error: ${error}`
 				);
 			}
 			return;
@@ -1581,15 +1585,16 @@ async function main() {
 				const closed = sessionStore.getClosedSessions(channelId);
 				if (closed.length === 0) {
 					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
-						"📭 No previously closed sessions for this channel. Use `/new` first."
+						"📭 No previously closed sessions for this channel. Use `/session` first."
 					);
 				} else {
 					const lines = closed.map(s => {
 						const date = new Date(s.closedAt).toLocaleString();
-						return `• \`${s.sessionId}\` — ${s.sessionName} (closed ${date})`;
+						const lab = s.label ? ` [${s.label}]` : "";
+						return `• \`${s.sessionId}\`${lab} — ${s.sessionName} (closed ${date})`;
 					});
 					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
-						`**Closed sessions for this channel:**\n${lines.join("\n")}\n\nUse \`/resume <id>\` to resume one.`
+						`**Closed sessions for this channel:**\n${lines.join("\n")}\n\nUse \`/resume <id or label>\` to resume one.`
 					);
 				}
 				return;

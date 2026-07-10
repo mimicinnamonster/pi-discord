@@ -29,7 +29,7 @@ export interface ClosedSessionInfo {
 	sessionFile: string; // backup file path
 	sessionName: string;
 	closedAt: number;
-}
+	label?: string;
 
 export class DiscordSession {
 	channelId: string;
@@ -577,7 +577,7 @@ export class SessionStore {
 	 * Close the current session for a channel and start a new one.
 	 * Returns the closed session's ID.
 	 */
-	async closeAndNewSession(channelId: string): Promise<string> {
+	async closeAndNewSession(channelId: string, label?: string): Promise<string> {
 		const discordSession = this.sessions.get(channelId);
 		if (!discordSession) {
 			throw new Error("No active session for this channel");
@@ -628,6 +628,7 @@ export class SessionStore {
 			sessionFile: backupFile,
 			sessionName,
 			closedAt: timestamp,
+			label,
 		});
 		this.saveClosedSessions(closedSessions);
 
@@ -645,10 +646,12 @@ export class SessionStore {
 	 * Resume a previously closed session.
 	 * Closes the current session, restores the old one by session ID.
 	 */
-	async resumeSession(channelId: string, sessionId: string): Promise<boolean> {
-		// Find the closed session
+	async resumeSession(channelId: string, sessionIdOrLabel: string): Promise<boolean> {
+		// Find the closed session by ID or label
 		const closedSessions = this.loadClosedSessions();
-		const idx = closedSessions.findIndex(s => s.sessionId === sessionId);
+		const idx = closedSessions.findIndex(s =>
+			s.sessionId === sessionIdOrLabel || s.label === sessionIdOrLabel
+		);
 		if (idx === -1) {
 			return false;
 		}
