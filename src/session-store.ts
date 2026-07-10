@@ -17,11 +17,19 @@ import {
 import mcpAdapter from "pi-mcp-adapter";
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, unlinkSync } from "fs";
 
 // ============================================================================
 // Types
 // ============================================================================
+
+export interface ClosedSessionInfo {
+	channelId: string;
+	sessionId: string;
+	sessionFile: string; // backup file path
+	sessionName: string;
+	closedAt: number;
+}
 
 export class DiscordSession {
 	channelId: string;
@@ -534,6 +542,198 @@ export class SessionStore {
 	// Check if a session file exists on disk
 	sessionExists(channelId: string): boolean {
 		return existsSync(this.getSessionPath(channelId));
+	}
+
+	// ============================================================================
+	// Closed Sessions (for /new and /resume)
+	// ============================================================================
+
+	private getClosedSessionsPath(): string {
+		return join(this.sessionDir, "closed-sessions.json");
+	}
+
+	private loadClosedSessions(): ClosedSessionInfo[] {
+		const path = this.getClosedSessionsPath();
+		try {
+			if (existsSync(path)) {
+				return JSON.parse(readFileSync(path, "utf-8"));
+			}
+		} catch (error) {
+			this.log("Failed to load closed sessions:", error);
+		}
+		return [];
+	}
+
+	private saveClosedSessions(sessions: ClosedSessionInfo[]): void {
+		const path = this.getClosedSessionsPath();
+		try {
+			writeFileSync(path, JSON.stringify(sessions, null, 2));
+		} catch (error) {
+			this.log("Failed to save closed sessions:", error);
+		}
+	}
+
+	/**
+	 * Close the current session for a channel and start a new one.
+	 * Returns the closed session's ID.
+	 */
+	async closeAndNewSession(channelId: string): Promise<string> {
+		const discordSession = this.sessions.get(channelId);
+		if (!discordSession) {
+			throw new Error("No active session for this channel");
+		}
+
+		const stats = discordSession.session.getSessionStats();
+		const sessionId = stats.sessionId;
+		const oldSessionFile = stats.sessionFile || this.getSessionPath(channelId);
+		const defaultPath = this.getSessionPath(channelId);
+		const sessionName = discordSession.session.sessionName || `discord-${channelId}`;
+
+		// Generate backup filename with timestamp
+		const timestamp = Date.now();
+		const backupFile = oldSessionFile.replace(/\.jsonl$/, `-${timestamp}.jsonl`);
+
+		this.log(`[${channelId}] Closing session ${sessionId}, moving ${oldSessionFile} → ${backupFile}`);
+
+		// Dispose from memory first (releases file handles)
+		this.dispose(channelId);
+
+		// Rename old session file to backup (copy if the defaultPath differs,
+		// because we need to also clean up the stale default path file below)
+		if (existsSync(oldSessionFile)) {
+			if (oldSessionFile !== defaultPath) {
+				// Session file was changed (e.g., by /clear which calls newSession()),
+				// so copy instead of rename to preserve the file for /resume
+				copyFileSync(oldSessionFile, backupFile);
+			} else {
+				renameSync(oldSessionFile, backupFile);
+			}
+		}
+
+		// Always clean up the default path (discord-{channelId}.jsonl) after rename.
+		// The rename already moved oldSessionFile. The defaultPath may still
+		// exist if oldSessionFile was a different path (e.g., from a previous
+		// /clear or /new). Remove it unconditionally to prevent stale sessions
+		// from being reloaded on restart (causing "invalid base64 data" errors).
+		if (existsSync(defaultPath)) {
+			this.log(`[${channelId}] Removing stale default path file: ${defaultPath}`);
+			unlinkSync(defaultPath);
+		}
+
+		// Store closed session info
+		const closedSessions = this.loadClosedSessions();
+		closedSessions.push({
+			channelId,
+			sessionId,
+			sessionFile: backupFile,
+			sessionName,
+			closedAt: timestamp,
+		});
+		this.saveClosedSessions(closedSessions);
+
+		// Remove channel from active index so next getOrCreate starts fresh
+		const index = this.loadIndex();
+		delete index.sessions[channelId];
+		this.saveIndex(index);
+
+		this.log(`[${channelId}] Closed session ${sessionId}, stored as ${backupFile}`);
+
+		return sessionId;
+	}
+
+	/**
+	 * Resume a previously closed session.
+	 * Closes the current session, restores the old one by session ID.
+	 */
+	async resumeSession(channelId: string, sessionId: string): Promise<boolean> {
+		// Find the closed session
+		const closedSessions = this.loadClosedSessions();
+		const idx = closedSessions.findIndex(s => s.sessionId === sessionId);
+		if (idx === -1) {
+			return false;
+		}
+
+		const closedInfo = closedSessions[idx];
+		const backupFile = closedInfo.sessionFile;
+
+		if (!existsSync(backupFile)) {
+			this.log(`[${channelId}] Closed session file not found: ${backupFile}`);
+			// Clean up stale entry
+			closedSessions.splice(idx, 1);
+			this.saveClosedSessions(closedSessions);
+			return false;
+		}
+
+		// Close current session if any
+		const currentSession = this.sessions.get(channelId);
+		if (currentSession) {
+			// Capture stats BEFORE dispose (session methods may fail after dispose)
+			const currentStats = currentSession.session.getSessionStats();
+			const currentSessionName = currentSession.session.sessionName || `discord-${channelId}`;
+			// Use the actual session file path (may differ from defaultPath after /clear)
+			const currentFile = currentStats.sessionFile || this.getSessionPath(channelId);
+
+			// Dispose current session from memory
+			this.dispose(channelId);
+
+			// Move current session file to a backup
+			if (existsSync(currentFile)) {
+				const swapTimestamp = Date.now();
+				const swappedFile = currentFile.replace(/\.jsonl$/, `-${swapTimestamp}.jsonl`);
+				renameSync(currentFile, swappedFile);
+
+				// Add the current session to closed sessions too, so it's not lost
+				closedSessions.push({
+					channelId,
+					sessionId: currentStats.sessionId,
+					sessionFile: swappedFile,
+					sessionName: currentSessionName,
+					closedAt: swapTimestamp,
+				});
+
+				this.log(`[${channelId}] Moved current session to ${swappedFile}`);
+			}
+		}
+
+		// Restore the target session file back to the default path
+		const defaultPath = this.getSessionPath(channelId);
+		// If default path already exists (stale file from before /clear),
+		// remove it first to avoid renameSync failure
+		if (existsSync(defaultPath)) {
+			this.log(`[${channelId}] Removing stale file at default path: ${defaultPath}`);
+			unlinkSync(defaultPath);
+		}
+		renameSync(backupFile, defaultPath);
+		this.log(`[${channelId}] Restored session ${sessionId}: ${backupFile} → ${defaultPath}`);
+
+		// Update index to point to default path
+		const index = this.loadIndex();
+		index.sessions[channelId] = {
+			channelId,
+			sessionFile: defaultPath,
+			lastActivity: Date.now(),
+		};
+		this.saveIndex(index);
+
+		// Remove from closed sessions list
+		closedSessions.splice(idx, 1);
+		this.saveClosedSessions(closedSessions);
+
+		return true;
+	}
+
+	/**
+	 * Get all closed sessions for a channel.
+	 */
+	getClosedSessions(channelId: string): ClosedSessionInfo[] {
+		return this.loadClosedSessions().filter(s => s.channelId === channelId);
+	}
+
+	/**
+	 * Get all closed sessions across all channels.
+	 */
+	getAllClosedSessions(): ClosedSessionInfo[] {
+		return this.loadClosedSessions();
 	}
 
 	// Reset a session (clear messages, start fresh)

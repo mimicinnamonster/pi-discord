@@ -1255,7 +1255,9 @@ async function main() {
 		});
 
 		// Check for non-interrupting commands (slash commands that should not abort the agent)
-		const isNonInterruptingCommand = message.content === "/queue" || message.content.startsWith("/queue ") ||
+		const isNonInterruptingCommand = message.content === "/new" ||
+			message.content === "/resume" || message.content.startsWith("/resume ") ||
+			message.content === "/queue" || message.content.startsWith("/queue ") ||
 			message.content === "/label" || message.content.startsWith("/label ") ||
 			message.content === "/labels" ||
 			message.content === "/cwd" || message.content.startsWith("/cwd ") ||
@@ -1356,6 +1358,8 @@ async function main() {
 				`• \`/cwd [path]\` - Change session working directory\n` +
 				`• \`/stats\` - Show token utilization and changes\n` +
 				`• \`/queue [prompt]\` - Queue a prompt to run after current task\n` +
+				`• \`/new\` - Close current session and start a fresh one\n` +
+				`• \`/resume [id]\` - Resume a previously closed session\n` +
 				`• \`/clear\` - Reset session and start fresh\n` +
 				`• \`/reload\` - Reload extensions, skills, and themes\n` +
 				`• \`/exit\` - Shut down the bot\n` +
@@ -1533,6 +1537,98 @@ async function main() {
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
 			savePromptQueue();
 			shutdown();
+			return;
+		}
+
+		// Handle /new command - close current session and start a fresh one
+		if (message.content === "/new") {
+			try {
+				const closedSessionId = await sessionStore.closeAndNewSession(channelId);
+
+				// Clear branch metadata for new session
+				const meta = loadBranchMetadata(sessionDir, channelId);
+				meta.discordMsgToPiEntryId.clear();
+				meta.discordMsgParent.clear();
+				meta.mainBranchTip = null;
+				meta.labelCounter = 0;
+				meta.labels.clear();
+				saveBranchMetadata(sessionDir, channelId, meta);
+
+				// Remove this channel from subscribed sessions so the new session gets subscribed
+				subscribedSessions.delete(channelId);
+				sessionSubscriptions.delete(channelId);
+				sessionMessageIndex.delete(channelId);
+				discordMessageToSession.delete(channelId);
+
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`✅ Closed session \`${closedSessionId}\`\nStarted a fresh session. Use \`/resume ${closedSessionId}\` to go back.`
+				);
+			} catch (error) {
+				console.error(`[${channelId}] /new error:`, error);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`❌ Error creating new session: ${error}`
+				);
+			}
+			return;
+		}
+
+		// Handle /resume command - resume a previously closed session
+		if (message.content === "/resume" || message.content.startsWith("/resume ")) {
+			const arg = message.content.slice("/resume".length).trim();
+
+			if (!arg) {
+				// List closed sessions for this channel
+				const closed = sessionStore.getClosedSessions(channelId);
+				if (closed.length === 0) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+						"📭 No previously closed sessions for this channel. Use `/new` first."
+					);
+				} else {
+					const lines = closed.map(s => {
+						const date = new Date(s.closedAt).toLocaleString();
+						return `• \`${s.sessionId}\` — ${s.sessionName} (closed ${date})`;
+					});
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+						`**Closed sessions for this channel:**\n${lines.join("\n")}\n\nUse \`/resume <id>\` to resume one.`
+					);
+				}
+				return;
+			}
+
+			const sessionId = arg;
+			try {
+				const resumed = await sessionStore.resumeSession(channelId, sessionId);
+				if (!resumed) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+						`❌ Session \`${sessionId}\` not found in closed sessions. Use \`/resume\` to list available sessions.`
+					);
+					return;
+				}
+
+				// Clear tracking state for the resumed session
+				subscribedSessions.delete(channelId);
+				sessionSubscriptions.delete(channelId);
+				sessionMessageIndex.delete(channelId);
+				discordMessageToSession.delete(channelId);
+
+				// Clear branch metadata for the resumed session (starts fresh tracking)
+				const meta = loadBranchMetadata(sessionDir, channelId);
+				meta.discordMsgToPiEntryId.clear();
+				meta.discordMsgParent.clear();
+				meta.mainBranchTip = null;
+				meta.labelCounter = 0;
+				meta.labels.clear();
+				saveBranchMetadata(sessionDir, channelId, meta);
+
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`✅ Resumed session \`${sessionId}\``
+				);
+			} catch (error) {
+				console.error(`[${channelId}] /resume error:`, error);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`❌ Error resuming session: ${error}`
+				);
+			}
 			return;
 		}
 
