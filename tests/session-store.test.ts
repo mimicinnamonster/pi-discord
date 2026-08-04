@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { SessionStore } from "../src/session-store";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
-import { tmpdir } from "os";
+import { tmpdir, homedir } from "os";
 
 describe("SessionStore", () => {
 	const testDir = join(tmpdir(), `pi-discord-test-${Date.now()}`);
@@ -133,6 +133,65 @@ describe("SessionStore", () => {
 			// Simulate setModel which re-applies overrides
 			await discordSession.setModel("google", "gemma-4-31b-it");
 			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
+		});
+	});
+
+	describe("CWD Management", () => {
+		it("should expand ~ and persist cwd in the index", async () => {
+			const channelId = "cwd-expand-channel";
+			await store.getOrCreate(channelId);
+			await store.changeCwd(channelId, "~/Projects/rotz");
+
+			const index = store.loadIndex();
+			expect(index.sessions[channelId].cwd).toBe(join(homedir(), "Projects/rotz"));
+		});
+
+		it("should return the expanded path", async () => {
+			const channelId = "cwd-return-channel";
+			await store.getOrCreate(channelId);
+
+			const expanded = await store.changeCwd(channelId, "~");
+			expect(expanded).toBe(homedir());
+		});
+
+		it("should recreate the session with the new cwd applied", async () => {
+			const channelId = "cwd-recreate-channel";
+			await store.getOrCreate(channelId);
+			await store.changeCwd(channelId, "~/Projects/rotz");
+
+			const discordSession = await store.getOrCreate(channelId);
+			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
+		});
+
+		it("should work for a channel without an existing session", async () => {
+			const channelId = "cwd-fresh-channel";
+			await store.changeCwd(channelId, "~/Projects/rotz");
+
+			const index = store.loadIndex();
+			expect(index.sessions[channelId].cwd).toBe(join(homedir(), "Projects/rotz"));
+
+			const discordSession = await store.getOrCreate(channelId);
+			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
+		});
+	});
+
+	describe("Session Close Metadata", () => {
+		it("should preserve cwd and model when closing a session", async () => {
+			const channelId = "close-meta-channel";
+			await store.getOrCreate(channelId);
+			await store.changeCwd(channelId, "~/Projects/rotz");
+			store.updateModel(channelId, "test-provider/test-model");
+
+			await store.closeAndNewSession(channelId);
+
+			const index = store.loadIndex();
+			expect(index.sessions[channelId]).toBeDefined();
+			expect(index.sessions[channelId].cwd).toBe(join(homedir(), "Projects/rotz"));
+			expect(index.sessions[channelId].model).toBe("test-provider/test-model");
+
+			// The new session should pick up the preserved cwd
+			const discordSession = await store.getOrCreate(channelId);
+			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
 		});
 	});
 

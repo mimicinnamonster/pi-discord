@@ -633,9 +633,17 @@ export class SessionStore {
 		});
 		this.saveClosedSessions(closedSessions);
 
-		// Remove channel from active index so next getOrCreate starts fresh
+		// Keep the channel in the active index so its metadata (cwd, model) survives
+		// /session, but reset the session file so the next getOrCreate starts fresh
+		// (the old file was moved to a timestamped backup above).
 		const index = this.loadIndex();
-		delete index.sessions[channelId];
+		const existingMeta = index.sessions[channelId] || {};
+		index.sessions[channelId] = {
+			...existingMeta,
+			channelId,
+			sessionFile: defaultPath,
+			lastActivity: Date.now(),
+		};
 		this.saveIndex(index);
 
 		this.log(`[${channelId}] Closed session ${sessionId}, stored as ${backupFile}`);
@@ -710,9 +718,11 @@ export class SessionStore {
 		renameSync(backupFile, defaultPath);
 		this.log(`[${channelId}] Restored session ${sessionId}: ${backupFile} → ${defaultPath}`);
 
-		// Update index to point to default path
+		// Update index to point to default path, preserving channel metadata (cwd, model)
 		const index = this.loadIndex();
+		const existingMeta = index.sessions[channelId] || {};
 		index.sessions[channelId] = {
+			...existingMeta,
 			channelId,
 			sessionFile: defaultPath,
 			lastActivity: Date.now(),
@@ -740,18 +750,26 @@ export class SessionStore {
 		return this.loadClosedSessions();
 	}
 
-	// Reset a session (clear messages, start fresh)
-	async changeCwd(channelId: string, newCwd: string): Promise<void> {
+	// Change the working directory for a channel and return the expanded path.
+	// The session is recreated so the new cwd takes effect immediately; if the
+	// session file exists it is reopened with the new cwd as an override, which
+	// preserves the conversation context across the change.
+	async changeCwd(channelId: string, newCwd: string): Promise<string> {
 		const expandedPath = newCwd.startsWith("~") 
 			? join(homedir(), newCwd.slice(1)) 
 			: newCwd;
 
 		const index = this.loadIndex();
-		if (index.sessions[channelId]) {
-			index.sessions[channelId].cwd = expandedPath;
-			this.saveIndex(index);
+		if (!index.sessions[channelId]) {
+			index.sessions[channelId] = { channelId, sessionFile: this.getSessionPath(channelId), lastActivity: Date.now() };
 		}
+		index.sessions[channelId].cwd = expandedPath;
+		this.saveIndex(index);
+
 		this.dispose(channelId);
+		await this.getOrCreate(channelId);
+
+		return expandedPath;
 	}
 
 	reset(channelId: string): void {

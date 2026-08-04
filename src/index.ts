@@ -114,12 +114,83 @@ function buildSessionChannelMap(): Map<string, string> {
 }
 
 /**
+ * Rebind all cron jobs for a Discord channel to the given session UUID.
+ * Called after session creation (e.g., /session, restart) so jobs remain
+ * scoped to their correct channel and don't fire in random channels.
+ */
+function rebindChannelJobs(channelId: string, sessionId: string): void {
+	const path = join(process.cwd(), ".pi", "schedule-prompts.json");
+	if (!existsSync(path)) return;
+	try {
+		const data = JSON.parse(readFileSync(path, "utf-8"));
+		const jobs: any[] = data.jobs || [];
+		let dirty = false;
+		for (const job of jobs) {
+			if (job.description?.startsWith(`channel:${channelId}`) && job.session !== sessionId) {
+				job.session = sessionId;
+				dirty = true;
+				console.log(`[discord] Rebound job ${job.name || job.id} to session ${sessionId} for channel ${channelId}`);
+			}
+		}
+		if (dirty) {
+			writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+		}
+	} catch {}
+}
+
+/**
+ * Read the session UUID from an existing session file for a channel.
+ * Returns undefined if the file doesn't exist or can't be read.
+ */
+function readChannelSessionUUID(channelId: string): string | undefined {
+	const sessionDir = join(homedir(), ".pi-discord", "sessions");
+	const sessionPath = join(sessionDir, `discord-${channelId}.jsonl`);
+	try {
+		if (existsSync(sessionPath)) {
+			const firstLine = readFileSync(sessionPath, "utf-8").split("\n")[0];
+			const meta = JSON.parse(firstLine);
+			return meta.id;
+		}
+	} catch {}
+	return undefined;
+}
+
+/**
+ * Given a session ID (UUID) and channel ID, update all jobs for that channel
+ * in schedule-prompts.json to use the given session UUID.
+ * Returns true if any jobs were updated.
+ */
+function setChannelJobsSessionSync(channelId: string, sessionId: string): boolean {
+	const path = join(process.cwd(), ".pi", "schedule-prompts.json");
+	if (!existsSync(path)) return false;
+	try {
+		const data = JSON.parse(readFileSync(path, "utf-8"));
+		const jobs: any[] = data.jobs || [];
+		let dirty = false;
+		for (const job of jobs) {
+			if (job.description?.startsWith(`channel:${channelId}`) && job.session !== sessionId) {
+				job.session = sessionId;
+				dirty = true;
+			}
+		}
+		if (dirty) {
+			writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+		}
+		return dirty;
+	} catch {}
+	return false;
+}
+
+/**
  * Restore sessions for channels with scheduled prompts.
  *
- * On startup, reads schedule-prompts.json, strips session-scoping so jobs fire
- * regardless of which pi session created them, and pre-creates Discord sessions
- * for every channel that has an enabled cron job — so the pi-schedule-prompt
- * scheduler has a live session to fire into.
+ * On startup, reads schedule-prompts.json, ensures each job's `session` field
+ * points to the current session UUID for its channel, and pre-creates Discord
+ * sessions so the pi-schedule-prompt scheduler has a live session to fire into.
+ *
+ * CRITICAL: Never sets `job.session` to undefined — that makes the job fire in
+ * ALL channels (isLoadedFor returns true for undefined). We instead keep stale
+ * UUIDs in the file and only update them after creating the new session.
  */
 function restoreScheduledSessions(): void {
 	try {
@@ -135,6 +206,7 @@ function restoreScheduledSessions(): void {
 
 		let dirty = false;
 		const channelsToCreate = new Set<string>();
+		const channelsWithStaleSession: string[] = [];
 
 		for (const job of jobs) {
 			// --- Resolve channel from description (persisted format) ---
@@ -143,7 +215,7 @@ function restoreScheduledSessions(): void {
 				channelsToCreate.add(descMatch[1]);
 			}
 
-			// --- Resolve channel from session UUID (first-time after creation) ---
+			// --- Resolve channel from session UUID ---
 			if (job.session) {
 				const chId = uuidToChannel.get(job.session);
 				if (chId) {
@@ -151,24 +223,89 @@ function restoreScheduledSessions(): void {
 					// Persist the channel association so we don't need the UUID next time
 					if (!job.description?.startsWith("channel:")) {
 						job.description = `channel:${chId} - ${job.description || "auto"}`;
+						dirty = true;
 					}
+					// Keep job.session — the session file still exists with this UUID.
+					// getOrCreate() below will open the existing file, preserving the UUID.
+				} else if (descMatch) {
+					// Session UUID is stale (e.g., after /session renamed the file).
+					// Keep the stale UUID in the file! Deleting it would make the job
+					// fire in ALL channels. We'll update it after creating the new session.
+					channelsWithStaleSession.push(descMatch[1]);
+				} else {
+					// No channel info at all — truly orphaned session reference.
+					// Safe to delete because there's no way to route it.
+					delete job.session;
+					dirty = true;
 				}
-				delete job.session;
-				dirty = true;
+			} else if (descMatch) {
+				// Job has channel info but no session field. Try to pre-set from
+				// existing session file so the scheduler loads it correctly.
+				const chId = descMatch[1];
+				const fileUUID = readChannelSessionUUID(chId);
+				if (fileUUID) {
+					// Pre-set the UUID from the existing session file so the scheduler
+					// loads the job on first try.
+					job.session = fileUUID;
+					dirty = true;
+				}
+				// If no existing session file, leave undefined — the startSessionKeeper
+				// or first user message will create the session and rebind.
 			}
 		}
 
+		// Save ONLY if we have non-stale updates (description changes, orphaned sessions cleared)
+		// Do NOT save stale-session deletions — we'll update those after creating sessions.
 		if (dirty) {
 			writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
-			console.log(`[discord] Stripped session field from jobs, identified ${channelsToCreate.size} channel(s) for scheduled prompts`);
+			console.log(`[discord] Prepared session references, identified ${channelsToCreate.size} channel(s) for scheduled prompts`);
 		}
 
+		// Now create sessions for all identified channels
+		// For channels with a matching session UUID, the scheduler will load the job correctly.
+		const promises: Array<Promise<void>> = [];
 		for (const chId of channelsToCreate) {
 			console.log(`[discord] Pre-creating session for scheduled channel ${chId}`);
-			sessionStore.getOrCreate(chId).catch((err) => {
+			const p = sessionStore.getOrCreate(chId).then((discordSession) => {
+				const sessionId = discordSession.session.getSessionStats().sessionId;
+				// Rebind all jobs for this channel to the current session UUID
+				for (const job of jobs) {
+					if (job.description?.startsWith(`channel:${chId}`) && job.session !== sessionId) {
+						job.session = sessionId;
+						dirty = true;
+						console.log(`[discord] Bound job ${job.name || job.id} to session ${sessionId} for channel ${chId}`);
+					}
+				}
+			}).catch((err) => {
 				console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
 			});
+			promises.push(p);
 		}
+
+		// Save once all sessions are created and jobs are rebound
+		Promise.all(promises).then(() => {
+			if (dirty) {
+				try {
+					writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+					console.log(`[discord] Saved job session bindings`);
+				} catch {}
+			}
+
+			// For channels with stale sessions whose UUID was updated, restart
+			// the session so the scheduler picks up the rebound job.
+			const channelsToRestart = channelsWithStaleSession.filter(chId => sessionStore.has(chId));
+			for (const chId of channelsToRestart) {
+				try {
+					sessionStore.dispose(chId);
+					sessionStore.getOrCreate(chId).catch(err => {
+						console.error(`[discord] Failed to restart session for ${chId}:`, err);
+					});
+					console.log(`[discord] Restarted session for channel ${chId} after rebind`);
+				} catch (err) {
+					console.error(`[discord] Failed to restart session for ${chId}:`, err);
+				}
+			}
+		}).catch(() => {});
 	} catch {}
 }
 
@@ -180,26 +317,100 @@ function restoreScheduledSessions(): void {
  * quiet hours would be silently skipped. This keeper checks every 60 seconds
  * and creates sessions for any channel that has an enabled scheduled job but
  * no active session.
+ *
+ * CRITICAL: Never deletes `job.session` first — setting it to undefined makes
+ * the job fire in ALL channels (isLoadedFor returns true for everyone).
+ * Instead, pre-sets the session UUID from the existing session file (so the
+ * new scheduler loads it), or creates the session first, then updates the
+ * session field and restarts the session for new channels.
  */
 function startSessionKeeper(): void {
 	setInterval(() => {
-		try {
-			const path = join(process.cwd(), ".pi", "schedule-prompts.json");
-			if (!existsSync(path)) return;
+		const intervalPath = join(process.cwd(), ".pi", "schedule-prompts.json");
+		if (!existsSync(intervalPath)) return;
 
-			const data = JSON.parse(readFileSync(path, "utf-8"));
+		try {
+			const data = JSON.parse(readFileSync(intervalPath, "utf-8"));
 			const jobs: any[] = data.jobs || [];
 
+			// Identify channels that need sessions
+			const channelsNeeded = new Set<string>();
 			for (const job of jobs) {
 				if (!job.enabled) continue;
 				const descMatch = job.description?.match(/^channel:(\d+)/);
 				if (!descMatch) continue;
 				const chId = descMatch[1];
 				if (!sessionStore.has(chId)) {
-					console.log(`[discord] Session keeper: creating session for channel ${chId} (job: ${job.name || job.id})`);
-					sessionStore.getOrCreate(chId).catch(() => {});
+					channelsNeeded.add(chId);
 				}
 			}
+
+			if (channelsNeeded.size === 0) return;
+
+			// Async IIFE so we can await session creation
+			void (async () => {
+				try {
+					const channelsWithExistingFile: string[] = [];
+					const channelsNewSession: string[] = [];
+
+					// Pre-compute: for channels with existing session files, set
+					// job.session to the file's UUID BEFORE any session starts,
+					// so their schedulers load the job on the first try.
+					let preDirty = false;
+					for (const chId of channelsNeeded) {
+						const fileUUID = readChannelSessionUUID(chId);
+						if (fileUUID) {
+							// Update jobs in memory for this channel
+							for (const job of jobs) {
+								if (job.description?.startsWith(`channel:${chId}`) && job.session !== fileUUID) {
+									job.session = fileUUID;
+									preDirty = true;
+								}
+							}
+							channelsWithExistingFile.push(chId);
+						} else {
+							channelsNewSession.push(chId);
+						}
+					}
+
+					// Save the pre-computed session bindings BEFORE creating sessions
+					if (preDirty) {
+						writeFileSync(intervalPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+					}
+
+					// Create sessions for channels with existing files
+					// The scheduler will load the job because the UUID matches now.
+					for (const chId of channelsWithExistingFile) {
+						try {
+							await sessionStore.getOrCreate(chId);
+							console.log(`[discord] Session keeper: created session for channel ${chId}`);
+						} catch (err) {
+							console.error(`[discord] Session keeper: failed to create session for ${chId}:`, err);
+						}
+					}
+
+					// For channels without existing session files, create the session
+					// first, then update job.session and restart the scheduler so it
+					// picks up the bound job.
+					for (const chId of channelsNewSession) {
+						try {
+							const discordSession = await sessionStore.getOrCreate(chId);
+							const sessionId = discordSession.session.getSessionStats().sessionId;
+							// Update the job session field now that we know the UUID
+							setChannelJobsSessionSync(chId, sessionId);
+							// The scheduler started before the rebind, so restart session
+							// so the new scheduler loads the job with the correct UUID.
+							sessionStore.dispose(chId);
+							await sessionStore.getOrCreate(chId);
+							console.log(`[discord] Session keeper: created and bound session for channel ${chId}`);
+						} catch (err) {
+							console.error(`[discord] Session keeper: failed for new channel ${chId}:`, err);
+						}
+					}
+				} catch (err) {
+					console.error(`[discord] Session keeper error:`, err);
+				}
+			})();
 		} catch {}
 	}, 60_000);
 }
@@ -1356,13 +1567,13 @@ async function main() {
 		if (message.content === "/help") {
 			const helpText = `📖 **pi-discord Help Guide**\n\n` +
 				`**General Commands**\n` +
-				`• \`/session\` - Show session statistics and info\n` +
+				`• \`/session [label]\` - Close current session and start fresh (label for /resume [label])\n` +
+				`• \`/session\` - Show current session info and stats\n` +
+				`• \`/stats\` - Show token utilization and changes\n` +
 				`• \`/channel\` - Show current channel info (ID, name)\n` +
 				`• \`/cwd\` - Show current working directory\n` +
 				`• \`/cwd [path]\` - Change session working directory\n` +
-				`• \`/stats\` - Show token utilization and changes\n` +
 				`• \`/queue [prompt]\` - Queue a prompt to run after current task\n` +
-				`• \`/session [label]\` - Close current session (label for /resume [label])\n` +
 				`• \`/resume [id or label]\` - Resume a previously closed session\n` +
 				`• \`/clear\` - Reset session and start fresh\n` +
 				`• \`/reload\` - Reload extensions, skills, and themes\n` +
@@ -1461,19 +1672,31 @@ async function main() {
 			return;
 		}
 
-		// Handle /session command
+		// Handle /cwd command
 		if (message.content === "/cwd" || message.content.startsWith("/cwd ")) {
 			if (message.content === "/cwd") {
 				const cwd = session.sessionManager.getCwd();
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `📂 Current working directory:\n\`${cwd}\``);
 			} else {
 				const newCwd = message.content.slice("/cwd ".length).trim();
-				try {
-					await sessionStore.changeCwd(channelId, newCwd);
-					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `✅ Changed working directory to:\n\`${newCwd}\``);
-				} catch (error) {
-					console.error(`[${channelId}] /cwd error:`, error);
-					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Error changing directory: ${error}`);
+				if (!newCwd) {
+					await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ Usage: `/cwd [path]`");
+				} else {
+					try {
+						const expandedPath = await sessionStore.changeCwd(channelId, newCwd);
+						await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `✅ Changed working directory to:\n\`${expandedPath}\``);
+
+						// changeCwd recreates the session with the new cwd — clear the
+						// subscription/tracking state so the recreated session gets
+						// subscribed on the next message.
+						subscribedSessions.delete(channelId);
+						sessionSubscriptions.delete(channelId);
+						sessionMessageIndex.delete(channelId);
+						discordMessageToSession.delete(channelId);
+					} catch (error) {
+						console.error(`[${channelId}] /cwd error:`, error);
+						await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Error changing directory: ${error}`);
+					}
 				}
 			}
 			return;
@@ -1485,49 +1708,6 @@ async function main() {
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, statsResult.message);
 			} else {
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "❌ No token stats available for this session.");
-			}
-			return;
-		}
-
-		if (message.content === "/session") {
-			try {
-				const stats = session.getSessionStats();
-				const sessionName = session.sessionName;
-
-				let info = "**Session Info**\n\n";
-				if (sessionName) {
-					info += `**Name:** ${sessionName}\n`;
-				}
-				info += `**File:** ${stats.sessionFile ?? "In-memory"}\n`;
-				info += `**ID:** ${stats.sessionId}\n\n`;
-
-				info += "**Messages**\n";
-				info += `User: ${stats.userMessages}\n`;
-				info += `Assistant: ${stats.assistantMessages}\n`;
-				info += `Tool Calls: ${stats.toolCalls}\n`;
-				info += `Tool Results: ${stats.toolResults}\n`;
-				info += `Total: ${stats.totalMessages}\n\n`;
-
-				info += "**Tokens**\n";
-				info += `Input: ${stats.tokens.input.toLocaleString()}\n`;
-				info += `Output: ${stats.tokens.output.toLocaleString()}\n`;
-				info += `Cache Read: ${stats.tokens.cacheRead.toLocaleString()}\n`;
-				info += `Cache Write: ${stats.tokens.cacheWrite.toLocaleString()}\n`;
-				info += `Total (lifetime): ${stats.tokens.total.toLocaleString()}\n`;
-
-				if (stats.contextUsage && stats.contextUsage.percent != null) {
-					info += `\n**Context Usage**\n`;
-					info += `${stats.contextUsage.percent.toFixed(1)}% | ${stats.contextUsage.tokens?.toLocaleString() ?? "?"} / ${stats.contextUsage.contextWindow.toLocaleString()} tok\n`;
-				}
-
-				if (stats.cost > 0) {
-					info += `\n**Cost:** $${stats.cost.toFixed(4)}\n`;
-				}
-
-				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, info);
-			} catch (error) {
-				console.error(`[${channelId}] /session error:`, error);
-				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `❌ Error getting session info: ${error}`);
 			}
 			return;
 		}
@@ -1544,18 +1724,48 @@ async function main() {
 			return;
 		}
 
-		// Handle /session command - close current session and start a fresh one
-		// /session [label] also labels the session for easy /resume [label]
+		// Handle /session command
+		// /session - Close current session and start fresh (no label)
+		// /session [label] - Close current session and start fresh with a label
 		if (message.content === "/session" || message.content.startsWith("/session ")) {
-			const label = message.content.slice("/session".length).trim() || undefined;
-			try {
-				const closedSessionId = await sessionStore.closeAndNewSession(channelId, label);
+			const label = message.content.slice("/session".length).trim();
 
-				// Label the new active session too
+			try {
+				// Capture old session stats BEFORE closing (session is disposed after)
+				const oldStats = session.getSessionStats();
+				const oldStatsResult = generateTokenStatsMessage(channelId, session, previousTokens);
+				const oldSessionId = oldStats.sessionId;
+
+				await sessionStore.closeAndNewSession(channelId, label || undefined);
+
+				// Create the new session. Its scheduler reads schedule-prompts.json
+				// which still has the old session UUID. The job won't load because
+				// the UUID doesn't match — that's intentional. We'll update the UUID
+				// after creation and restart the session so the scheduler picks it up.
+				// CRITICAL: We DO NOT delete job.session first — doing so would make
+				// the job fire in ALL channels (isLoadedFor returns true for undefined).
+				const newDiscordSession = await sessionStore.getOrCreate(channelId);
+				const newSessionId = newDiscordSession.session.getSessionStats().sessionId;
+
+				// Update the job session field to the new UUID
+				setChannelJobsSessionSync(channelId, newSessionId);
+
+				// The scheduler started before we updated the UUID, so restart the
+				// session so the new scheduler loads the job with the correct UUID.
+				sessionStore.dispose(channelId);
+				const restartedSession = await sessionStore.getOrCreate(channelId);
+				const finalSessionId = restartedSession.session.getSessionStats().sessionId;
+
+				// Ensure the session field is correct after restart
+				// (UUID should be stable since we read the same session file)
+				if (finalSessionId !== newSessionId) {
+					// UUID changed during re-creation — rebind again
+					setChannelJobsSessionSync(channelId, finalSessionId);
+				}
+
+				// If a label was provided, label the new active session too
 				if (label) {
 					sessionLabels.set(channelId, label);
-				} else {
-					sessionLabels.delete(channelId);
 				}
 
 				// Clear branch metadata for new session
@@ -1573,9 +1783,24 @@ async function main() {
 				sessionMessageIndex.delete(channelId);
 				discordMessageToSession.delete(channelId);
 
-				const msg = label
-					? `✅ Closed session labeled "${label}" → use /resume ${label}`
-					: `✅ Fresh session started. Use /label <name> to name it.`;
+				// Build message: stats first, then resume hint, then new session confirmation
+				const resumeArg = label || oldSessionId;
+				const resumeHint = `Use \`/resume ${resumeArg}\` to resume this session.`;
+
+				let msg = '';
+				if (oldStatsResult) {
+					msg += oldStatsResult.message + '\n\n';
+				} else {
+					// Fallback basic stats when context usage data is unavailable
+					msg += `📊 **Token Utilization**\n`;
+					msg += `**In:** ${oldStats.tokens.input.toLocaleString()} tok\n`;
+					msg += `**Out:** ${oldStats.tokens.output.toLocaleString()} tok\n`;
+					msg += `**Messages:** ${oldStats.totalMessages ?? '?'}\n`;
+					msg += `\n`;
+				}
+				msg += `${resumeHint}\n\n`;
+				msg += `✅ New session started.`;
+
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, msg);
 			} catch (error) {
 				console.error(`[${channelId}] /session error:`, error);
@@ -1618,6 +1843,29 @@ async function main() {
 						`❌ Session \`${sessionId}\` not found in closed sessions. Use \`/resume\` to list available sessions.`
 					);
 					return;
+				}
+
+				// Load the restored session. Its scheduler reads schedule-prompts.json
+				// which still has the old session UUID. The job won't load because
+				// the UUID doesn't match — that's intentional. We'll update the UUID
+				// after creation and restart the session so the scheduler picks it up.
+				// CRITICAL: We do NOT delete job.session first — doing so would make
+				// the job fire in ALL channels (isLoadedFor returns true for undefined).
+				const restoredSession = await sessionStore.getOrCreate(channelId);
+				const restoredSessionId = restoredSession.session.getSessionStats().sessionId;
+
+				// Update the job session field to the restored session UUID
+				setChannelJobsSessionSync(channelId, restoredSessionId);
+
+				// The scheduler started before we updated the UUID, so restart the
+				// session so the new scheduler loads the job with the correct UUID.
+				sessionStore.dispose(channelId);
+				const restartedSession = await sessionStore.getOrCreate(channelId);
+				const finalSessionId = restartedSession.session.getSessionStats().sessionId;
+
+				// Ensure the session field is correct after restart
+				if (finalSessionId !== restoredSessionId) {
+					setChannelJobsSessionSync(channelId, finalSessionId);
 				}
 
 				// Clear tracking state for the resumed session
