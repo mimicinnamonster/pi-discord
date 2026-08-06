@@ -84,6 +84,29 @@ export interface SessionIndex {
 // with text-only models). The standalone function is kept for unit testing.
 
 /** Reads and validates an image file. Exported for unit testing. */
+/**
+ * Validate that a buffer contains actual image data by checking magic bytes.
+ * Prevents sending HTML error pages (404, etc.) stored as .jpg files to the API,
+ * which causes 400 errors from providers like opencode-go.
+ */
+function isValidImageData(buffer: Buffer): boolean {
+	if (buffer.length < 4) return false;
+
+	// JPEG: starts with FF D8 FF
+	if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return true;
+
+	// PNG: starts with 89 50 4E 47 (\x89PNG)
+	if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return true;
+
+	// GIF: starts with GIF87a or GIF89a
+	if (buffer.slice(0, 6).toString('ascii') === 'GIF87a' || buffer.slice(0, 6).toString('ascii') === 'GIF89a') return true;
+
+	// WebP: starts with RIFF....WEBP
+	if (buffer.slice(0, 4).toString('ascii') === 'RIFF' && buffer.slice(8, 12).toString('ascii') === 'WEBP') return true;
+
+	return false;
+}
+
 export async function readImageFile(args: { path: string }, cwd: string): Promise<{ absolutePath: string; base64Data: string; mimeType: string }> {
 	const fs = await import("fs");
 	const pathMod = await import("path");
@@ -103,6 +126,13 @@ export async function readImageFile(args: { path: string }, cwd: string): Promis
 	}
 
 	const buffer = fs.readFileSync(absolutePath);
+
+	// Validate that the file actually contains image data (not HTML error pages, etc.)
+	if (!isValidImageData(buffer)) {
+		const preview = buffer.slice(0, 100).toString('utf-8').replace(/\n/g, ' ').trim();
+		throw new Error(`NOT_AN_IMAGE: File has image extension but does not contain valid image data. Content preview: ${preview}`);
+	}
+
 	const base64Data = buffer.toString('base64');
 
 	const mimeTypes: Record<string, string> = {
@@ -266,12 +296,17 @@ export class SessionStore {
 				try {
 					const { absolutePath, base64Data, mimeType } = await readImageFile({ path }, sessionRef!.sessionManager.getCwd());
 
+					// Downscale/compress so heavy images don't bloat the context payload
+					// (some providers drop streams on large multimodal requests).
+					const { downscaleImage } = await import("./image-utils.js");
+					const downscaled = await downscaleImage(base64Data, mimeType);
+
 					// Inject the image via sendUserMessage (like Discord attachments) so it
 					// arrives as a user message, not tool result content. This avoids crashes
 					// with text-only models that can't handle image parts in tool results.
 					await sessionRef!.sendUserMessage([
 						{ type: "text", text: `[Attached Image: ${absolutePath}]` },
-						{ type: "image", data: base64Data, mimeType: mimeType }
+						{ type: "image", data: downscaled.data, mimeType: downscaled.mimeType }
 					], { deliverAs: "nextTurn" });
 
 					// Return proper content array — Google provider requires arrays for toolResult
@@ -282,6 +317,8 @@ export class SessionStore {
 						? `❌ File not found at path: ${msg.slice("FILE_NOT_FOUND:".length).trim()}`
 						: msg.startsWith("UNSUPPORTED_FORMAT:")
 						? `❌ ${msg.slice("UNSUPPORTED_FORMAT:".length).trim()}`
+						: msg.startsWith("NOT_AN_IMAGE:")
+						? `❌ ${msg.slice("NOT_AN_IMAGE:".length).trim()}`
 						: `❌ Error reading image file: ${msg}`;
 					return { content: [{ type: "text", text }] };
 				}
@@ -716,7 +753,7 @@ export class SessionStore {
 			unlinkSync(defaultPath);
 		}
 		renameSync(backupFile, defaultPath);
-		this.log(`[${channelId}] Restored session ${sessionId}: ${backupFile} → ${defaultPath}`);
+		this.log(`[${channelId}] Restored session ${closedInfo.sessionId}: ${backupFile} → ${defaultPath}`);
 
 		// Update index to point to default path, preserving channel metadata (cwd, model)
 		const index = this.loadIndex();

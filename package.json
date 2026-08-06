@@ -17,6 +17,7 @@
     "@earendil-works/pi-ai": "^0.83.0",
     "@earendil-works/pi-tui": "^0.83.0",
     "@mariozechner/pi-coding-agent": "0.73.1",
+    "croner": "^10.0.1",
     "discord.js": "14.26.4",
     "pi-mcp-adapter": "2.5.4"
   },
@@ -27,6 +28,6 @@
     "vitest": "^4.1.10"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.19.0"
   }
 }

@@ -5,12 +5,13 @@
 
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
 import { createSessionStore } from "./session-store";
-import { TypingManager } from "./typing-manager";
+import { TypingManager, type TypingChannel } from "./typing-manager";
 import { generateTokenStatsMessage } from "./token-stats";
 import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@mariozechner/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
 import { writeFileSync, readFileSync, existsSync, readdirSync } from "fs";
+import { Cron } from "croner";
 import {
 	loadBranchMetadata,
 	saveBranchMetadata,
@@ -53,6 +54,21 @@ if (!discordToken) {
 let discordClient: Client | null = null;
 const sessionStore = createSessionStore({ sessionDir, debug });
 const typingManager = new TypingManager();
+
+// ============================================================================
+// Process resilience — scheduled prompts must survive process death
+// (/kill, external kill, laptop battery, crashes). pi-schedule-prompt's widget
+// can throw "extension ctx is stale after session replacement" and otherwise
+// unhandled errors would kill the whole bot, taking every scheduled job with
+// it. Log loudly and keep running: the session keeper below re-creates
+// sessions and catches up any missed runs.
+// ============================================================================
+process.on("uncaughtException", (err) => {
+	console.error("[discord] Uncaught exception (keeping bot alive):", err);
+});
+process.on("unhandledRejection", (reason) => {
+	console.error("[discord] Unhandled rejection (keeping bot alive):", reason);
+});
 
 // Track Discord message IDs to session entry indices for deletion handling
 // Map structure: channelId -> discordMessageId -> { sessionIndex, type: 'user' | 'assistant' | 'tool' | 'thinking' }
@@ -283,7 +299,7 @@ function restoreScheduledSessions(): void {
 		}
 
 		// Save once all sessions are created and jobs are rebound
-		Promise.all(promises).then(() => {
+		Promise.all(promises).then(async () => {
 			if (dirty) {
 				try {
 					writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
@@ -297,10 +313,20 @@ function restoreScheduledSessions(): void {
 			for (const chId of channelsToRestart) {
 				try {
 					sessionStore.dispose(chId);
-					sessionStore.getOrCreate(chId).catch(err => {
-						console.error(`[discord] Failed to restart session for ${chId}:`, err);
-					});
-					console.log(`[discord] Restarted session for channel ${chId} after rebind`);
+					const restarted = await sessionStore.getOrCreate(chId);
+					const restartedId = restarted.session.getSessionStats().sessionId;
+					// The restart may have created a NEW session UUID (e.g. the old
+					// session file was moved by /session or /clear), so rebind the
+					// jobs to the actual restarted session, then restart once more
+					// so the scheduler reads schedule-prompts.json with the new UUID.
+					setChannelJobsSessionSync(chId, restartedId);
+					sessionStore.dispose(chId);
+					const finalSession = await sessionStore.getOrCreate(chId);
+					const finalSessionId = finalSession.session.getSessionStats().sessionId;
+					if (finalSessionId !== restartedId) {
+						setChannelJobsSessionSync(chId, finalSessionId);
+					}
+					console.log(`[discord] Rebound jobs to session ${finalSessionId} for channel ${chId} after restart`);
 				} catch (err) {
 					console.error(`[discord] Failed to restart session for ${chId}:`, err);
 				}
@@ -324,95 +350,244 @@ function restoreScheduledSessions(): void {
  * new scheduler loads it), or creates the session first, then updates the
  * session field and restarts the session for new channels.
  */
-function startSessionKeeper(): void {
-	setInterval(() => {
-		const intervalPath = join(process.cwd(), ".pi", "schedule-prompts.json");
-		if (!existsSync(intervalPath)) return;
-
+function startSessionKeeper(deps: {
+	subscribedSessions: Set<string>;
+	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>;
+}): void {
+	/**
+	 * Ensure the channel's session is subscribed so agent output (from the
+	 * extension's on-time fires AND our catch-up fires) is forwarded to Discord.
+	 * Subscriptions normally only exist after a user message; without this,
+	 * a keeper-created session's scheduled run would be invisible.
+	 */
+	async function ensureCronSubscription(chId: string): Promise<void> {
+		const discordSession = sessionStore.get(chId);
+		if (!discordSession) return;
+		const sessionId = discordSession.session.getSessionStats().sessionId;
+		if (cronSubscribedSessions.get(chId) === sessionId) return;
+		const channel = await fetchChannelObject(chId);
+		if (!channel) return;
 		try {
-			const data = JSON.parse(readFileSync(intervalPath, "utf-8"));
-			const jobs: any[] = data.jobs || [];
+			const sub = subscribeToSession(discordSession.session, chId, channel, typingManager, sessionDir);
+			deps.sessionSubscriptions.set(chId, sub);
+			deps.subscribedSessions.add(chId);
+			cronSubscribedSessions.set(chId, sessionId);
+			console.log(`[discord] Subscribed cron session for channel ${chId} (session ${sessionId})`);
+		} catch (err) {
+			console.error(`[discord] Failed to subscribe cron session for channel ${chId}:`, err);
+		}
+	}
 
-			// Identify channels that need sessions
-			const channelsNeeded = new Set<string>();
-			for (const job of jobs) {
-				if (!job.enabled) continue;
-				const descMatch = job.description?.match(/^channel:(\d+)/);
-				if (!descMatch) continue;
-				const chId = descMatch[1];
-				if (!sessionStore.has(chId)) {
-					channelsNeeded.add(chId);
+	/**
+	 * Fire any scheduled job whose `nextRun` passed without being executed
+	 * (bot was down: /kill, crash, laptop battery). This is what makes the
+	 * schedule survive process death — the extension only fires while its
+	 * session is alive and has loaded the job; the bot catches up the rest.
+	 */
+	async function fireMissedScheduledJobs(chId: string, jobs: any[]): Promise<void> {
+		const discordSession = sessionStore.get(chId);
+		if (!discordSession) return;
+		const sessionId = discordSession.session.getSessionStats().sessionId;
+		const now = Date.now();
+		for (const job of jobs) {
+			if (job.type !== "cron") continue;
+			if (!job.nextRun) continue;
+			const next = new Date(job.nextRun).getTime();
+			if (Number.isNaN(next)) continue;
+			// Grace: only catch up runs due more than 60s ago, so we never race
+			// the extension's own on-time fire (it updates nextRun when it fires).
+			if (next > now - 60_000) continue;
+			const last = job.lastRun ? new Date(job.lastRun).getTime() : 0;
+			if (last >= next) continue;
+			// Session-bound jobs only fire in their own session (same rule as
+			// pi-schedule-prompt's isLoadedFor).
+			if (job.session && job.session !== sessionId) continue;
+
+			console.log(`[discord] Catching up missed scheduled job "${job.name}" (${job.id}) for channel ${chId}`);
+			const nextRun = getNextCronRun(job.schedule) ?? new Date(now + 24 * 3600 * 1000).toISOString();
+			// Advance nextRun BEFORE delivering so a crash in between can't cause
+			// a duplicate fire on the next tick (email scans dedupe anyway).
+			updateScheduledJob(job.id, {
+				lastRun: new Date().toISOString(),
+				lastStatus: "success",
+				runCount: (job.runCount ?? 0) + 1,
+				nextRun,
+			});
+
+			const channel = await fetchChannelObject(chId);
+			if (channel) {
+				sendToDiscord(
+					channel,
+					`⏰ Running scheduled job **"${job.name}"** — was scheduled for ${new Date(next).toLocaleString("en-GB", { timeZone: "Europe/Amsterdam" })}, executing now (bot was offline at that time).`,
+				).catch(() => {});
+			}
+
+			// Inject the prompt into the session; the cron subscription forwards
+			// the agent's response to Discord.
+			discordSession.session.sendUserMessage([{ type: "text", text: job.prompt }]).catch((err) => {
+				console.error(`[discord] Failed to deliver scheduled prompt ${job.id}:`, err);
+				// Delivery failed — put nextRun back so the next tick retries.
+				updateScheduledJob(job.id, { lastStatus: "error", nextRun: new Date(next).toISOString() });
+			});
+		}
+	}
+
+	/**
+	 * One full scheduled-check pass: ensure sessions exist for channels with
+	 * enabled jobs, subscribe them, and catch up any missed runs.
+	 */
+	async function runScheduledCheck(): Promise<void> {
+		const path = join(process.cwd(), ".pi", "schedule-prompts.json");
+		if (!existsSync(path)) return;
+
+		const data = JSON.parse(readFileSync(path, "utf-8"));
+		const jobs: any[] = data.jobs || [];
+
+		// Map channel -> enabled jobs, and which channels still need a session.
+		const channelJobs = new Map<string, any[]>();
+		const channelsNeeded = new Set<string>();
+		for (const job of jobs) {
+			if (!job.enabled) continue;
+			const descMatch = job.description?.match(/^channel:(\d+)/);
+			if (!descMatch) continue;
+			const chId = descMatch[1];
+			if (!channelJobs.has(chId)) channelJobs.set(chId, []);
+			channelJobs.get(chId)!.push(job);
+			if (!sessionStore.has(chId)) channelsNeeded.add(chId);
+		}
+		if (channelJobs.size === 0) return;
+
+		// --- Create sessions for channels that don't have one ---
+		if (channelsNeeded.size > 0) {
+			const channelsWithExistingFile: string[] = [];
+			const channelsNewSession: string[] = [];
+
+			// Pre-compute: for channels with existing session files, set
+			// job.session to the file's UUID BEFORE any session starts,
+			// so their schedulers load the job on the first try.
+			let preDirty = false;
+			for (const chId of channelsNeeded) {
+				const fileUUID = readChannelSessionUUID(chId);
+				if (fileUUID) {
+					for (const job of jobs) {
+						if (job.description?.startsWith(`channel:${chId}`) && job.session !== fileUUID) {
+							job.session = fileUUID;
+							preDirty = true;
+						}
+					}
+					channelsWithExistingFile.push(chId);
+				} else {
+					channelsNewSession.push(chId);
 				}
 			}
 
-			if (channelsNeeded.size === 0) return;
+			// Save the pre-computed session bindings BEFORE creating sessions
+			if (preDirty) {
+				writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+			}
 
-			// Async IIFE so we can await session creation
-			void (async () => {
+			// Create sessions for channels with existing files
+			for (const chId of channelsWithExistingFile) {
 				try {
-					const channelsWithExistingFile: string[] = [];
-					const channelsNewSession: string[] = [];
-
-					// Pre-compute: for channels with existing session files, set
-					// job.session to the file's UUID BEFORE any session starts,
-					// so their schedulers load the job on the first try.
-					let preDirty = false;
-					for (const chId of channelsNeeded) {
-						const fileUUID = readChannelSessionUUID(chId);
-						if (fileUUID) {
-							// Update jobs in memory for this channel
-							for (const job of jobs) {
-								if (job.description?.startsWith(`channel:${chId}`) && job.session !== fileUUID) {
-									job.session = fileUUID;
-									preDirty = true;
-								}
-							}
-							channelsWithExistingFile.push(chId);
-						} else {
-							channelsNewSession.push(chId);
-						}
-					}
-
-					// Save the pre-computed session bindings BEFORE creating sessions
-					if (preDirty) {
-						writeFileSync(intervalPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
-					}
-
-					// Create sessions for channels with existing files
-					// The scheduler will load the job because the UUID matches now.
-					for (const chId of channelsWithExistingFile) {
-						try {
-							await sessionStore.getOrCreate(chId);
-							console.log(`[discord] Session keeper: created session for channel ${chId}`);
-						} catch (err) {
-							console.error(`[discord] Session keeper: failed to create session for ${chId}:`, err);
-						}
-					}
-
-					// For channels without existing session files, create the session
-					// first, then update job.session and restart the scheduler so it
-					// picks up the bound job.
-					for (const chId of channelsNewSession) {
-						try {
-							const discordSession = await sessionStore.getOrCreate(chId);
-							const sessionId = discordSession.session.getSessionStats().sessionId;
-							// Update the job session field now that we know the UUID
-							setChannelJobsSessionSync(chId, sessionId);
-							// The scheduler started before the rebind, so restart session
-							// so the new scheduler loads the job with the correct UUID.
-							sessionStore.dispose(chId);
-							await sessionStore.getOrCreate(chId);
-							console.log(`[discord] Session keeper: created and bound session for channel ${chId}`);
-						} catch (err) {
-							console.error(`[discord] Session keeper: failed for new channel ${chId}:`, err);
-						}
-					}
+					await sessionStore.getOrCreate(chId);
+					console.log(`[discord] Session keeper: created session for channel ${chId}`);
 				} catch (err) {
-					console.error(`[discord] Session keeper error:`, err);
+					console.error(`[discord] Session keeper: failed to create session for ${chId}:`, err);
 				}
-			})();
-		} catch {}
+			}
+
+			// For channels without existing session files, create the session
+			// first, then update job.session and restart the scheduler so it
+			// picks up the bound job.
+			for (const chId of channelsNewSession) {
+				try {
+					const discordSession = await sessionStore.getOrCreate(chId);
+					const sessionId = discordSession.session.getSessionStats().sessionId;
+					setChannelJobsSessionSync(chId, sessionId);
+					sessionStore.dispose(chId);
+					await sessionStore.getOrCreate(chId);
+					console.log(`[discord] Session keeper: created and bound session for channel ${chId}`);
+				} catch (err) {
+					console.error(`[discord] Session keeper: failed for new channel ${chId}:`, err);
+				}
+			}
+		}
+
+		// --- Subscribe + catch up missed runs for every channel with jobs ---
+		for (const [chId, channelJobsArr] of channelJobs) {
+			await ensureCronSubscription(chId);
+			await fireMissedScheduledJobs(chId, channelJobsArr);
+		}
+	}
+
+	// Run once shortly after startup so missed runs (crash, /kill, battery
+	// death) fire soon after the bot comes back — no need to wait for the
+	// first 60s tick.
+	setTimeout(() => {
+		runScheduledCheck().catch((err) => console.error(`[discord] Initial scheduled check error:`, err));
+	}, 10_000);
+
+	setInterval(() => {
+		runScheduledCheck().catch((err) => console.error(`[discord] Session keeper error:`, err));
 	}, 60_000);
+}
+
+/**
+ * Cached Discord channel objects for cron delivery (avoids repeated fetches).
+ */
+const cronChannelCache = new Map<string, DMChannel | TextChannel | NewsChannel>();
+
+/**
+ * channelId -> sessionId that the cron subscription is currently bound to.
+ */
+const cronSubscribedSessions = new Map<string, string>();
+
+/**
+ * Fetch (and cache) the Discord channel object for a channel ID.
+ */
+async function fetchChannelObject(chId: string): Promise<DMChannel | TextChannel | NewsChannel | undefined> {
+	const cached = cronChannelCache.get(chId);
+	if (cached) return cached;
+	if (!discordClient) return undefined;
+	try {
+		const fetched = await discordClient.channels.fetch(chId);
+		const channel = fetched as DMChannel | TextChannel | NewsChannel | null;
+		if (channel) cronChannelCache.set(chId, channel);
+		return channel ?? undefined;
+	} catch (err) {
+		console.error(`[discord] Failed to fetch channel ${chId}:`, err);
+		return undefined;
+	}
+}
+
+/**
+ * Compute the next occurrence of a 6-field cron expression (local timezone,
+ * same as pi-schedule-prompt/croner). Returns an ISO string or null.
+ */
+function getNextCronRun(schedule: string): string | null {
+	try {
+		return new Cron(schedule, () => {}).nextRun()?.toISOString() ?? null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Update a job in .pi/schedule-prompts.json. Returns true when updated.
+ */
+function updateScheduledJob(jobId: string, partial: Record<string, unknown>): boolean {
+	const path = join(process.cwd(), ".pi", "schedule-prompts.json");
+	try {
+		const data = JSON.parse(readFileSync(path, "utf-8"));
+		const job = (data.jobs || []).find((j: any) => j.id === jobId);
+		if (!job) return false;
+		Object.assign(job, partial);
+		writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+		return true;
+	} catch (err) {
+		console.error(`[discord] Failed to update scheduled job ${jobId}:`, err);
+		return false;
+	}
 }
 
 // Track pending Discord message IDs being processed (for branch metadata)
@@ -670,16 +845,12 @@ async function sendToDiscord(
 	return sentMessages;
 }
 
-function subscribeToSession(
-	session: AgentSession,
-	channelId: string,
-	channel: DMChannel | TextChannel | NewsChannel,
-	typingManager: TypingManager,
-	sessionDir: string
-): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
-	// Direct fetch to Discord typing endpoint — bypasses Discord.js's sendTyping()
-	// which wraps the REST client and can cause issues with rate-limit retries.
-	const typingChannel: TypingChannel = {
+/**
+ * Direct fetch to Discord typing endpoint — bypasses Discord.js's sendTyping()
+ * which wraps the REST client and can cause issues with rate-limit retries.
+ */
+function createTypingChannel(channelId: string): TypingChannel {
+	return {
 		triggerTyping: async () => {
 			const token = discordClient?.token;
 			if (!token) return false;
@@ -698,6 +869,16 @@ function subscribeToSession(
 			}
 		},
 	};
+}
+
+function subscribeToSession(
+	session: AgentSession,
+	channelId: string,
+	channel: DMChannel | TextChannel | NewsChannel,
+	typingManager: TypingManager,
+	sessionDir: string
+): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
+	const typingChannel = createTypingChannel(channelId);
 	const responseBuffer: string[] = [];
 	const thinkingBuffer: string[] = [];
 	let lastUserMessageEntryId: string | undefined;
@@ -808,11 +989,14 @@ function subscribeToSession(
 			}
 
 			case "tool_execution_update":
-				// Streaming tool output
+				// Streaming tool output — keep typing alive for long-running tools
+				typingManager.show(channelId, typingChannel);
 				break;
 
 			case "tool_execution_end":
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
+				// Turn continues after the tool (more LLM calls may follow)
+				typingManager.show(channelId, typingChannel);
 				if (event.isError) {
 					const result = escapeForCodeBlock(JSON.stringify(event.result, null, 2));
 					sendToDiscord(channel, `⚠️ Tool execution failed\n\`\`\`json\n${result}\n\`\`\``, { trackInSession: true, type: "tool-error" }).catch(() => {});
@@ -826,7 +1010,8 @@ function subscribeToSession(
 
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
-				// Ensure typing is hidden (defensive, normally message_end handles this)
+				// Agent turn fully finished — stop typing until the next user message
+				// or queued prompt starts a new turn (agent_start re-shows it).
 				typingManager.hide(channelId);
 				// Capture assistant entry NOW (synchronous, all messages appended)
 				// The .then() callback will use this to track bot response Discord msg IDs
@@ -872,7 +1057,13 @@ function subscribeToSession(
 				break;
 
 			case "compaction_end":
-				typingManager.hide(channelId);
+				if (!event.willRetry) {
+					// Terminal compaction (threshold cleanup, or overflow recovery that
+					// won't retry): the turn is done. The next agent_start re-shows.
+					typingManager.hide(channelId);
+				}
+				// Overflow compaction with willRetry continues via agent.continue() —
+				// keep typing visible through the retry.
 				log(`[${channelId}] Compaction complete`);
 				break;
 
@@ -883,7 +1074,13 @@ function subscribeToSession(
 				break;
 
 			case "auto_retry_end":
-				typingManager.hide(channelId);
+				if (event.success) {
+					// Retry succeeded — the turn continues with more LLM calls/tools.
+					typingManager.show(channelId, typingChannel);
+				} else {
+					// Retries exhausted — the turn is over.
+					typingManager.hide(channelId);
+				}
 				log(`[${channelId}] Retry ${event.success ? "succeeded" : "failed"}`);
         if (!event.success) {
           sendToDiscord(channel, "🛑 Retry failed...").catch(() => {});
@@ -1449,6 +1646,17 @@ async function main() {
 	): Promise<void> {
 		const channelId = channel.id;
 		const channelName = getChannelDisplayName(channel);
+
+		// Show typing immediately for real prompts (non-command messages) so the
+		// user sees activity during session setup, image downloads and the wait
+		// for the first API response — not just once streaming starts. Command
+		// messages (slash/!/..) are handled below and show typing only where
+		// they actually trigger work.
+		const messageContent = message.content?.trim() ?? "";
+		if (!messageContent.startsWith("/") && !messageContent.startsWith("!")) {
+			typingManager.show(channelId, createTypingChannel(channelId));
+		}
+
 		sessionStore.setChannelName(channelId, channelName);
 		const discordSession = await sessionStore.getOrCreate(channelId, channelName);
 		const { session } = discordSession;
@@ -1548,12 +1756,27 @@ async function main() {
 						const base64Data = Buffer.from(buffer).toString('base64');
 						log(`[${channelId}] Base64 conversion: length=${base64Data.length}, snippet=${base64Data.slice(0, 30)}...`);
 						log(`[${channelId}] Adding image attachment: ${attachment.url} (MIME: ${mimeType})`);
+
+						// Downscale/compress images before sending to the LLM. Discord
+						// attachments are often multi-MB photos; sending them at full size
+						// makes every request carry megabytes of base64 per image. Heavy
+						// multimodal payloads make some providers (e.g. opencode-go) drop
+						// the stream before it finishes ("Stream ended without
+						// finish_reason"). Falls back to the original if resizing fails.
+						const { downscaleImage } = await import("./image-utils.js");
+						const downscaled = await downscaleImage(base64Data, mimeType);
+						const imageData = downscaled.data;
+						const imageMime = downscaled.mimeType;
+						if (downscaled.wasDownscaled) {
+							log(`[${channelId}] Image downscaled: ${base64Data.length} → ${imageData.length} base64 chars (${imageMime})`);
+						}
+
 						const imagePart = {
 							type: "image",
-							data: base64Data,
-							mimeType: mimeType,
+							data: imageData,
+							mimeType: imageMime,
 						};
-						log(`[${channelId}] imagePart data starts with: ${base64Data.startsWith('http') ? 'URL (WRONG)' : 'Base64 (CORRECT)'}`);
+						log(`[${channelId}] imagePart data starts with: ${imageData.startsWith('http') ? 'URL (WRONG)' : 'Base64 (CORRECT)'}`);
 						agentContent.push(imagePart);
 					} catch (e) {
 						log(`[${channelId}] Failed to fetch image ${attachment.url}: ${e}`);
@@ -1648,6 +1871,7 @@ async function main() {
 			}
 
 			log(`[${channelId}] Executing bash command: ${command}`);
+			typingManager.show(channelId, createTypingChannel(channelId));
 
 			try {
 				const output: string[] = [];
@@ -1668,6 +1892,9 @@ async function main() {
 				const truncatedError = errorStr.length > 1800 ? errorStr.substring(0, 1800) + "... (truncated)" : errorStr;
 				const errorMessage = `❌ Bash error: ${truncatedError}`;
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, errorMessage);
+			} finally {
+				// Bash execution doesn't emit agent events — hide typing explicitly.
+				typingManager.hide(channelId);
 			}
 			return;
 		}
@@ -1759,8 +1986,12 @@ async function main() {
 				// Ensure the session field is correct after restart
 				// (UUID should be stable since we read the same session file)
 				if (finalSessionId !== newSessionId) {
-					// UUID changed during re-creation — rebind again
+					// UUID changed during re-creation — rebind again, then restart
+					// the session so its scheduler reads the file with the new UUID
+					// (it started before the rebind and never re-reads the file).
 					setChannelJobsSessionSync(channelId, finalSessionId);
+					sessionStore.dispose(channelId);
+					await sessionStore.getOrCreate(channelId);
 				}
 
 				// If a label was provided, label the new active session too
@@ -1866,6 +2097,10 @@ async function main() {
 				// Ensure the session field is correct after restart
 				if (finalSessionId !== restoredSessionId) {
 					setChannelJobsSessionSync(channelId, finalSessionId);
+					// Restart once more so the scheduler reads the file with the
+					// new UUID (it started before the rebind and never re-reads).
+					sessionStore.dispose(channelId);
+					await sessionStore.getOrCreate(channelId);
 				}
 
 				// Clear tracking state for the resumed session
@@ -2128,6 +2363,10 @@ async function main() {
 					}
 				});
 			}
+			// Ensure typing is active for the whole agent turn (covers slash commands
+			// that fell through to the agent, e.g. unknown commands or spaced-out
+			// commands, and re-asserts after the pre-processing above).
+			typingManager.show(channelId, createTypingChannel(channelId));
 			await session.sendUserMessage(finalContent);
 
 			// Track user Discord message → user Pi entry
@@ -2150,6 +2389,9 @@ async function main() {
 			}
 		} catch (error) {
 			console.error(`[${channelId}] Error sending message:`, error);
+			// The turn died without agent_end — stop typing so the user knows
+			// nothing is running anymore.
+			typingManager.hide(channelId);
 			try {
 				await (channel as DMChannel | TextChannel | NewsChannel).send(
 					"❌ Sorry, I encountered an error processing your message."
@@ -2188,8 +2430,9 @@ async function main() {
 	// Restore sessions for channels with scheduled prompts
 	restoreScheduledSessions();
 
-	// Keep sessions alive for enabled cron jobs (pi-schedule-prompt only fires while a session is open)
-	startSessionKeeper();
+	// Keep sessions alive for enabled cron jobs (pi-schedule-prompt only fires
+	// while a session is open) and catch up runs missed while the bot was down.
+	startSessionKeeper({ subscribedSessions, sessionSubscriptions });
 
 	// Pre-create sessions for channels with queued prompts so they survive restarts
 	for (const chId of promptQueue.keys()) {

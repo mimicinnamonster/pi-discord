@@ -1,0 +1,8 @@
+# Project tool versions (mise)
+#
+# Node 20 (the global default) is too old for the pi SDK's dependency chain:
+# loading globally-installed pi packages during session creation imports
+# undici 8.x, which requires Node >= 22.19 (webidl.util.markAsUncloneable).
+# Vitest 4 also requires ^20 || ^22 || >=24. Pin 25.x to be safe.
+[tools]
+node = "25.9.0"

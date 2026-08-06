@@ -37,11 +37,16 @@ bun.lockb
 # Logs
 logs.txt
 log.txt
+logs.txt.*
+log.txt.*
 
 # Personal/deployment config files (machine-specific)
 com.michal.pi-discord.plist
 start-bot.sh
 AGENTS.md
+
+# Scratch diagnostic scripts (opencode-go provider stream tests, read auth.json)
+scripts/opencode-go-*.mjs
 
 # Notes & task data (personal)
 Notes/

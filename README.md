@@ -13,7 +13,31 @@ Each Discord channel gets its own isolated pi agent session with persistent hist
 See what the agent is doing in real-time — running tools, thinking, handling errors — all streamed to Discord.
 
 ### 🖼️ Image Support
-Send images as Discord attachments — the agent can see and analyze them.
+Send images as Discord attachments — the agent can see and analyze them. Local files can
+be inspected with the built-in `look_at_file` tool.
+
+Images are **automatically downscaled/compressed** before being sent to the model
+(max 1568px long edge, ~1MB, JPEG quality 80) so large photos don't bloat the request
+payload — heavy multimodal requests made some providers (e.g. opencode-go) drop the
+stream mid-generation. Files with an image extension but no real image content (e.g. an
+HTML 404 page saved as `.jpg`) are rejected with a clear error instead of a provider 400.
+If resizing is unavailable it falls back to the original image.
+
+### ⏰ Scheduled Prompts
+Cron jobs (configured via the `pi-schedule-prompt` extension) fire into the channel's
+session and stream the response to Discord. The bot keeps sessions alive for channels
+with enabled jobs and **catches up runs missed while the bot was offline** (crash,
+`/kill`, laptop battery): shortly after startup and every minute it checks for jobs
+whose `nextRun` passed, advances the schedule *before* delivering (so a crash can't
+duplicate a run), and retries on delivery failure. Unhandled exceptions/rejections are
+logged and swallowed instead of killing the bot — scheduled jobs survive process hiccups.
+
+### ⌨️ Persistent Typing Indicator
+The "typing…" indicator stays visible for the entire turn instead of fading after ~10s:
+it re-triggers every 7s (safely under Discord's 5s rate limit, before the 10s expiry)
+and stops on `agent_end`, on failure, or via a 30-minute dead-man timer that guards
+against a turn dying without a clean end event. It shows immediately for real prompts,
+and stays up through tool calls, bash commands, retries, and long generations.
 
 ### 🌿 Branching & History
 - **Reply branching** — reply to any previous bot message to fork the conversation
@@ -50,6 +74,8 @@ Send images as Discord attachments — the agent can see and analyze them.
 
 ### Prerequisites
 - [Bun](https://bun.sh) >= 1.0
+- [Node.js](https://nodejs.org) >= 22.19 (for `vitest`/test tooling; the bot itself runs on Bun).
+  With [mise](https://mise.jdx.dev), the pinned version is picked up automatically from `.mise.toml` — run `mise trust` once if prompted.
 - A [Discord bot token](https://discord.com/developers/applications)
 - pi coding agent configuration (API keys set up via `pi` CLI)
 
@@ -99,6 +125,28 @@ cp start-bot.sh.example start-bot.sh
 launchctl load ~/Library/LaunchAgents/com.pi-discord.plist
 ```
 
+### ⚠️ Calendar access (ical) when running under launchd
+
+When the bot runs as a launchd LaunchAgent, macOS attributes any EventKit/Calendar
+request (e.g. the `ical` CLI used by agent sessions) to **bun** — the process that
+launchd spawns. bun is a hardened-runtime binary, and macOS **auto-denies**
+Calendar access for hardened-runtime binaries unless they carry the
+`com.apple.security.personal-information.calendars` entitlement.
+
+The fix is to re-sign bun with that entitlement (plus Reminders):
+
+```bash
+./scripts/re-sign-bun.sh
+```
+
+This re-signs the bun binary ad-hoc with the Calendar/Reminders entitlements,
+enabling the one-time macOS permission prompt (click **Allow** on the
+"bun wants to access your calendar" dialog).
+
+> **Caveat:** any bun update or reinstall (e.g. `mise upgrade bun`) overwrites
+> the signature and silently breaks calendar access again. Re-run
+> `./scripts/re-sign-bun.sh` after every bun update.
+
 ## Architecture
 
 ```
@@ -114,10 +162,11 @@ launchctl load ~/Library/LaunchAgents/com.pi-discord.plist
                     └────────────┘
 ```
 
-- **`src/index.ts`** — Discord client setup, message routing, command handlers
-- **`src/session-store.ts`** — pi session lifecycle (create, persist, restore)
+- **`src/index.ts`** — Discord client setup, message routing, command handlers, scheduled-prompt keeper
+- **`src/session-store.ts`** — pi session lifecycle (create, persist, restore), image validation
 - **`src/branch-manager.ts`** — Discord reply tree ↔ pi session tree mapping
-- **`src/typing-manager.ts`** — Typing indicator management (respects rate limits)
+- **`src/typing-manager.ts`** — Typing indicator management (renewal + dead-man switch, respects rate limits)
+- **`src/image-utils.ts`** — Image downscaling/compression for LLM payloads
 - **`src/token-stats.ts`** — Token utilization tracking and alerts
 - **`src/model-utils.ts`** — Model search and filtering
 

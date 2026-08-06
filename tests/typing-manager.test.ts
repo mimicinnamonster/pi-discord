@@ -71,6 +71,63 @@ describe("TypingManager", () => {
 		});
 	});
 
+	describe("renewal (keep typing alive during long operations)", () => {
+		it("should re-trigger typing periodically while active", () => {
+			vi.useFakeTimers();
+			try {
+				typingManager.show("channel-1", mockChannel);
+				expect(mockChannel.triggerTyping).toHaveBeenCalledTimes(1);
+
+				vi.advanceTimersByTime(7_000);
+				expect(mockChannel.triggerTyping).toHaveBeenCalledTimes(2);
+
+				vi.advanceTimersByTime(14_000);
+				expect(mockChannel.triggerTyping).toHaveBeenCalledTimes(4);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("should stop re-triggering after hide()", () => {
+			vi.useFakeTimers();
+			try {
+				typingManager.show("channel-1", mockChannel);
+				typingManager.hide("channel-1");
+
+				vi.advanceTimersByTime(30_000);
+				expect(mockChannel.triggerTyping).toHaveBeenCalledTimes(1);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("should not re-trigger for a channel that was never shown", () => {
+			vi.useFakeTimers();
+			try {
+				vi.advanceTimersByTime(30_000);
+				expect(mockChannel.triggerTyping).not.toHaveBeenCalled();
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+
+		it("should keep renewing through show() refreshes without double-triggering", () => {
+			vi.useFakeTimers();
+			try {
+				typingManager.show("channel-1", mockChannel);
+				// Repeated show() calls (events during a turn) must not fire extra requests
+				typingManager.show("channel-1", mockChannel);
+				typingManager.show("channel-1", mockChannel);
+				expect(mockChannel.triggerTyping).toHaveBeenCalledTimes(1);
+
+				vi.advanceTimersByTime(7_000);
+				expect(mockChannel.triggerTyping).toHaveBeenCalledTimes(2);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
+	});
+
 	describe("dispose()", () => {
 		it("should clear all active typing states", () => {
 			typingManager.show("channel-1", mockChannel);
