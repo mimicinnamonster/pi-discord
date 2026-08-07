@@ -173,6 +173,30 @@ describe("SessionStore", () => {
 			const discordSession = await store.getOrCreate(channelId);
 			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
 		});
+
+		it("should preserve conversation context across a cwd change", async () => {
+			const channelId = "cwd-context-channel";
+			const sessionId = "cwd-context-session";
+			const ts = new Date().toISOString();
+			// Write a valid v3 session file with a header + two messages
+			// (array content parts — the format getSessionStats expects)
+			writeFileSync(store.getSessionFile(channelId), [
+				{ type: "session", version: 3, id: sessionId, timestamp: ts, cwd: "/tmp" },
+				{ type: "message", id: "m1", parentId: null, timestamp: ts, message: { role: "user", content: [{ type: "text", text: "Remember this" }] } },
+				{ type: "message", id: "m2", parentId: "m1", timestamp: ts, message: { role: "assistant", content: [{ type: "text", text: "Noted" }], usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+			].map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+			await store.getOrCreate(channelId);
+			await store.changeCwd(channelId, "~/Projects/rotz");
+
+			// The recreated session must keep the old conversation, with the new cwd
+			const discordSession = await store.getOrCreate(channelId);
+			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
+			const context = discordSession.session.sessionManager.buildSessionContext();
+			expect(context.messages.length).toBeGreaterThanOrEqual(2);
+			expect((context.messages[0].content as Array<{ text: string }>)[0].text).toBe("Remember this");
+			expect((context.messages[1].content as Array<{ text: string }>)[0].text).toBe("Noted");
+		});
 	});
 
 	describe("Session Close Metadata", () => {
@@ -192,6 +216,128 @@ describe("SessionStore", () => {
 			// The new session should pick up the preserved cwd
 			const discordSession = await store.getOrCreate(channelId);
 			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
+		});
+	});
+
+	describe("Session Resume", () => {
+		/**
+		 * Write a valid v3 session file (header + user + assistant message) at the
+		 * channel's default path, so closeAndNewSession can back it up and
+		 * resumeSession can restore it — mirroring a real persisted conversation.
+		 */
+		function writeSessionFixture(channelId: string, sessionId: string, cwd: string = "/tmp"): string {
+			const path = store.getSessionFile(channelId);
+			const ts = new Date().toISOString();
+			const entries = [
+				{ type: "session", version: 3, id: sessionId, timestamp: ts, cwd },
+				{ type: "message", id: "msg-1", parentId: null, timestamp: ts, message: { role: "user", content: [{ type: "text", text: "Hello there" }] } },
+				{ type: "message", id: "msg-2", parentId: "msg-1", timestamp: ts, message: { role: "assistant", content: [{ type: "text", text: "Hi!" }], usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+			];
+			writeFileSync(path, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+			return path;
+		}
+
+		it("should resume a closed session by ID", async () => {
+			const channelId = "resume-by-id-channel";
+			const sessionId = "resume-session-id-001";
+			writeSessionFixture(channelId, sessionId);
+
+			const discordSession = await store.getOrCreate(channelId);
+			expect(discordSession.session.getSessionStats().sessionId).toBe(sessionId);
+
+			const closedId = await store.closeAndNewSession(channelId);
+			expect(closedId).toBe(sessionId);
+
+			expect(await store.resumeSession(channelId, sessionId)).toBe(true);
+
+			// Session file restored to the default path and reopened with the same ID
+			expect(existsSync(store.getSessionFile(channelId))).toBe(true);
+			const restored = await store.getOrCreate(channelId);
+			expect(restored.session.getSessionStats().sessionId).toBe(sessionId);
+		});
+
+		it("should resume a closed session by label", async () => {
+			const channelId = "resume-by-label-channel";
+			const sessionId = "resume-session-id-002";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.closeAndNewSession(channelId, "my-label");
+
+			expect(await store.resumeSession(channelId, "my-label")).toBe(true);
+
+			const restored = await store.getOrCreate(channelId);
+			expect(restored.session.getSessionStats().sessionId).toBe(sessionId);
+		});
+
+		it("should restore the conversation context on resume", async () => {
+			const channelId = "resume-context-channel";
+			const sessionId = "resume-session-id-003";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.closeAndNewSession(channelId);
+
+			expect(await store.resumeSession(channelId, sessionId)).toBe(true);
+
+			const restored = await store.getOrCreate(channelId);
+			const context = restored.session.sessionManager.buildSessionContext();
+			expect(context.messages.length).toBeGreaterThanOrEqual(2);
+			expect((context.messages[0].content as Array<{ text: string }>)[0].text).toBe("Hello there");
+			expect((context.messages[1].content as Array<{ text: string }>)[0].text).toBe("Hi!");
+		});
+
+		it("should remove the entry from closed sessions after resume", async () => {
+			const channelId = "resume-cleanup-channel";
+			const sessionId = "resume-session-id-004";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.closeAndNewSession(channelId);
+			expect(store.getClosedSessions(channelId).length).toBe(1);
+
+			expect(await store.resumeSession(channelId, sessionId)).toBe(true);
+			expect(store.getClosedSessions(channelId)).toEqual([]);
+		});
+
+		it("should preserve cwd and model metadata across close and resume", async () => {
+			const channelId = "resume-meta-channel";
+			const sessionId = "resume-session-id-005";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.changeCwd(channelId, "~/Projects/rotz");
+			store.updateModel(channelId, "test-provider/test-model");
+			await store.closeAndNewSession(channelId);
+
+			expect(await store.resumeSession(channelId, sessionId)).toBe(true);
+
+			const index = store.loadIndex();
+			expect(index.sessions[channelId].cwd).toBe(join(homedir(), "Projects/rotz"));
+			expect(index.sessions[channelId].model).toBe("test-provider/test-model");
+
+			const restored = await store.getOrCreate(channelId);
+			expect(restored.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
+		});
+
+		it("should return false for an unknown session ID or label", async () => {
+			const channelId = "resume-unknown-channel";
+			expect(await store.resumeSession(channelId, "does-not-exist")).toBe(false);
+		});
+
+		it("should clean up stale closed-session entries whose file is missing", async () => {
+			const channelId = "resume-stale-channel";
+			// Seed closed-sessions.json with an entry pointing at a nonexistent file
+			writeFileSync(join(testDir, "closed-sessions.json"), JSON.stringify([{
+				channelId,
+				sessionId: "stale-session-id",
+				sessionFile: join(testDir, "does-not-exist.jsonl"),
+				sessionName: "discord-resume-stale-channel",
+				closedAt: Date.now(),
+			}]));
+
+			expect(await store.resumeSession(channelId, "stale-session-id")).toBe(false);
+			expect(store.getClosedSessions(channelId)).toEqual([]);
 		});
 	});
 
