@@ -87,6 +87,52 @@ const promptQueue = new Map<string, string[]>();
 // Track active session labels per channel (set via /label or /session [label])
 const sessionLabels = new Map<string, string>();
 
+// ============================================================================
+// Per-channel output visibility settings (/hide, /show) — persisted to disk
+// ============================================================================
+
+interface ChannelOutputSettings {
+	hideThinking: boolean;
+	hideTools: boolean;
+}
+
+const channelOutputSettings = new Map<string, ChannelOutputSettings>();
+
+function getChannelOutputSettings(channelId: string): ChannelOutputSettings {
+	let settings = channelOutputSettings.get(channelId);
+	if (!settings) {
+		settings = { hideThinking: false, hideTools: false };
+		channelOutputSettings.set(channelId, settings);
+	}
+	return settings;
+}
+
+function saveChannelOutputSettings(): void {
+	try {
+		const obj: Record<string, ChannelOutputSettings> = {};
+		for (const [ch, s] of channelOutputSettings) {
+			if (s.hideThinking || s.hideTools) obj[ch] = s;
+		}
+		writeFileSync(join(sessionDir, "channel-output-settings.json"), JSON.stringify(obj, null, 2));
+	} catch {}
+}
+
+function loadChannelOutputSettings(): void {
+	try {
+		const path = join(sessionDir, "channel-output-settings.json");
+		if (existsSync(path)) {
+			const obj = JSON.parse(readFileSync(path, "utf-8"));
+			for (const [ch, s] of Object.entries(obj)) {
+				const raw = s as Record<string, unknown>;
+				channelOutputSettings.set(ch, {
+					hideThinking: raw.hideThinking === true,
+					hideTools: raw.hideTools === true,
+				});
+			}
+		}
+	} catch {}
+}
+
 function savePromptQueue(): void {
 	try {
 		const obj: Record<string, string[]> = {};
@@ -368,7 +414,7 @@ function startSessionKeeper(deps: {
 		const channel = await fetchChannelObject(chId);
 		if (!channel) return;
 		try {
-			const sub = subscribeToSession(discordSession.session, chId, channel, typingManager, sessionDir);
+			const sub = subscribeToSession(discordSession.session, chId, channel, typingManager, sessionDir, getChannelOutputSettings);
 			deps.sessionSubscriptions.set(chId, sub);
 			deps.subscribedSessions.add(chId);
 			cronSubscribedSessions.set(chId, sessionId);
@@ -876,7 +922,8 @@ function subscribeToSession(
 	channelId: string,
 	channel: DMChannel | TextChannel | NewsChannel,
 	typingManager: TypingManager,
-	sessionDir: string
+	sessionDir: string,
+	getOutputSettings: (channelId: string) => ChannelOutputSettings
 ): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
 	const typingChannel = createTypingChannel(channelId);
 	const responseBuffer: string[] = [];
@@ -938,7 +985,8 @@ function subscribeToSession(
 				if (event.message.role === "assistant") {
 					// Send thinking only once when complete (not streaming)
 					const fullThinking = thinkingBuffer.join("");
-					if (fullThinking.trim().length > 10) {
+					const outputSettings = getOutputSettings(channelId);
+					if (!outputSettings.hideThinking && fullThinking.trim().length > 10) {
 						log(`[${channelId}] Sending completed thinking (${fullThinking.length} chars)`);
 						sendToDiscord(channel, `💭 Thinking\n\`\`\`\n${escapeForCodeBlock(fullThinking)}\n\`\`\``, { trackInSession: true, type: "thinking" }).catch(() => {});
 					}
@@ -978,11 +1026,14 @@ function subscribeToSession(
 
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
-				const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
-				// Increment session index for tool calls
-				const currentIdx = (sessionMessageIndex.get(channelId) ?? 0) + 1;
-				sessionMessageIndex.set(channelId, currentIdx);
-				sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``, { trackInSession: true, type: "tool" }).catch(() => {});
+				// Skip sending (and index tracking) when tools are hidden
+				if (!getOutputSettings(channelId).hideTools) {
+					const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
+					// Increment session index for tool calls
+					const currentIdx = (sessionMessageIndex.get(channelId) ?? 0) + 1;
+					sessionMessageIndex.set(channelId, currentIdx);
+					sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``, { trackInSession: true, type: "tool" }).catch(() => {});
+				}
 				// Keep typing indicator visible during tool execution
 				typingManager.show(channelId, typingChannel);
 				break;
@@ -997,12 +1048,15 @@ function subscribeToSession(
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
 				// Turn continues after the tool (more LLM calls may follow)
 				typingManager.show(channelId, typingChannel);
+				const outputSettings = getOutputSettings(channelId);
 				if (event.isError) {
-					const result = escapeForCodeBlock(JSON.stringify(event.result, null, 2));
-					sendToDiscord(channel, `⚠️ Tool execution failed\n\`\`\`json\n${result}\n\`\`\``, { trackInSession: true, type: "tool-error" }).catch(() => {});
+					if (!outputSettings.hideTools) {
+						const result = escapeForCodeBlock(JSON.stringify(event.result, null, 2));
+						sendToDiscord(channel, `⚠️ Tool execution failed\n\`\`\`json\n${result}\n\`\`\``, { trackInSession: true, type: "tool-error" }).catch(() => {});
+					}
 				} else {
 					// Send success result for tools like 'remember'
-					if (typeof event.result === 'string' && event.result.startsWith('✅')) {
+					if (!outputSettings.hideTools && typeof event.result === 'string' && event.result.startsWith('✅')) {
 						sendToDiscord(channel, event.result, { trackInSession: true, type: "tool-success" }).catch(() => {});
 					}
 				}
@@ -1689,7 +1743,9 @@ async function main() {
 			message.content === "/session" ||
 			message.content === "/models" || message.content.startsWith("/models ") ||
 			message.content === "/model" || message.content.startsWith("/model ") ||
-			message.content === "/settings";
+			message.content === "/settings" ||
+			message.content === "/hide" || message.content.startsWith("/hide ") ||
+			message.content === "/show" || message.content.startsWith("/show ");
 
 		// Only abort if the agent is active AND this is not a non-interrupting command
 		if (discordSession.isModelActive() && !isNonInterruptingCommand) {
@@ -1711,7 +1767,7 @@ async function main() {
 			subscribedSessions.add(channelId);
 			subscribeCount++;
 			log(`[${channelId}] Subscribing to session (total subscriptions: ${subscribeCount})`);
-			const sub = subscribeToSession(session, channelId, channel as DMChannel | TextChannel | NewsChannel, typingManager, sessionDir);
+			const sub = subscribeToSession(session, channelId, channel as DMChannel | TextChannel | NewsChannel, typingManager, sessionDir, getChannelOutputSettings);
 			sessionSubscriptions.set(channelId, sub);
 		} else {
 			log(`[${channelId}] Already subscribed, skipping`);
@@ -1806,7 +1862,9 @@ async function main() {
 				`• \`/models\` - List available models\n` +
 				`• \`/model [provider/id]\` - Change current model\n` +
 				`• \`/thinking [level]\` - Set thinking level (e.g., \`/thinking high\`)\n` +
-				`• \`/settings\` - Show current agent settings\n\n` +
+				`• \`/settings\` - Show current agent settings\n` +
+				`• \`/hide thinking|tools\` - Hide thinking/tool call blocks in this channel\n` +
+				`• \`/show thinking|tools\` - Show thinking/tool call blocks in this channel\n\n` +
 				`**Branching & History**\n` +
 				`• \`/label [name]\` - Label current session for /resume [label]\n` +
 				`• \`/labels\` - List all closed/labeled sessions\n` +
@@ -2178,6 +2236,44 @@ async function main() {
 			return;
 		}
 
+		// Handle /hide and /show — per-channel output visibility for thinking/tool blocks
+		if (message.content === "/hide" || message.content.startsWith("/hide ") ||
+			message.content === "/show" || message.content.startsWith("/show ")) {
+			const isHide = message.content.startsWith("/hide");
+			const target = message.content.slice(isHide ? "/hide".length : "/show".length).trim().toLowerCase();
+			const settings = getChannelOutputSettings(channelId);
+
+			const targets: Record<string, keyof ChannelOutputSettings> = {
+				thinking: "hideThinking",
+				tools: "hideTools",
+			};
+
+			// No target — show current state
+			if (!target) {
+				const state =
+					`👁 **Output visibility in this channel**\n` +
+					`• 💭 Thinking: ${settings.hideThinking ? "🔴 hidden" : "🟢 shown"}\n` +
+					`• 🔧 Tools: ${settings.hideTools ? "🔴 hidden" : "🟢 shown"}\n\n` +
+					`Use \`/hide thinking|tools\` or \`/show thinking|tools\` to change.`;
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, state);
+				return;
+			}
+
+			const key = targets[target];
+			if (!key) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`❌ Unknown target \`${target}\`. Use \`thinking\` or \`tools\`.`);
+				return;
+			}
+
+			settings[key] = isHide;
+			saveChannelOutputSettings();
+			const label = target === "thinking" ? "💭 thinking blocks" : "🔧 tool call blocks";
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+				`✅ ${isHide ? "Hidden" : "Showing"} ${label} in this channel.`);
+			return;
+		}
+
 		if (message.content.startsWith("/thinking ")) {
 			const thinking = message.content.replace('/thinking ', '')
 			try {
@@ -2426,6 +2522,9 @@ async function main() {
 
 	// Restore persisted prompt queues from disk
 	loadPromptQueue();
+
+	// Restore per-channel output visibility settings (/hide, /show) from disk
+	loadChannelOutputSettings();
 
 	// Restore sessions for channels with scheduled prompts
 	restoreScheduledSessions();

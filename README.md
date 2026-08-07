@@ -54,6 +54,8 @@ and stays up through tool calls, bash commands, retries, and long generations.
 | `/session` | Show session stats (messages, tokens, cost) |
 | `/stats` | Show token utilization & delta |
 | `/settings` | Show current agent settings |
+| `/hide thinking\|tools` | Hide thinking/tool call blocks in this channel |
+| `/show thinking\|tools` | Show thinking/tool call blocks in this channel |
 | `/cwd [path]` | View/change working directory |
 | `/queue [prompt]` | Queue a prompt for after current task |
 | `/clear` | Reset session (start fresh) |
