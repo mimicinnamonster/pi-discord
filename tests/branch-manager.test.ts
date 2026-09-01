@@ -14,7 +14,7 @@ import {
 import { mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import type { SessionManager, SessionEntry, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
+import type { SessionManager, SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 
 // ============================================================================
 // Mocks

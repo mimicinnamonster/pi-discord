@@ -23,6 +23,22 @@ stream mid-generation. Files with an image extension but no real image content (
 HTML 404 page saved as `.jpg`) are rejected with a clear error instead of a provider 400.
 If resizing is unavailable it falls back to the original image.
 
+### 🧠 Channel Memory (`remember` tool)
+The agent has a `remember` tool for persistent per-channel memory: whatever the
+agent is told to remember is stored keyed by **Discord channel**, not pi session
+UUID, so it survives bot restarts, `/session`, `/clear`, `/compact`, `/resume`,
+`/fork` and reply-based forks within the same channel. The memory is injected
+into the system prompt at the start of every turn via the official
+`before_agent_start` extension hook. Legacy `memory-<sessionId>.json` sidecars
+from earlier versions are migrated automatically on startup.
+
+### 🎛️ Model-controlled Thinking (`thinkingmode` tool)
+The model can raise or lower its own thinking/reasoning effort with the
+`thinkingmode` tool (default: `off` — it only escalates for genuinely complex
+tasks). The chosen level and the enable flag are persisted per Discord channel;
+`/thinkingmode on|off` controls whether the model may change its own level, and
+`/hide thinkingmode` suppresses its notifications.
+
 ### ⏰ Scheduled Prompts
 Cron jobs (configured via the `pi-schedule-prompt` extension) fire into the channel's
 session and stream the response to Discord. The bot keeps sessions alive for channels
@@ -41,6 +57,7 @@ and stays up through tool calls, bash commands, retries, and long generations.
 
 ### 🌿 Branching & History
 - **Reply branching** — reply to any previous bot message to fork the conversation
+- **`/fork [label]`** — snapshot the current session (resumable via `/resume`) and continue in a full-context copy
 - **`/label` / `/labels`** — bookmark any point in the conversation
 - **`/merge`** — merge changes from a branch into the current thread
 - **`/summary`** — preview what would be merged
@@ -51,15 +68,17 @@ and stays up through tool calls, bash commands, retries, and long generations.
 | `/model [name]` | Switch AI model (e.g. `/model anthropic/claude-sonnet-4`) |
 | `/models [query]` | List/search available models |
 | `/thinking [level]` | Set thinking/effort level |
+| `/thinkingmode on\|off` | Allow/prevent the model from changing its own thinking level via the `thinkingmode` tool |
 | `/session` | Show session stats (messages, tokens, cost) |
 | `/stats` | Show token utilization & delta |
 | `/settings` | Show current agent settings |
-| `/hide thinking\|tools` | Hide thinking/tool call blocks in this channel |
-| `/show thinking\|tools` | Show thinking/tool call blocks in this channel |
+| `/hide thinking\|tools\|thinkingmode` | Hide thinking/tool/thinking-mode-notification blocks in this channel |
+| `/show thinking\|tools\|thinkingmode` | Show thinking/tool/thinking-mode-notification blocks in this channel |
 | `/cwd [path]` | View/change working directory |
 | `/queue [prompt]` | Queue a prompt for after current task |
 | `/clear` | Reset session (start fresh) |
 | `/reload` | Reload extensions, skills, and themes |
+| `/fork [label]` | Snapshot current session and continue in a full-context copy (pre-fork state resumable via `/resume`) |
 | `/label [name]` | Label current position |
 | `/labels` | List all labels |
 | `/merge [name]` | Merge from a label or reply |
@@ -169,6 +188,8 @@ enabling the one-time macOS permission prompt (click **Allow** on the
 - **`src/branch-manager.ts`** — Discord reply tree ↔ pi session tree mapping
 - **`src/typing-manager.ts`** — Typing indicator management (renewal + dead-man switch, respects rate limits)
 - **`src/image-utils.ts`** — Image downscaling/compression for LLM payloads
+- **`src/session-memory.ts`** — Channel-scoped `remember` memory persistence + system-prompt injection
+- **`src/thinking-mode.ts`** — Channel-scoped `thinkingmode` tool (model-controlled thinking level)
 - **`src/token-stats.ts`** — Token utilization tracking and alerts
 - **`src/model-utils.ts`** — Model search and filtering
 

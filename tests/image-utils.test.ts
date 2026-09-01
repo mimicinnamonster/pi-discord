@@ -15,7 +15,7 @@ import { downscaleImage } from "../src/image-utils";
 // The path resolves to the same module file that src/image-utils.ts imports.
 const resizeImageMock = vi.fn();
 
-vi.mock("../node_modules/@mariozechner/pi-coding-agent/dist/utils/image-resize.js", () => ({
+vi.mock("../node_modules/@earendil-works/pi-coding-agent/dist/utils/image-resize.js", () => ({
 	resizeImage: (...args: unknown[]) => resizeImageMock(...args),
 }));
 

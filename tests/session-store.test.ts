@@ -130,8 +130,12 @@ describe("SessionStore", () => {
 			// Initial check (should be 10 from createPiSession)
 			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
 
-			// Simulate setModel which re-applies overrides
-			await discordSession.setModel("google", "gemma-4-31b-it");
+			// Simulate setModel which re-applies overrides.
+			// pi >= 0.84 validates auth in setModel, so pick a model the
+			// current environment actually has credentials for.
+			const available = await discordSession.session.modelRuntime.getAvailable();
+			const target = available.find((m) => m.provider === "google" && m.id === "gemma-4-31b-it") ?? available[0];
+			await discordSession.setModel(target.provider, target.id);
 			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
 		});
 	});
@@ -338,6 +342,103 @@ describe("SessionStore", () => {
 
 			expect(await store.resumeSession(channelId, "stale-session-id")).toBe(false);
 			expect(store.getClosedSessions(channelId)).toEqual([]);
+		});
+	});
+
+	describe("Session Fork", () => {
+		/**
+		 * Write a valid v3 session file (header + user + assistant message) at the
+		 * channel's default path, so forkSession can snapshot it — mirroring a real
+		 * persisted conversation.
+		 */
+		function writeSessionFixture(channelId: string, sessionId: string, cwd: string = "/tmp"): string {
+			const path = store.getSessionFile(channelId);
+			const ts = new Date().toISOString();
+			const entries = [
+				{ type: "session", version: 3, id: sessionId, timestamp: ts, cwd },
+				{ type: "message", id: "msg-1", parentId: null, timestamp: ts, message: { role: "user", content: [{ type: "text", text: "Hello there" }] } },
+				{ type: "message", id: "msg-2", parentId: "msg-1", timestamp: ts, message: { role: "assistant", content: [{ type: "text", text: "Hi!" }], usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+			];
+			writeFileSync(path, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+			return path;
+		}
+
+		it("should create a NEW session (new UUID) with the full history after fork", async () => {
+			const channelId = "fork-context-channel";
+			const sessionId = "fork-session-id-001";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.forkSession(channelId);
+
+			const forked = await store.getOrCreate(channelId);
+			// New UUID: the fork is an independent session (pi's native fork),
+			// while the original is preserved as a resumable snapshot
+			expect(forked.session.getSessionStats().sessionId).not.toBe(sessionId);
+			expect(store.getClosedSessions(channelId)[0].sessionId).toBe(sessionId);
+
+			// Full history was copied into the new session
+			const context = forked.session.sessionManager.buildSessionContext();
+			expect(context.messages.length).toBeGreaterThanOrEqual(2);
+			expect((context.messages[0].content as Array<{ text: string }>)[0].text).toBe("Hello there");
+			expect((context.messages[1].content as Array<{ text: string }>)[0].text).toBe("Hi!");
+
+			// The live file at the default path carries the NEW UUID so
+			// restarts reopen the fork (not the pre-fork state)
+			const header = JSON.parse(readFileSync(store.getSessionFile(channelId), "utf-8").split("\n")[0]);
+			expect(header.id).toBe(forked.session.getSessionStats().sessionId);
+		});
+
+		it("should register the pre-fork state as a resumable snapshot", async () => {
+			const channelId = "fork-snapshot-channel";
+			const sessionId = "fork-session-id-002";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.forkSession(channelId);
+
+			const closed = store.getClosedSessions(channelId);
+			expect(closed.length).toBe(1);
+			expect(closed[0].sessionId).toBe(sessionId);
+			expect(existsSync(closed[0].sessionFile)).toBe(true);
+
+			// Snapshot is resumable and restores the original context
+			expect(await store.resumeSession(channelId, sessionId)).toBe(true);
+			const restored = await store.getOrCreate(channelId);
+			expect(restored.session.getSessionStats().sessionId).toBe(sessionId);
+			const context = restored.session.sessionManager.buildSessionContext();
+			expect(context.messages.length).toBeGreaterThanOrEqual(2);
+		});
+
+		it("should fork with a label and resume by label", async () => {
+			const channelId = "fork-label-channel";
+			const sessionId = "fork-session-id-003";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.forkSession(channelId, "pre-experiment");
+
+			expect(store.getClosedSessions(channelId)[0].label).toBe("pre-experiment");
+			expect(await store.resumeSession(channelId, "pre-experiment")).toBe(true);
+		});
+
+		it("should preserve cwd and model metadata across fork", async () => {
+			const channelId = "fork-meta-channel";
+			const sessionId = "fork-session-id-004";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+			await store.changeCwd(channelId, "~/Projects/rotz");
+			store.updateModel(channelId, "test-provider/test-model");
+			await store.forkSession(channelId);
+
+			const index = store.loadIndex();
+			expect(index.sessions[channelId].cwd).toBe(join(homedir(), "Projects/rotz"));
+			expect(index.sessions[channelId].model).toBe("test-provider/test-model");
+		});
+
+		it("should throw when there is no active session", async () => {
+			await expect(store.forkSession("no-session-channel")).rejects.toThrow("No active session");
 		});
 	});
 
@@ -631,6 +732,91 @@ describe("Session Persistence Behavior", () => {
 
 			expect(loaded.sessions["persist-channel"]).toBeDefined();
 			expect(loaded.sessions["persist-channel"].lastActivity).toBe(1234567890);
+		} finally {
+			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("Legacy memory migration", () => {
+	it("should adopt memory-<sessionId>.json sidecars into channel-memory-<channelId>.json on startup", () => {
+		const testDir = join(tmpdir(), `pi-discord-memory-migrate-${Date.now()}`);
+		mkdirSync(testDir, { recursive: true });
+
+		try {
+			// A closed-session backup file whose session header carries the UUID
+			// that the legacy sidecar is keyed on.
+			writeFileSync(
+				join(testDir, "discord-111222333-1785000000000.jsonl"),
+				'{"type":"session","id":"legacy-session-abc","timestamp":"2026-08-01T00:00:00Z","cwd":"/tmp"}\n',
+			);
+			writeFileSync(
+				join(testDir, "memory-legacy-session-abc.json"),
+				JSON.stringify({ memory: "Legacy note", updatedAt: 100 }),
+			);
+
+			// Constructing the store triggers the migration.
+			new SessionStore({ sessionDir: testDir });
+
+			const channelFile = join(testDir, "channel-memory-111222333.json");
+			expect(existsSync(channelFile)).toBe(true);
+			const data = JSON.parse(readFileSync(channelFile, "utf-8"));
+			expect(data.memory).toBe("Legacy note");
+
+			// The legacy sidecar is left in place (never deleted).
+			expect(existsSync(join(testDir, "memory-legacy-session-abc.json"))).toBe(true);
+		} finally {
+			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	it("should map sessions via closed-sessions.json too", () => {
+		const testDir = join(tmpdir(), `pi-discord-memory-migrate2-${Date.now()}`);
+		mkdirSync(testDir, { recursive: true });
+
+		try {
+			writeFileSync(
+				join(testDir, "closed-sessions.json"),
+				JSON.stringify([
+					{
+						channelId: "444555666",
+						sessionId: "closed-session-xyz",
+						sessionFile: join(testDir, "discord-444555666-1785000000000.jsonl"),
+					sessionName: "discord-444555666",
+					closedAt: 1785000000000,
+				},
+			]),
+			);
+			writeFileSync(
+				join(testDir, "memory-closed-session-xyz.json"),
+				JSON.stringify({ memory: "Closed session memory", updatedAt: 100 }),
+			);
+
+			new SessionStore({ sessionDir: testDir });
+
+			const channelFile = join(testDir, "channel-memory-444555666.json");
+			expect(existsSync(channelFile)).toBe(true);
+			const data = JSON.parse(readFileSync(channelFile, "utf-8"));
+			expect(data.memory).toBe("Closed session memory");
+		} finally {
+			rmSync(testDir, { recursive: true, force: true });
+		}
+	});
+
+	it("should leave unmappable legacy sidecars untouched", () => {
+		const testDir = join(tmpdir(), `pi-discord-memory-migrate3-${Date.now()}`);
+		mkdirSync(testDir, { recursive: true });
+
+		try {
+			writeFileSync(
+				join(testDir, "memory-unknown-session.json"),
+				JSON.stringify({ memory: "Orphaned", updatedAt: 100 }),
+			);
+
+			new SessionStore({ sessionDir: testDir });
+
+			expect(existsSync(join(testDir, "memory-unknown-session.json"))).toBe(true);
+			expect(existsSync(join(testDir, "channel-memory-unknown-session.json"))).toBe(false);
 		} finally {
 			rmSync(testDir, { recursive: true, force: true });
 		}

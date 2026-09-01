@@ -1,25 +1,27 @@
 import { describe, it, expect, vi } from "vitest";
-import { createAgentSession } from "@mariozechner/pi-coding-agent";
+import { withCurrentDate } from "../src/session-store.js";
 
 describe("Agent Date Awareness", () => {
-	it("should have the correct local date in the system prompt when TZ is set", async () => {
-		// Set timezone to Amsterdam
+	it("appends the correct local date when the prompt has none (pi >= 0.84)", () => {
 		process.env.TZ = "Europe/Amsterdam";
-		
-		// Simulate April 14, 01:00 AM in Netherlands (UTC+2)
-		// This corresponds to April 13, 11:00 PM UTC
-		const mockDate = new Date("2026-04-13T23:00:00Z"); 
-		vi.setSystemTime(mockDate);
 
-		const { session } = await createAgentSession();
-		const prompt = session.systemPrompt;
-		
-		const localDate = new Date().toLocaleDateString('en-CA'); // Should be 2026-04-14
-		
-		console.log(`Mocked Time: ${mockDate.toISOString()}`);
-		console.log(`Local date: ${localDate}`);
-		console.log(`System prompt date: ${prompt.match(/Current date: (\d{4}-\d{2}-\d{2})/)?.[1]}`);
+		// April 14, 01:00 AM in Netherlands (UTC+2) = April 13, 11:00 PM UTC
+		vi.setSystemTime(new Date("2026-04-13T23:00:00Z"));
+
+		const prompt = withCurrentDate("You are an expert coding assistant.");
+		const localDate = new Date().toLocaleDateString("en-CA"); // 2026-04-14
 
 		expect(prompt).toContain(`Current date: ${localDate}`);
+	});
+
+	it("replaces an existing date line (older pi prompts)", () => {
+		process.env.TZ = "Europe/Amsterdam";
+		vi.setSystemTime(new Date("2026-04-13T23:00:00Z"));
+
+		const prompt = withCurrentDate("Intro\nCurrent date: 2020-01-01\nMore");
+		const localDate = new Date().toLocaleDateString("en-CA");
+
+		expect(prompt).toContain(`Current date: ${localDate}`);
+		expect(prompt).not.toContain("2020-01-01");
 	});
 });

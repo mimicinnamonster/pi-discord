@@ -4,20 +4,21 @@
  */
 
 import {
-	AuthStorage,
 	createAgentSession,
-	ModelRegistry,
+	ModelRuntime,
 	SessionManager,
 	SettingsManager,
 	createCodingTools,
 	type AgentSession,
 	DefaultResourceLoader,
 	discoverAndLoadExtensions,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import mcpAdapter from "pi-mcp-adapter";
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, unlinkSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, unlinkSync, readdirSync } from "fs";
+import { createSessionMemoryExtension, getChannelMemoryFilePath, getMemoryFilePath, loadMemory, patchCurrentSystemPrompt, saveChannelMemory } from "./session-memory.js";
+import { applyChannelThinkingMode, createThinkingModeTool } from "./thinking-mode.js";
 
 // ============================================================================
 // Types
@@ -32,6 +33,18 @@ export interface ClosedSessionInfo {
 	label?: string;
 }
 
+/**
+ * Ensure the system prompt carries today's local date (YYYY-MM-DD, en-CA).
+ * pi >= 0.84 no longer injects a date line; older versions had one to update.
+ */
+export function withCurrentDate(prompt: string, now: Date = new Date()): string {
+	const localDate = now.toLocaleDateString('en-CA');
+	if (/Current date: \d{4}-\d{2}-\d{2}/.test(prompt)) {
+		return prompt.replace(/Current date: \d{4}-\d{2}-\d{2}/, `Current date: ${localDate}`);
+	}
+	return `${prompt}\n\nCurrent date: ${localDate}`;
+}
+
 export class DiscordSession {
 	channelId: string;
 	session: AgentSession;
@@ -44,7 +57,7 @@ export class DiscordSession {
 	}
 
 	async setModel(provider: string, model: string) {
-		const m = this.session.modelRegistry.find(provider, model)
+		const m = this.session.modelRuntime.getModel(provider, model)
 		if (!m) throw new Error(`Can't find model ${provider}/${model}`)
 		await this.session.setModel(m);
 		this.applyRetryOverrides();
@@ -162,6 +175,88 @@ export class SessionStore {
 		if (!existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
+
+		// Adopt legacy session-UUID-keyed memory sidecars (memory-<uuid>.json)
+		// into the channel-scoped files (channel-memory-<channelId>.json) so
+		// nothing the user told the bot to remember is lost after this upgrade.
+		this.migrateLegacyMemoryFiles();
+	}
+
+	/**
+	 * One-time migration of legacy `memory-<sessionId>.json` sidecars to
+	 * channel-scoped `channel-memory-<channelId>.json`. Maps each session UUID
+	 * to its channel via closed-sessions.json (explicit pairs) and by scanning
+	 * the session header of every `discord-<channelId>[-<ts>].jsonl` file.
+	 * When several legacy sessions of one channel carry memory, the most
+	 * recently updated one wins. Legacy files are left in place (never
+	 * deleted) — they are simply no longer read.
+	 */
+	private migrateLegacyMemoryFiles(): void {
+		try {
+			const sessionIdToChannel = new Map<string, string>();
+
+			// 1) closed-sessions.json holds explicit sessionId -> channelId pairs
+			for (const closed of this.loadClosedSessions()) {
+				sessionIdToChannel.set(closed.sessionId, closed.channelId);
+			}
+
+			// 2) Scan the session header of every discord-*.jsonl file (active
+			//    default files and timestamped backups) for its session UUID.
+			const dir = this.sessionDir;
+			for (const name of readdirSync(dir)) {
+				if (!name.startsWith("discord-") || !name.endsWith(".jsonl")) continue;
+				const m = name.match(/^discord-(\d+)(?:-\d+)?\.jsonl$/);
+				if (!m) continue;
+				const channelId = m[1];
+				let header: { type?: string; id?: string } | undefined;
+				try {
+					header = JSON.parse(readFileSync(join(dir, name), "utf-8").split("\n", 1)[0]);
+				} catch {
+					continue;
+				}
+				if (header?.type === "session" && header.id) {
+					sessionIdToChannel.set(header.id, channelId);
+				}
+			}
+
+			// 3) Adopt every legacy sidecar into its channel's memory file.
+			let migrated = 0;
+			for (const name of readdirSync(dir)) {
+				const m = name.match(/^memory-([\w-]+)\.json$/);
+				if (!m) continue;
+				const sessionId = m[1];
+				const channelId = sessionIdToChannel.get(sessionId);
+				if (!channelId) continue;
+				const legacy = loadMemory(dir, sessionId);
+				if (!legacy) continue;
+
+				const channelPath = getChannelMemoryFilePath(dir, channelId);
+				if (existsSync(channelPath)) {
+					let existingUpdated = 0;
+					try {
+						existingUpdated = JSON.parse(readFileSync(channelPath, "utf-8"))?.updatedAt ?? 0;
+					} catch {
+						// Corrupt channel file -> overwrite below
+					}
+					let legacyUpdated = 0;
+					try {
+						legacyUpdated = JSON.parse(readFileSync(getMemoryFilePath(dir, sessionId), "utf-8"))?.updatedAt ?? 0;
+					} catch {
+						// Ignore
+					}
+					if (existingUpdated >= legacyUpdated) continue;
+				}
+
+				writeFileSync(channelPath, JSON.stringify({ channelId, memory: legacy, updatedAt: Date.now() }, null, 2));
+				migrated++;
+				this.log(`[memory] Migrated legacy session memory ${sessionId} → channel ${channelId}`);
+			}
+			if (migrated > 0) {
+				this.log(`[memory] Legacy memory migration complete (${migrated} file(s) adopted)`);
+			}
+		} catch (error) {
+			this.log("Legacy memory migration failed:", error);
+		}
 	}
 
 	// ============================================================================
@@ -220,8 +315,10 @@ export class SessionStore {
 
 		// Set up auth and model registry
 		const agentDir = join(homedir(), ".pi", "agent");
-		const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-		const modelRegistry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
+		const modelRuntime = await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+		});
 
 		// Create or open session manager first to determine the CWD
 		let sessionManager: SessionManager;
@@ -247,7 +344,7 @@ export class SessionStore {
 		let sessionRef: AgentSession | undefined;
 		const rememberTool = {
 			name: "remember",
-			description: "Temporary session memory. Adds info to the system prompt for this session only (lost on /clear or restart). Use to remember tasks, preferences, or key facts the agent should track and focus on during this conversation.",
+			description: "Session memory. Persisted per-channel: survives /session, /clear, /compact, bot restarts, /resume, and forks within the same Discord channel. Use to remember tasks, preferences, or key facts the agent should track and focus on across conversations in this channel.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -258,26 +355,31 @@ export class SessionStore {
 				},
 				required: ["memory"],
 			},
-					execute: async (_toolCallId: string, { memory }: { memory: string }) => {
+				execute: async (_toolCallId: string, { memory }: { memory: string }) => {
 				try {
-					const memoryBlock = `agent memory:\n${memory}`;
-					const current = sessionRef!["agent"].state.systemPrompt;
-					const marker = "agent memory:";
-					const markerIndex = current.indexOf(marker);
-					if (markerIndex !== -1) {
-						// Replace from the marker, strip trailing newlines from existing prefix
-						const base = current.slice(0, markerIndex).replace(/\n+$/, "");
-						sessionRef!["agent"].state.systemPrompt = base + `\n\n${memoryBlock}`;
-					} else {
-						// Append
-						sessionRef!["agent"].state.systemPrompt = current + `\n\n${memoryBlock}`;
-					}
-					return { content: [{ type: "text", text: "✅ Memory updated successfully." }] };
+					// Persist per DISCORD CHANNEL so memory follows the channel across
+					// /session, /clear, /compact, restarts, /resume and forks (keying
+					// by pi session UUID leaked whenever a fresh UUID was minted).
+					const session = sessionRef!;
+					saveChannelMemory(this.sessionDir, channelId, memory);
+					// Patch the CURRENT turn's system prompt so the running agent
+					// loop sees the new memory right away. Future turns pick it up
+					// automatically via the before_agent_start extension hook.
+					patchCurrentSystemPrompt(session, memory);
+					return { content: [{ type: "text", text: "✅ Memory updated successfully (persisted for this channel)." }] };
 				} catch (error) {
 					return { content: [{ type: "text", text: `❌ Failed to update memory: ${error}` }] };
 				}
 			},
 		};
+
+		const thinkingModeTool = createThinkingModeTool({
+			sessionDir: this.sessionDir,
+			channelId,
+			// Lazy resolver: both the tool's execute and its dynamic description
+			// (which reads the live thinking level) use it.
+			getSession: () => sessionRef,
+		});
 
 		const lookAtFileTool = {
 			name: "look_at_file",
@@ -343,12 +445,14 @@ export class SessionStore {
 			cwd: finalCwd,
 			agentDir,
 			settingsManager,
+			// Official `before_agent_start` hook: appends persisted `remember`
+			// memory to the system prompt at the start of every agent turn.
+			// Channel-scoped: memory follows the channel, not the pi session UUID.
+			extensionFactories: [createSessionMemoryExtension(this.sessionDir, channelId)],
 			appendSystemPrompt: [`\n\nYou are running on Discord (in a channel named "${getChannelName()}"), use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
 			systemPromptOverride: (basePrompt) => {
 				if (!basePrompt) return basePrompt;
-				const now = new Date();
-				const localDate = now.toLocaleDateString('en-CA');
-				let prompt = basePrompt.replace(/Current date: \d{4}-\d{2}-\d{2}/, `Current date: ${localDate}`);
+				let prompt = withCurrentDate(basePrompt, now);
 
 				// Dynamically update channel name (handles renames)
 				const chanName = getChannelName();
@@ -370,10 +474,9 @@ export class SessionStore {
 		const agent = await createAgentSession({
 			cwd,
 			agentDir: join(homedir(), ".pi", "agent"),
-			authStorage,
-			modelRegistry,
+			modelRuntime,
 			tools,
-			customTools: [rememberTool, lookAtFileTool],
+			customTools: [rememberTool, lookAtFileTool, thinkingModeTool],
 			sessionManager,
 			settingsManager,
 			resourceLoader
@@ -382,6 +485,11 @@ export class SessionStore {
 		const { session } = agent
 
 		sessionRef = session;
+
+		// Restore the channel's persisted thinking mode (channel-scoped, defaults
+		// to "off") onto this freshly created session so it survives restarts,
+		// /session, /clear, /compact, /resume, forks and crashes.
+		applyChannelThinkingMode(this.sessionDir, channelId, session);
 
     await session.bindExtensions({
         mcp: mcpAdapter,
@@ -394,19 +502,10 @@ export class SessionStore {
 		// Set session name for identification
 		session.setSessionName(`discord-${channelId}`);
 
-		// Restore agent memory from session file if it exists
-		try {
-			const systemPrompt = session.systemPrompt;
-			if (systemPrompt) {
-				const memoryMarker = "agent memory:";
-				const memoryIndex = systemPrompt.indexOf(memoryMarker);
-				if (memoryIndex !== -1) {
-					this.log(`[${channelId}] Restored memory from system prompt`);
-				}
-			}
-		} catch (error) {
-			this.log(`[${channelId}] Failed to check for restored memory: ${error}`);
-		}
+		// Persisted `remember` memory is applied automatically on every turn by
+		// the before_agent_start extension hook (it re-reads the sidecar file for
+		// this session's UUID), so nothing to restore here — the hook covers bot
+		// restarts, /resume and any other session recreation.
 
 		return session;
 	}
@@ -478,12 +577,24 @@ export class SessionStore {
 		// Restore persisted model if available
 		if (indexed?.model) {
 			this.log(`[${channelId}] Restoring model: ${indexed.model}`);
-			const [provider, modelId] = indexed.model.split('/');
-			const m = session.modelRegistry.find(provider, modelId);
-			if (m) {
-				await session.setModel(m);
+			// Split on the FIRST slash only — model IDs may contain slashes
+			// themselves (e.g. vastai-qwen38/unsloth/Qwen3.8-27B-GGUF:Q4_K_M,
+			// openrouter/google/gemma-4-26b-a4b-it:free). A naive split('/')
+			// truncated the ID to "unsloth" so the registry lookup always failed
+			// and the channel silently fell back to the default model after
+			// /session, /clear, /compact or a bot restart.
+			const slashIndex = indexed.model.indexOf('/');
+			if (slashIndex === -1) {
+				this.log(`[${channelId}] Warning: Persisted model ${indexed.model} has no provider prefix`);
 			} else {
-				this.log(`[${channelId}] Warning: Persisted model ${indexed.model} not found in registry`);
+				const provider = indexed.model.slice(0, slashIndex);
+				const modelId = indexed.model.slice(slashIndex + 1);
+				const m = session.modelRuntime.getModel(provider, modelId);
+				if (m) {
+					await session.setModel(m);
+				} else {
+					this.log(`[${channelId}] Warning: Persisted model ${indexed.model} not found in registry`);
+				}
 			}
 		}
 
@@ -689,6 +800,124 @@ export class SessionStore {
 	}
 
 	/**
+	 * Fork the current session the pi-native way: mint a NEW session (fresh
+	 * UUID) via SessionManager.createBranchedSession() — which replays the
+	 * full conversation path (root → current leaf: messages, tool calls,
+	 * compaction summaries, model/thinking history, labels) into a brand-new
+	 * session file — then move that file onto the channel's default path so
+	 * the live session keeps the bot's "default path = live session"
+	 * convention (startup, cron, memory all rely on it).
+	 *
+	 * The ORIGINAL pre-fork session (old UUID) is saved as a resumable
+	 * snapshot and registered in closed-sessions.json (label works too).
+	 * Returns the snapshot's session id (old UUID).
+	 */
+	async forkSession(channelId: string, label?: string): Promise<string> {
+		const discordSession = this.sessions.get(channelId);
+		if (!discordSession) {
+			throw new Error("No active session for this channel");
+		}
+
+		// Don't fork mid-turn — the manager gets transformed below.
+		await discordSession.abortModelActivities();
+
+		const { session } = discordSession;
+		const oldStats = session.getSessionStats();
+		const oldSessionId = oldStats.sessionId;
+		const oldSessionFile = oldStats.sessionFile || this.getSessionPath(channelId);
+		const defaultPath = this.getSessionPath(channelId);
+		const sessionName = session.sessionName || `discord-${channelId}`;
+		const leafId = session.sessionManager.getLeafId();
+		if (!leafId) {
+			throw new Error("Cannot fork: session has no conversation yet");
+		}
+		// Guard BEFORE any mutation: createBranchedSession transforms the manager
+		// immediately but defers writing the file until the first assistant
+		// message — a fork with no assistant content would strand the manager
+		// half-transformed. Refuse instead.
+		const hasAssistant = session.sessionManager.getBranch(leafId).some(
+			(e: any) => e.type === "message" && e.message?.role === "assistant"
+		);
+		if (!hasAssistant) {
+			throw new Error("Cannot fork: session has no assistant content yet");
+		}
+
+		// 1) Snapshot the pre-fork state to a distinct backup path (resumable
+		//    via /resume <id>). The default path itself must NOT be registered
+		//    as a closed-session file — resumeSession unlinks the default path
+		//    before restoring, which would destroy the snapshot.
+		const timestamp = Date.now();
+		const backupFile = oldSessionFile.replace(/\.jsonl$/, `-${timestamp}.jsonl`);
+		if (existsSync(oldSessionFile)) {
+			if (oldSessionFile === defaultPath) {
+				copyFileSync(oldSessionFile, backupFile);
+			} else {
+				// Live file is already at a distinct path (e.g. after /clear) —
+				// moving it frees the default path for the fork below.
+				renameSync(oldSessionFile, backupFile);
+			}
+		} else {
+			throw new Error("Cannot fork: session file not found on disk");
+		}
+
+		// 2) Create the NEW session (new UUID, full history) with pi's own
+		//    fork primitive. It re-points the current SessionManager in place
+		//    to represent the new session and writes the new file.
+		const forkedPath = session.sessionManager.createBranchedSession(leafId);
+		if (!forkedPath) {
+			throw new Error("Cannot fork: failed to create forked session");
+		}
+		if (!existsSync(forkedPath)) {
+			// No assistant content yet — createBranchedSession defers writing the
+			// file until the first assistant message. Nothing meaningful to fork.
+			throw new Error("Cannot fork: session has no assistant content yet");
+		}
+
+		// 3) Move the fork onto the channel default path (the live slot).
+		if (existsSync(defaultPath)) {
+			// Only ever the stale pre-fork copy (old UUID) — its snapshot lives
+			// at backupFile, so it's safe to remove.
+			this.log(`[${channelId}] Removing stale default path file: ${defaultPath}`);
+			unlinkSync(defaultPath);
+		}
+		renameSync(forkedPath, defaultPath);
+		session.sessionManager.setSessionFile(defaultPath);
+
+		// 4) Rebuild the agent's in-memory context for the forked session so
+		//    the next turn carries the full history (same as /compact does).
+		const ctx = session.sessionManager.buildSessionContext();
+		session.agent.state.messages = ctx.messages;
+
+		// 5) Register the original session as a resumable snapshot
+		const closedSessions = this.loadClosedSessions();
+		closedSessions.push({
+			channelId,
+			sessionId: oldSessionId,
+			sessionFile: backupFile,
+			sessionName,
+			closedAt: timestamp,
+			label,
+		});
+		this.saveClosedSessions(closedSessions);
+
+		// 6) Keep the channel's index pointing at the live (now forked) session
+		//    and preserve its metadata (cwd, model).
+		const index = this.loadIndex();
+		const existingMeta = index.sessions[channelId] || {};
+		index.sessions[channelId] = {
+			...existingMeta,
+			channelId,
+			sessionFile: defaultPath,
+			lastActivity: Date.now(),
+		};
+		this.saveIndex(index);
+
+		this.log(`[${channelId}] Forked session ${oldSessionId} → new session; pre-fork snapshot stored as ${backupFile}`);
+
+		return oldSessionId;
+	}
+
+	/**
 	 * Resume a previously closed session.
 	 * Closes the current session, restores the old one by session ID.
 	 */
@@ -813,9 +1042,56 @@ export class SessionStore {
 		const discordSession = this.sessions.get(channelId);
 		if (discordSession) {
 			this.log(`[${channelId}] Resetting session`);
+			const session = discordSession.session;
+			const sessionManager = session.sessionManager;
+			const defaultPath = this.getSessionPath(channelId);
+
+			// Preserve the current session as a resumable backup (like /session)
+			// instead of stranding it: /clear used to let SessionManager.newSession()
+			// repoint writes at a timestamped <ts>_<uuid>.jsonl file, so after a
+			// restart the bot reopened the OLD discord-<channel>.jsonl and the
+			// "cleared" state silently reverted (full zombie session + its memory
+			// resurrected with it).
+			let backupFile: string | undefined;
+			let oldSessionId: string | undefined;
+			try {
+				const stats = session.getSessionStats();
+				oldSessionId = stats.sessionId;
+				const oldFile = stats.sessionFile || defaultPath;
+				if (oldSessionId && existsSync(oldFile)) {
+					const ts = Date.now();
+					backupFile = oldFile.replace(/\.jsonl$/, `-${ts}.jsonl`);
+					renameSync(oldFile, backupFile);
+				}
+			} catch {
+				// Best-effort; stats may be unavailable mid-stream
+			}
+
+			// Clear any stale default-path file so the fresh session owns it
+			if (existsSync(defaultPath)) {
+				unlinkSync(defaultPath);
+			}
+
 			// Reset both the Agent state (messages) and the session manager (file state)
-			discordSession.session.agent.reset();
-			discordSession.session.sessionManager.newSession();
+			session.agent.reset();
+			sessionManager.newSession();
+			// SessionManager.newSession() points at a timestamped file; repoint
+			// writes at the channel default path so restarts open the new session.
+			if (sessionManager.getSessionFile() !== defaultPath) {
+				sessionManager.setSessionFile(defaultPath);
+			}
+
+			if (backupFile && oldSessionId) {
+				const closedSessions = this.loadClosedSessions();
+				closedSessions.push({
+					channelId,
+					sessionId: oldSessionId,
+					sessionFile: backupFile,
+					sessionName: session.sessionName || `discord-${channelId}`,
+					closedAt: Date.now(),
+				});
+				this.saveClosedSessions(closedSessions);
+			}
 
 			// Update last activity
 			this.touch(channelId);

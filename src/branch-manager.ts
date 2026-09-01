@@ -5,7 +5,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
-import type { SessionManager, SessionEntry, SessionMessageEntry } from "@mariozechner/pi-coding-agent";
+import type { SessionManager, SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
 
 // SessionTreeNode is not exported publicly, but we can use duck typing
 interface SessionTreeNode {

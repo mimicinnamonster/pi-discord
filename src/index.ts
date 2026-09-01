@@ -4,13 +4,15 @@
  */
 
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
-import { createSessionStore } from "./session-store";
+import { createSessionStore, type ClosedSessionInfo } from "./session-store";
+import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.js";
 import { TypingManager, type TypingChannel } from "./typing-manager";
 import { generateTokenStatsMessage } from "./token-stats";
-import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { generateSummary, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
-import { writeFileSync, readFileSync, existsSync, readdirSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, readdirSync, openSync, readSync, closeSync } from "fs";
 import { Cron } from "croner";
 import {
 	loadBranchMetadata,
@@ -94,6 +96,7 @@ const sessionLabels = new Map<string, string>();
 interface ChannelOutputSettings {
 	hideThinking: boolean;
 	hideTools: boolean;
+	hideThinkingMode: boolean;
 }
 
 const channelOutputSettings = new Map<string, ChannelOutputSettings>();
@@ -101,7 +104,7 @@ const channelOutputSettings = new Map<string, ChannelOutputSettings>();
 function getChannelOutputSettings(channelId: string): ChannelOutputSettings {
 	let settings = channelOutputSettings.get(channelId);
 	if (!settings) {
-		settings = { hideThinking: false, hideTools: false };
+		settings = { hideThinking: false, hideTools: false, hideThinkingMode: false };
 		channelOutputSettings.set(channelId, settings);
 	}
 	return settings;
@@ -111,7 +114,7 @@ function saveChannelOutputSettings(): void {
 	try {
 		const obj: Record<string, ChannelOutputSettings> = {};
 		for (const [ch, s] of channelOutputSettings) {
-			if (s.hideThinking || s.hideTools) obj[ch] = s;
+			if (s.hideThinking || s.hideTools || s.hideThinkingMode) obj[ch] = s;
 		}
 		writeFileSync(join(sessionDir, "channel-output-settings.json"), JSON.stringify(obj, null, 2));
 	} catch {}
@@ -127,6 +130,7 @@ function loadChannelOutputSettings(): void {
 				channelOutputSettings.set(ch, {
 					hideThinking: raw.hideThinking === true,
 					hideTools: raw.hideTools === true,
+					hideThinkingMode: raw.hideThinkingMode === true,
 				});
 			}
 		}
@@ -241,6 +245,23 @@ function setChannelJobsSessionSync(channelId: string, sessionId: string): boolea
 		return dirty;
 	} catch {}
 	return false;
+}
+
+/**
+ * Rebind all scheduled jobs for a channel to the channel's live session UUID.
+ * Called after any operation that replaces/recreates the session (/session,
+ * /compact, /clear, /resume, /cwd) and every 60s by the session keeper as a
+ * self-heal. A stale binding (job.session pointing at a replaced session) is
+ * silently skipped by BOTH the pi-schedule-prompt extension (isLoadedFor) and
+ * the keeper's catch-up, so leaving it stale means the job never fires again.
+ */
+function rebindChannelJobsToLiveSession(channelId: string): void {
+	const discordSession = sessionStore.get(channelId);
+	if (!discordSession) return;
+	const sessionId = discordSession.session.getSessionStats().sessionId;
+	if (setChannelJobsSessionSync(channelId, sessionId)) {
+		console.log(`[discord] Rebound scheduled jobs to live session ${sessionId} for channel ${channelId}`);
+	}
 }
 
 /**
@@ -411,6 +432,16 @@ function startSessionKeeper(deps: {
 		if (!discordSession) return;
 		const sessionId = discordSession.session.getSessionStats().sessionId;
 		if (cronSubscribedSessions.get(chId) === sessionId) return;
+		// The channel's session may already be subscribed from a user message
+		// (handleMessage) — subscribeToSession appends a listener without dedup,
+		// so subscribing again would make every agent event fire TWICE and the
+		// user would receive every thinking block / response / tool message
+		// twice. If a subscription already exists, just record the binding for
+		// this pass and move on.
+		if (deps.subscribedSessions.has(chId)) {
+			cronSubscribedSessions.set(chId, sessionId);
+			return;
+		}
 		const channel = await fetchChannelObject(chId);
 		if (!channel) return;
 		try {
@@ -464,7 +495,7 @@ function startSessionKeeper(deps: {
 			if (channel) {
 				sendToDiscord(
 					channel,
-					`⏰ Running scheduled job **"${job.name}"** — was scheduled for ${new Date(next).toLocaleString("en-GB", { timeZone: "Europe/Amsterdam" })}, executing now (bot was offline at that time).`,
+					`⏰ Running scheduled job **"${job.name}"** — was scheduled for ${new Date(next).toLocaleString("en-GB", { timeZone: "Europe/Amsterdam" })}, executing now (it missed its scheduled time — e.g. the bot was offline or the session was recreated).`,
 				).catch(() => {});
 			}
 
@@ -559,10 +590,21 @@ function startSessionKeeper(deps: {
 			}
 		}
 
-		// --- Subscribe + catch up missed runs for every channel with jobs ---
+		// --- Rebind stale bindings, subscribe, and catch up missed runs ---
 		for (const [chId, channelJobsArr] of channelJobs) {
+			// Self-heal: if the channel's live session UUID drifted from the jobs'
+			// binding (any /session, /compact, /clear, /resume, /cwd or crash can
+			// orphan them), rebind now — otherwise BOTH the extension (isLoadedFor)
+			// and the catch-up below silently skip the job forever.
+			rebindChannelJobsToLiveSession(chId);
+			// Re-read jobs so fireMissedScheduledJobs sees the corrected binding.
+			let freshJobs: any[] = channelJobsArr;
+			try {
+				const fresh = JSON.parse(readFileSync(path, "utf-8"));
+				freshJobs = (fresh.jobs || []).filter((j: any) => j.description?.startsWith(`channel:${chId}`));
+			} catch {}
 			await ensureCronSubscription(chId);
-			await fireMissedScheduledJobs(chId, channelJobsArr);
+			await fireMissedScheduledJobs(chId, freshJobs);
 		}
 	}
 
@@ -668,6 +710,74 @@ function isThread(channel: unknown): channel is ThreadChannel {
  */
 function escapeForCodeBlock(text: string): string {
 	return text.replace(/```/g, "`\u200b``\u200b``");
+}
+
+// ============================================================================
+// /sessions helpers — list resumable sessions with a first-message preview
+// ============================================================================
+
+/** Read only the head of a file. Session JSONL files can grow huge (REPL
+ * transcripts, tool output), but the first user message lives near the top,
+ * so reading the whole file just to preview it would be wasteful. */
+function readFileHead(path: string, maxBytes = 262_144): string {
+	try {
+		const fd = openSync(path, "r");
+		try {
+			const buffer = Buffer.alloc(maxBytes);
+			const bytesRead = readSync(fd, buffer, 0, maxBytes, 0);
+			return buffer.subarray(0, bytesRead).toString("utf-8");
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return "";
+	}
+}
+
+/** The marker pi-compact seeds a fresh session with. Stripped from previews so
+ * the summary itself (which tells you what the session was about) is shown. */
+const COMPACT_MARKER = /^\[Previous conversation summary — the full history was closed and can be restored with \/resume [\w-]+\]/;
+
+/**
+ * Extract the first non-empty user message from a pi session JSONL file head,
+ * collapsed to a single line — used as a "what was this session about" preview.
+ * Returns undefined when no user message can be read (e.g. file is missing or
+ * not a session file).
+ */
+function extractFirstUserMessagePreview(fileHead: string, maxPreview = 140): { text: string; isCompacted: boolean } | undefined {
+	let raw: string | undefined;
+	for (const line of fileHead.split("\n")) {
+		if (!line.trim()) continue;
+		let entry: any;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue; // corrupt/foreign line — skip
+		}
+		if (entry?.type !== "message") continue;
+		if (entry.message?.role !== "user") continue;
+		const content = entry.message.content;
+		if (typeof content === "string") {
+			raw = content;
+		} else if (Array.isArray(content)) {
+			raw = content
+				.map((part: any) =>
+					part?.type === "text" ? part.text
+					: part?.type === "image" ? "[📷 image]"
+					: "")
+				.filter((p: string) => typeof p === "string" && p.trim().length > 0)
+				.join(" ");
+		}
+		raw = raw?.replace(/\s+/g, " ").trim();
+		if (raw) break; // found the first non-empty user message
+	}
+	if (!raw) return undefined;
+
+	const isCompacted = COMPACT_MARKER.test(raw);
+	if (isCompacted) raw = raw.replace(COMPACT_MARKER, "").trim();
+	if (!raw) return undefined; // nothing but the marker — no usable preview
+	if (raw.length > maxPreview) raw = raw.slice(0, maxPreview - 1).trimEnd() + "…";
+	return { text: raw, isCompacted };
 }
 
 // ============================================================================
@@ -1055,9 +1165,19 @@ function subscribeToSession(
 						sendToDiscord(channel, `⚠️ Tool execution failed\n\`\`\`json\n${result}\n\`\`\``, { trackInSession: true, type: "tool-error" }).catch(() => {});
 					}
 				} else {
-					// Send success result for tools like 'remember'
-					if (!outputSettings.hideTools && typeof event.result === 'string' && event.result.startsWith('✅')) {
-						sendToDiscord(channel, event.result, { trackInSession: true, type: "tool-success" }).catch(() => {});
+					if (event.toolName === "thinkingmode") {
+						// The MODEL changed its own thinking level via the `thinkingmode`
+						// tool. Post a dedicated notification, gated by `/hide
+						// thinkingmode` (separate from general tool/thinking output).
+						if (!outputSettings.hideThinkingMode) {
+							const level = session?.thinkingLevel ?? "off";
+							sendToDiscord(channel, `🧠 The model changed the thinking level to **${level}** for this channel.`, { trackInSession: true, type: "tool-success" }).catch(() => {});
+						}
+					} else {
+						// Send success result for tools like 'remember'
+						if (!outputSettings.hideTools && typeof event.result === 'string' && event.result.startsWith('✅')) {
+							sendToDiscord(channel, event.result, { trackInSession: true, type: "tool-success" }).catch(() => {});
+						}
 					}
 				}
 				break;
@@ -1093,7 +1213,7 @@ function subscribeToSession(
 							log(`[${channelId}] Processing queued prompt: ${nextPrompt.slice(0, 50)}...`);
 							
 							// Send notification about queued prompt being executed
-							await sendToDiscord(channel, `🚀 **Executing queued prompt:**\n${nextPrompt.length > 200 ? nextPrompt.slice(0, 200) + '...' : nextPrompt}`, { trackInSession: false });
+							await sendToDiscord(channel, `📤 **Executing queued prompt:**\n${nextPrompt.length > 200 ? nextPrompt.slice(0, 200) + '...' : nextPrompt}`, { trackInSession: false });
 							
 							// Send the queued prompt to the agent
 							await session.sendUserMessage(nextPrompt);
@@ -1450,6 +1570,103 @@ async function main() {
 	}
 
 	/**
+	 * /sessions - List every session that can be returned to via /resume, each
+	 * with the first user message as a "what was this about" preview.
+	 *
+	 * Sources: closed-sessions.json (registered) plus orphaned timestamped
+	 * backup files on disk (discord-<channel>-<ts>.jsonl) that were never
+	 * registered — e.g. moved by older bot versions or manual cleanup — so no
+	 * resumable session is left out. Sorted most-recently-closed first; the
+	 * shown window shrinks from the end so the message always fits Discord's
+	 * 2000-char limit, with a pointer to /resume for the rest.
+	 */
+	async function handleSessions(
+		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel
+	): Promise<void> {
+		const channelId = channel.id;
+		const MAX_SESSIONS = 10;
+		const MAX_PREVIEW = 140;
+
+		const registered = sessionStore.getClosedSessions(channelId);
+
+		// Orphaned backup files never registered in closed-sessions.json
+		const seenFiles = new Set(registered.map(s => s.sessionFile));
+		const orphans: ClosedSessionInfo[] = [];
+		try {
+			for (const name of readdirSync(sessionDir)) {
+				const m = name.match(new RegExp(`^discord-${channelId}-(\\d+)\\.jsonl$`));
+				if (!m) continue;
+				const file = join(sessionDir, name);
+				if (seenFiles.has(file)) continue;
+				const head = readFileHead(file);
+				let sessionId = "";
+				for (const line of head.split("\n")) {
+					if (!line.trim()) continue;
+					try {
+						const entry = JSON.parse(line);
+						if (entry?.type === "session" && entry.id) { sessionId = entry.id; break; }
+					} catch { /* not JSON — keep scanning */ }
+				}
+				if (!sessionId) continue; // unreadable file — skip it
+				orphans.push({
+					channelId,
+					sessionId,
+					sessionFile: file,
+					sessionName: `discord-${channelId}`,
+					closedAt: Number(m[1]),
+				});
+			}
+		} catch {}
+
+		// Merge, dedupe by file (a fork keeps the same sessionId as the live
+		// session, so sessionId alone is ambiguous), newest closed first.
+		const byFile = new Map<string, ClosedSessionInfo>();
+		for (const s of [...registered, ...orphans]) byFile.set(s.sessionFile, s);
+		const sessions = [...byFile.values()].sort((a, b) => b.closedAt - a.closedAt);
+
+		if (sessions.length === 0) {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+				"📭 No closed sessions to return to in this channel. Use `/session` or `/fork` to save one.");
+			return;
+		}
+
+		// Build entry lines once (the reads are the expensive part), then trim
+		// the shown window from the end until the message fits under Discord's
+		// 2000-char limit — better than a file upload for a listing command.
+		const MAX_CHARS = 1900; // headroom under the 2000-char Discord limit
+		const entryLines: string[] = [];
+		for (const s of sessions.slice(0, MAX_SESSIONS)) {
+			let head = `• \`${s.sessionId}\``;
+			if (s.label) head += ` [${s.label.replace(/`/g, "'")}]`;
+			head += ` — closed ${new Date(s.closedAt).toLocaleString("en-GB", { timeZone: "Europe/Amsterdam" })}`;
+			entryLines.push(head);
+
+			const preview = extractFirstUserMessagePreview(readFileHead(s.sessionFile), MAX_PREVIEW);
+			if (preview) {
+				const tag = preview.isCompacted ? "📦 compacted: " : "💬 ";
+				entryLines.push(`   ${tag}${preview.text}`);
+			} else if (existsSync(s.sessionFile)) {
+				entryLines.push("   *(no readable first message)*");
+			} else {
+				entryLines.push("   ⚠️ *(session file missing — /resume will not be able to restore it)*");
+			}
+		}
+
+		let take = Math.min(MAX_SESSIONS, sessions.length);
+		let output = "";
+		while (take > 0) {
+			const hidden = sessions.length - take;
+			const footer = hidden > 0
+				? `\n…and ${hidden} more. Use \`/resume\` for the full list, or \`/resume <id or label>\` to jump in.`
+				: `\nUse \`/resume <id or label>\` to jump into one.`;
+			output = `📚 **Sessions you can return to (${sessions.length}):**\n${entryLines.slice(0, take * 2).join("\n")}\n${footer}`;
+			if (output.length <= MAX_CHARS) break;
+			take--;
+		}
+		await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, output);
+	}
+
+	/**
 	 * /merge [name] - Merge branch from labeled entry or previous message
 	 */
 	async function handleMerge(
@@ -1732,11 +1949,13 @@ async function main() {
 
 		// Check for non-interrupting commands (slash commands that should not abort the agent)
 		const isNonInterruptingCommand = message.content === "/session" || message.content.startsWith("/session ") ||
+			message.content === "/fork" || message.content.startsWith("/fork ") ||
 			message.content === "/new" ||
 			message.content === "/resume" || message.content.startsWith("/resume ") ||
 			message.content === "/queue" || message.content.startsWith("/queue ") ||
 			message.content === "/label" || message.content.startsWith("/label ") ||
 			message.content === "/labels" ||
+			message.content === "/sessions" ||
 			message.content === "/cwd" || message.content.startsWith("/cwd ") ||
 			message.content === "/channel" ||
 			message.content === "/help" ||
@@ -1745,7 +1964,8 @@ async function main() {
 			message.content === "/model" || message.content.startsWith("/model ") ||
 			message.content === "/settings" ||
 			message.content === "/hide" || message.content.startsWith("/hide ") ||
-			message.content === "/show" || message.content.startsWith("/show ");
+			message.content === "/show" || message.content.startsWith("/show ") ||
+			message.content === "/compact" || message.content.startsWith("/compact ");
 
 		// Only abort if the agent is active AND this is not a non-interrupting command
 		if (discordSession.isModelActive() && !isNonInterruptingCommand) {
@@ -1857,7 +2077,8 @@ async function main() {
 				`• \`/clear\` - Reset session and start fresh\n` +
 				`• \`/reload\` - Reload extensions, skills, and themes\n` +
 				`• \`/exit\` - Shut down the bot\n` +
-				`• \`/stop\` - Stop current agent operation\n\n` +
+				`• \`/stop\` - Stop current agent operation\n` +
+				`• \`/compact [instructions]\` - Start a fresh session with a summary of this one (original stays resumable via /resume)\n\n` +
 				`**Model & Settings**\n` +
 				`• \`/models\` - List available models\n` +
 				`• \`/model [provider/id]\` - Change current model\n` +
@@ -1866,8 +2087,10 @@ async function main() {
 				`• \`/hide thinking|tools\` - Hide thinking/tool call blocks in this channel\n` +
 				`• \`/show thinking|tools\` - Show thinking/tool call blocks in this channel\n\n` +
 				`**Branching & History**\n` +
+				`• \`/fork [label]\` - Create a NEW session (new id) with the full history copied in; original stays resumable via /resume\n` +
 				`• \`/label [name]\` - Label current session for /resume [label]\n` +
 				`• \`/labels\` - List all closed/labeled sessions\n` +
+				`• \`/sessions\` - List resumable sessions with a preview of each\n` +
 				`• \`/merge [name]\` - Merge branch from label or reply\n` +
 				`• \`/summary [name]\` - Summarize changes from a branch\n\n` +
 				`**Bash Integration**\n` +
@@ -1969,6 +2192,9 @@ async function main() {
 				} else {
 					try {
 						const expandedPath = await sessionStore.changeCwd(channelId, newCwd);
+						// changeCwd recreates the session — rebind scheduled jobs to the
+						// recreated session's UUID (it can drift if the file is gone).
+						rebindChannelJobsToLiveSession(channelId);
 						await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `✅ Changed working directory to:\n\`${expandedPath}\``);
 
 						// changeCwd recreates the session with the new cwd — clear the
@@ -2023,34 +2249,18 @@ async function main() {
 
 				await sessionStore.closeAndNewSession(channelId, label || undefined);
 
-				// Create the new session. Its scheduler reads schedule-prompts.json
-				// which still has the old session UUID. The job won't load because
-				// the UUID doesn't match — that's intentional. We'll update the UUID
-				// after creation and restart the session so the scheduler picks it up.
+				// Create the new session, then rebind scheduled jobs to its UUID.
+				// The old dispose/recreate "restart dance" was unreliable: a brand-
+				// new session doesn't flush its file until the first message, so
+				// every getOrCreate minted a NEW random UUID and the job ended up
+				// bound to a ghost session — silently skipped by both the extension
+				// and the keeper. We bind once to whatever UUID is actually live;
+				// the session keeper re-checks and self-heals every 60s anyway and
+				// catches up any missed runs.
 				// CRITICAL: We DO NOT delete job.session first — doing so would make
 				// the job fire in ALL channels (isLoadedFor returns true for undefined).
-				const newDiscordSession = await sessionStore.getOrCreate(channelId);
-				const newSessionId = newDiscordSession.session.getSessionStats().sessionId;
-
-				// Update the job session field to the new UUID
-				setChannelJobsSessionSync(channelId, newSessionId);
-
-				// The scheduler started before we updated the UUID, so restart the
-				// session so the new scheduler loads the job with the correct UUID.
-				sessionStore.dispose(channelId);
-				const restartedSession = await sessionStore.getOrCreate(channelId);
-				const finalSessionId = restartedSession.session.getSessionStats().sessionId;
-
-				// Ensure the session field is correct after restart
-				// (UUID should be stable since we read the same session file)
-				if (finalSessionId !== newSessionId) {
-					// UUID changed during re-creation — rebind again, then restart
-					// the session so its scheduler reads the file with the new UUID
-					// (it started before the rebind and never re-reads the file).
-					setChannelJobsSessionSync(channelId, finalSessionId);
-					sessionStore.dispose(channelId);
-					await sessionStore.getOrCreate(channelId);
-				}
+				await sessionStore.getOrCreate(channelId);
+				rebindChannelJobsToLiveSession(channelId);
 
 				// If a label was provided, label the new active session too
 				if (label) {
@@ -2100,6 +2310,83 @@ async function main() {
 			return;
 		}
 
+		// Handle /fork command
+		// /fork - Fork the pi-native way: create a NEW session (fresh UUID) via
+		//         SessionManager.createBranchedSession() with the full history
+		//         (root → current position, incl. tool calls and labels)
+		//         replayed into it, and continue working there. The ORIGINAL
+		//         pre-fork session becomes a resumable snapshot.
+		// /fork [label] - Same, with a label for the snapshot
+		if (message.content === "/fork" || message.content.startsWith("/fork ")) {
+			const label = message.content.slice("/fork".length).trim();
+
+			try {
+				// Capture old session stats BEFORE forking (the manager is
+				// transformed to the new session inside forkSession)
+				const oldStats = session.getSessionStats();
+				const oldStatsResult = generateTokenStatsMessage(channelId, session, previousTokens);
+				const oldSessionId = oldStats.sessionId;
+
+				await sessionStore.forkSession(channelId, label || undefined);
+
+				const newSessionId = session.getSessionStats().sessionId;
+
+				// The same AgentSession now represents the forked session (new
+				// UUID) — rebind scheduled jobs to the new UUID.
+				rebindChannelJobsToLiveSession(channelId);
+
+				// The forked session replays history with FRESH entry ids, so the
+				// old Discord-side branch metadata (labels, reply tree,
+				// mainBranchTip) no longer resolves — clear it like /session does.
+				// Replies to pre-fork bot messages can't branch across the fork.
+				const meta = loadBranchMetadata(sessionDir, channelId);
+				meta.discordMsgToPiEntryId.clear();
+				meta.discordMsgParent.clear();
+				meta.mainBranchTip = null;
+				meta.labelCounter = 0;
+				meta.labels.clear();
+				saveBranchMetadata(sessionDir, channelId, meta);
+
+				// Message-index tracking is invalidated by the replayed history —
+				// rebuild it fresh on the next messages. The session subscription
+				// is intentionally KEPT: the same AgentSession keeps streaming.
+				sessionMessageIndex.delete(channelId);
+				discordMessageToSession.delete(channelId);
+
+				// Build message: stats first, then resume hint, then fork confirmation
+				const resumeArg = label || oldSessionId;
+				const resumeHint = `Use \`/resume ${resumeArg}\` to return to the pre-fork session.`;
+
+				let msg = '';
+				if (oldStatsResult) {
+					msg += oldStatsResult.message + '\n\n';
+				} else {
+					// Fallback basic stats when context usage data is unavailable
+					msg += `📊 **Token Utilization**\n`;
+					msg += `**In:** ${oldStats.tokens.input.toLocaleString()} tok\n`;
+					msg += `**Out:** ${oldStats.tokens.output.toLocaleString()} tok\n`;
+					msg += `**Messages:** ${oldStats.totalMessages ?? '?'}\n`;
+					msg += `\n`;
+				}
+				msg += `${resumeHint}\n\n`;
+				msg += `🌿 Forked — new session \`${newSessionId}\` created with the full history copied in.`;
+
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, msg);
+			} catch (error) {
+				console.error(`[${channelId}] /fork error:`, error);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`❌ Error: ${error}`
+				);
+			}
+			return;
+		}
+
+		// Handle /sessions command - list all resumable sessions with previews
+		if (message.content === "/sessions") {
+			await handleSessions(channel);
+			return;
+		}
+
 		// Handle /resume command - resume a previously closed session
 		if (message.content === "/resume" || message.content.startsWith("/resume ")) {
 			const arg = message.content.slice("/resume".length).trim();
@@ -2134,32 +2421,13 @@ async function main() {
 					return;
 				}
 
-				// Load the restored session. Its scheduler reads schedule-prompts.json
-				// which still has the old session UUID. The job won't load because
-				// the UUID doesn't match — that's intentional. We'll update the UUID
-				// after creation and restart the session so the scheduler picks it up.
+				// Load the restored session and rebind scheduled jobs to its UUID.
+				// (The restored file exists on disk, so its UUID is stable here;
+				// the session keeper also self-heals and catches up missed runs.)
 				// CRITICAL: We do NOT delete job.session first — doing so would make
 				// the job fire in ALL channels (isLoadedFor returns true for undefined).
-				const restoredSession = await sessionStore.getOrCreate(channelId);
-				const restoredSessionId = restoredSession.session.getSessionStats().sessionId;
-
-				// Update the job session field to the restored session UUID
-				setChannelJobsSessionSync(channelId, restoredSessionId);
-
-				// The scheduler started before we updated the UUID, so restart the
-				// session so the new scheduler loads the job with the correct UUID.
-				sessionStore.dispose(channelId);
-				const restartedSession = await sessionStore.getOrCreate(channelId);
-				const finalSessionId = restartedSession.session.getSessionStats().sessionId;
-
-				// Ensure the session field is correct after restart
-				if (finalSessionId !== restoredSessionId) {
-					setChannelJobsSessionSync(channelId, finalSessionId);
-					// Restart once more so the scheduler reads the file with the
-					// new UUID (it started before the rebind and never re-reads).
-					sessionStore.dispose(channelId);
-					await sessionStore.getOrCreate(channelId);
-				}
+				await sessionStore.getOrCreate(channelId);
+				rebindChannelJobsToLiveSession(channelId);
 
 				// Clear tracking state for the resumed session
 				subscribedSessions.delete(channelId);
@@ -2192,6 +2460,9 @@ async function main() {
 		if (message.content === "/clear") {
 			log(`[${channelId}] Starting new session`);
 			sessionStore.reset(channelId);
+			// reset() mints a fresh session UUID in place — rebind scheduled jobs to
+			// it or every job stays orphaned (silently skipped) until restart.
+			rebindChannelJobsToLiveSession(channelId);
 			metadata.discordMsgToPiEntryId.clear()
 			metadata.discordMsgParent.clear()
 			metadata.mainBranchTip = null;
@@ -2213,6 +2484,9 @@ async function main() {
 				const discordSession = sessionStore.get(channelId);
 				if (discordSession) {
 					discordSession.applyRetryOverrides();
+					// /reload rebuilds the base system prompt, but the
+					// before_agent_start memory hook is part of the reloaded
+					// extension set — no re-application needed.
 				}
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "✅ Extensions, skills, and themes reloaded.");
 			} catch (error) {
@@ -2223,7 +2497,7 @@ async function main() {
 		}
 
 		if (message.content === "/models") {
-			const available = (await session.modelRegistry.getAvailable()).map(({provider,id}) =>`${provider}/${id}`);
+			const available = (await session.modelRuntime.getAvailable()).map(({provider,id}) =>`${provider}/${id}`);
 			const availableJson = escapeForCodeBlock(JSON.stringify(available, null, 2));
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Models:\n\`\`\`json\n${availableJson}\n\`\`\``);
 			return;
@@ -2246,6 +2520,7 @@ async function main() {
 			const targets: Record<string, keyof ChannelOutputSettings> = {
 				thinking: "hideThinking",
 				tools: "hideTools",
+				thinkingmode: "hideThinkingMode",
 			};
 
 			// No target — show current state
@@ -2253,8 +2528,9 @@ async function main() {
 				const state =
 					`👁 **Output visibility in this channel**\n` +
 					`• 💭 Thinking: ${settings.hideThinking ? "🔴 hidden" : "🟢 shown"}\n` +
-					`• 🔧 Tools: ${settings.hideTools ? "🔴 hidden" : "🟢 shown"}\n\n` +
-					`Use \`/hide thinking|tools\` or \`/show thinking|tools\` to change.`;
+					`• 🔧 Tools: ${settings.hideTools ? "🔴 hidden" : "🟢 shown"}\n` +
+					`• 🧠 Thinking-mode notifications: ${settings.hideThinkingMode ? "🔴 hidden" : "🟢 shown"}\n\n` +
+					`Use \`/hide thinking|tools|thinkingmode\` or \`/show thinking|tools|thinkingmode\` to change.`;
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, state);
 				return;
 			}
@@ -2262,13 +2538,16 @@ async function main() {
 			const key = targets[target];
 			if (!key) {
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
-					`❌ Unknown target \`${target}\`. Use \`thinking\` or \`tools\`.`);
+					`❌ Unknown target \`${target}\`. Use \`thinking\`, \`tools\`, or \`thinkingmode\`.`);
 				return;
 			}
 
 			settings[key] = isHide;
 			saveChannelOutputSettings();
-			const label = target === "thinking" ? "💭 thinking blocks" : "🔧 tool call blocks";
+			const label =
+				target === "thinking" ? "💭 thinking blocks"
+				: target === "thinkingmode" ? "🧠 thinking-mode notifications"
+				: "🔧 tool call blocks";
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
 				`✅ ${isHide ? "Hidden" : "Showing"} ${label} in this channel.`);
 			return;
@@ -2279,6 +2558,9 @@ async function main() {
 			try {
 				console.log('setting thinking ' + thinking)
 				session.setThinkingLevel(thinking)
+				// Keep the manual /thinking command and the model-controlled
+				// `thinkingmode` tool in sync by persisting the choice per-channel.
+				saveChannelThinkingMode(sessionDir, channelId, session.thinkingLevel)
 				const available = session.getAvailableThinkingLevels()
 				await sendToDiscord(channel as TextChannel, `🧠 Thinking level: ${session.thinkingLevel}. Available levels: ${available.join(', ')}`)
 			} catch (error) {
@@ -2296,9 +2578,41 @@ async function main() {
 			return;
 		}
 
+		// /thinkingmode on|off — enable/disable the model's ability to change its
+		// own thinking level via the `thinkingmode` tool. The enabled state is
+		// persisted per channel and reflected in the tool's description + output.
+		if (message.content === "/thinkingmode" || message.content.startsWith("/thinkingmode ")) {
+			const arg = message.content.replace("/thinkingmode", "").trim().toLowerCase();
+			const enabled = isThinkingModeEnabled(sessionDir, channelId);
+			const current = session.thinkingLevel || loadChannelThinkingMode(sessionDir, channelId) || DEFAULT_THINKING_MODE;
+
+			if (arg === "") {
+				// No argument — report current state.
+				await sendToDiscord(channel as TextChannel,
+					enabled
+						? `🧠 The model **may** change its own thinking level (thinkingmode tool enabled). Current level: ${current}. Use \`/thinkingmode off\` to disable.`
+						: `🧠 The model may **NOT** change its own thinking level (thinkingmode tool disabled). Current level: ${current}. Use \`/thinkingmode on\` to enable.`);
+				return;
+			}
+
+			if (arg === "on" || arg === "off") {
+				const newState = arg === "on";
+				setThinkingModeEnabled(sessionDir, channelId, newState);
+				await sendToDiscord(channel as TextChannel,
+					newState
+						? `✅ The model may **now** change its own thinking level (thinkingmode tool enabled). Current level: ${current}.`
+						: `🛑 The model may **not** change its own thinking level (thinkingmode tool disabled). Current level: ${current}. The tool's description now tells the model it is disabled.`);
+				return;
+			}
+
+			await sendToDiscord(channel as TextChannel,
+				`❌ Unknown argument \`${arg}\`. Use \`/thinkingmode on\` to enable or \`/thinkingmode off\` to disable the model's ability to change its thinking level.`);
+			return;
+		}
+
 		if (message.content.startsWith("/models ")) {
 			const search = message.content.replace("/models ", "").trim();
-			const available = await session.modelRegistry.getAvailable();
+			const available = await session.modelRuntime.getAvailable();
 			const { filterModels } = await import("./model-utils.js");
 			const found = filterModels(available, search).map(({provider,id}) =>`${provider}/${id}`);
 			const foundJson = escapeForCodeBlock(JSON.stringify(found, null, 2));
@@ -2315,7 +2629,7 @@ async function main() {
 		if (message.content.startsWith("/model ")) {
 			const search = message.content.replace("/model ", "").trim();
 			try {
-				const available = await session.modelRegistry.getAvailable();
+				const available = await session.modelRuntime.getAvailable();
 				const { findModel } = await import("./model-utils.js");
 				const m = findModel(available, search);
 
@@ -2389,6 +2703,138 @@ async function main() {
 		if (message.content.startsWith("/summary ")) {
 			const labelName = message.content.slice("/summary ".length).trim();
 			await handleSummary(channel, message, labelName);
+			return;
+		}
+
+		// Handle /compact command
+		// /compact - Start a FRESH session seeded with a summary of the current
+		// one. The original session is left unchanged on disk and stays
+		// resumable via /resume <session id>.
+		// /compact [instructions] - Add custom focus for the summary
+		if (message.content === "/compact" || message.content.startsWith("/compact ")) {
+			const instructions = message.content.slice("/compact".length).trim();
+			if (session.isCompacting) {
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "📦 Already compacting, please wait...");
+				return;
+			}
+			try {
+				// Show typing during the (potentially slow) summarization LLM call
+				typingManager.show(channelId, createTypingChannel(channelId));
+
+				// 1) Stop anything still running (the agent may be mid-turn since
+				//    /compact is a non-interrupting command).
+				await discordSession.abortModelActivities();
+
+				// 2) Generate the summary WITHOUT mutating the current session:
+				//    the original must stay byte-for-byte intact so /resume can
+				//    restore it. prepareBranchEntries skips tool results, so the
+				//    summarization input is much smaller than the real context.
+				const entries = session.sessionManager.getBranch();
+				const { messages } = prepareBranchEntries(entries);
+				const settings = session.settingsManager.getCompactionSettings();
+				const auth = await session.modelRuntime.getApiKeyAndHeaders(session.model);
+				if (!auth.ok) throw new Error(auth.error);
+				if (!auth.apiKey) throw new Error(`No API key found for provider ${session.model.provider}`);
+				const summary = await generateSummary(
+					messages,
+					session.model,
+					settings.reserveTokens,
+					auth.apiKey,
+					auth.headers,
+					undefined, // signal
+					instructions || undefined,
+					undefined, // previousSummary
+					session.thinkingLevel
+				);
+
+				// 3) Capture old session stats, then close it — it's preserved on
+				//    disk (timestamped backup) and listed for /resume. `remember`
+				//    memory is channel-scoped (channel-memory-<channelId>.json),
+				//    so it survives the close/recreate automatically — nothing to
+				//    carry over here.
+				const oldStats = session.getSessionStats();
+				const oldSessionId = oldStats.sessionId;
+				await sessionStore.closeAndNewSession(channelId);
+
+				// 4) Create the new session and rebind scheduled jobs to its UUID.
+				//    (Same reasoning as /session: the old dispose/recreate dance
+				//    minted fresh random UUIDs because unflushed sessions don't
+				//    write their file; the keeper self-heals + catches up anyway.)
+				await sessionStore.getOrCreate(channelId);
+				rebindChannelJobsToLiveSession(channelId);
+
+				// 5) Seed the new session with ONLY the compacted context — silent
+				//    injection (no agent turn), so the summary is the opening context.
+				const compactedSession = sessionStore.get(channelId)!.session;
+				// (Channel-scoped remember memory is picked up automatically by the
+				// before_agent_start hook on the first turn — no UUID carry needed.)
+				compactedSession.sessionManager.appendMessage({
+					role: "user",
+					content: `[Previous conversation summary — the full history was closed and can be restored with /resume ${oldSessionId}]\n\n${summary}`,
+					timestamp: Date.now(),
+				});
+				// Force-persist the seeded session to disk. The pi SDK's
+				// SessionManager._persist() defers ALL file writes until an
+				// assistant message exists in the session (see its hasAssistant
+				// guard). Without this, a fresh compacted session containing only
+				// the seeded summary (a user message) is never written to disk —
+				// if the bot restarts before the first real assistant response,
+				// the whole compacted context is silently lost and the channel
+				// comes back as an empty session (observed 2026-08-14 in the
+				// forth channel: /compact 22:48 → bot restart 09:32 → fresh
+				// empty session 09:58). Appending this minimal assistant marker
+				// triggers the flush so the summary survives restarts.
+				compactedSession.sessionManager.appendMessage({
+					role: "assistant",
+					// Content must be an ARRAY (not a string): getSessionStats() and
+					// other SDK paths call content.filter() on assistant messages.
+					content: [{ type: "text", text: `[Session compacted, previous conversation summarized above. The full history is available in session ${oldSessionId}]` }],
+					timestamp: Date.now(),
+					// The marker is a real assistant message in the session, so the
+					// SDK's next-prompt compaction check (_checkCompaction) reads its
+					// usage/stopReason, and getSessionStats() reads usage.cost.total.
+					// Without these, the next user message crashes ("TypeError:
+					// undefined is not an object (evaluating 'usage.totalTokens')") or
+					// /resume crashes ("assistantMsg.content.filter is not a
+					// function"). Zeroed usage keeps shouldCompact() at 0 → no
+					// false threshold compaction.
+					stopReason: "stop",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				});
+				const ctx = compactedSession.sessionManager.buildSessionContext();
+				compactedSession.agent.state.messages = ctx.messages;
+
+				// 6) Reset Discord-side tracking for the new session (like /session)
+				subscribedSessions.delete(channelId);
+				sessionSubscriptions.delete(channelId);
+				sessionMessageIndex.delete(channelId);
+				discordMessageToSession.delete(channelId);
+				const meta = loadBranchMetadata(sessionDir, channelId);
+				meta.discordMsgToPiEntryId.clear();
+				meta.discordMsgParent.clear();
+				meta.mainBranchTip = null;
+				meta.labelCounter = 0;
+				meta.labels.clear();
+				saveBranchMetadata(sessionDir, channelId, meta);
+
+				// 7) Confirm — no need to dump the summary into Discord; the new
+				//    session has it in context and /resume restores the full history.
+				const totalTokens = oldStats.tokens.input + oldStats.tokens.output;
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`✅ **Session compacted** — started a fresh session seeded with a summary of the previous one (~${totalTokens.toLocaleString()} tokens of history → summary).\n\nUse \`/resume ${oldSessionId}\` to go back to the original session.`);
+			} catch (error) {
+				console.error(`[${channelId}] /compact error:`, error);
+				typingManager.hide(channelId);
+				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
+					`❌ Compaction failed:\n${escapeForCodeBlock(String(error))}`);
+			}
 			return;
 		}
 		
