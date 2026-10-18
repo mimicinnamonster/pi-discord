@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { generateTokenStatsMessage } from "../src/token-stats";
+import { generateTokenStatsMessage } from "../src/token-stats.ts";
 
 // Minimal mock for AgentSession with getSessionStats
 function mockSession(stats: {

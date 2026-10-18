@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createSessionStore } from "../src/session-store";
+import { createSessionStore } from "../src/session-store.ts";
 import {
 	createThinkingModeTool,
 	applyChannelThinkingMode,
@@ -7,7 +7,7 @@ import {
 	loadChannelThinkingMode,
 	isThinkingModeEnabled,
 	setThinkingModeEnabled,
-} from "../src/thinking-mode";
+} from "../src/thinking-mode.ts";
 import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -16,6 +16,12 @@ import { join } from "path";
 // mutable thinkingLevel so we can exercise setThinkingLevel + persistence.
 let mockSessionState: {
 	thinkingLevel: string;
+	// Set by tests that need a model exposing thinking levels; the mock session
+	// below spreads this object verbatim into the fake session.
+	model?: {
+		reasoning?: boolean;
+		thinkingLevelMap?: Record<string, string | null>;
+	};
 	setThinkingLevel: (level: string) => void;
 	getAvailableThinkingLevels: () => string[];
 };
@@ -36,6 +42,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
 				session: {
 					bindExtensions: vi.fn().mockResolvedValue(undefined),
 					setSessionName: vi.fn(),
+					setActiveToolsByName: vi.fn(),
+					getAllTools: vi.fn(() => [{ name: "subagent" }, { name: "schedule_prompt" }]),
 					dispose: vi.fn(),
 					getSessionStats: () => ({ sessionId: "test-session-uuid-1" }),
 					...mockSessionState,

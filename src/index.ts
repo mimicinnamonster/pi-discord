@@ -4,10 +4,11 @@
  */
 
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
-import { createSessionStore, type ClosedSessionInfo } from "./session-store";
-import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.js";
-import { TypingManager, type TypingChannel } from "./typing-manager";
-import { generateTokenStatsMessage } from "./token-stats";
+import { createSessionStore, type ClosedSessionInfo } from "./session-store.ts";
+import { shouldInterruptForIncomingMessage } from "./interrupt-decision.ts";
+import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.ts";
+import { TypingManager, type TypingChannel } from "./typing-manager.ts";
+import { generateTokenStatsMessage } from "./token-stats.ts";
 import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { generateSummary, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
 import { homedir } from "os";
@@ -20,7 +21,7 @@ import {
 	findCommonAncestor,
 	getMessagesBetween,
 	formatMergedMessages,
-} from "./branch-manager";
+} from "./branch-manager.ts";
 
 // ============================================================================
 // Configuration
@@ -419,7 +420,7 @@ function restoreScheduledSessions(): void {
  */
 function startSessionKeeper(deps: {
 	subscribedSessions: Set<string>;
-	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>;
+	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void; isAwaitingAgentEnd: () => boolean }>;
 }): void {
 	/**
 	 * Ensure the channel's session is subscribed so agent output (from the
@@ -1034,7 +1035,7 @@ function subscribeToSession(
 	typingManager: TypingManager,
 	sessionDir: string,
 	getOutputSettings: (channelId: string) => ChannelOutputSettings
-): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
+): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void; isAwaitingAgentEnd: () => boolean } {
 	const typingChannel = createTypingChannel(channelId);
 	const responseBuffer: string[] = [];
 	const thinkingBuffer: string[] = [];
@@ -1045,18 +1046,33 @@ function subscribeToSession(
 	let pendingIsReply = false;
 	// Captured at agent_end (synchronous, all messages appended) for use in .then()
 	let capturedAssistantEntryId: string | null = null;
+	// True from the final turn_end (assistant message with a non-toolUse stop
+	// reason) until the next agent activity. pi-subagents drains background
+	// subagents inside its agent_end extension handler, which the SDK runs BEFORE
+	// emitting the public agent_end — so during that drain the bot has seen
+	// turn_end but not agent_end, and isStreaming stays true the whole time.
+	// The interrupt decision in handleMessage uses this to tell "main turn still
+	// executing" apart from "main turn over, only background work draining".
+	let awaitingAgentEnd = false;
 
 
 	session.subscribe(async (event: AgentSessionEvent) => {
 		switch (event.type) {
 			case "agent_start":
 				log(`[${channelId}] Agent starting...`);
+				awaitingAgentEnd = false;
 				responseBuffer.length = 0;
 				// LLM is processing - show typing indicator
 				typingManager.show(channelId, typingChannel);
 				break;
 
+			case "turn_start":
+				// A new turn of the same run is starting — work is genuinely executing again.
+				awaitingAgentEnd = false;
+				break;
+
 			case "message_start":
+				awaitingAgentEnd = false;
 				if (event.message.role === "user") {
 					// Capture pending discord info - entry id captured on message_end when appended
 					lastDiscordMessageId = pendingDiscordMsgId;
@@ -1136,6 +1152,7 @@ function subscribeToSession(
 
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
+				awaitingAgentEnd = false;
 				// Skip sending (and index tracking) when tools are hidden
 				if (!getOutputSettings(channelId).hideTools) {
 					const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
@@ -1182,8 +1199,16 @@ function subscribeToSession(
 				}
 				break;
 
+			case "turn_end":
+				// Final turn of the run: the assistant answered without tool calls and
+				// agent_end (and pi-subagents' drain inside it) follows next. A toolUse
+				// stopReason means the loop continues with another turn instead.
+				awaitingAgentEnd = event.message.role === "assistant" && event.message.stopReason !== "toolUse";
+				break;
+
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
+				awaitingAgentEnd = false;
 				// Agent turn fully finished — stop typing until the next user message
 				// or queued prompt starts a new turn (agent_start re-shows it).
 				typingManager.hide(channelId);
@@ -1225,6 +1250,7 @@ function subscribeToSession(
 				break;
 
 			case "compaction_start":
+				awaitingAgentEnd = false;
 				typingManager.show(channelId, typingChannel);
 				log(`[${channelId}] Compacting context...`);
 				sendToDiscord(channel, "📦 Compacting context...").catch(() => {});
@@ -1242,6 +1268,7 @@ function subscribeToSession(
 				break;
 
 			case "auto_retry_start":
+				awaitingAgentEnd = false;
 				typingManager.show(channelId, typingChannel);
 				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts}). Error message: ${event.errorMessage}`);
 				sendToDiscord(channel, `⚠️ Retrying (attempt ${event.attempt}/${event.maxAttempts})...\nError:\n\`\`\`\n${escapeForCodeBlock(event.errorMessage)}\n\`\`\``).catch(() => {});
@@ -1268,6 +1295,7 @@ function subscribeToSession(
 			pendingDiscordMsgId = id;
 			pendingIsReply = isReply;
 		},
+		isAwaitingAgentEnd: () => awaitingAgentEnd,
 	};
 }
 
@@ -1899,7 +1927,7 @@ async function main() {
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
-	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>();
+	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void; isAwaitingAgentEnd: () => boolean }>();
 	let subscribeCount = 0;
 	let sendCount = 0;
 
@@ -1967,12 +1995,30 @@ async function main() {
 			message.content === "/show" || message.content.startsWith("/show ") ||
 			message.content === "/compact" || message.content.startsWith("/compact ");
 
-		// Only abort if the agent is active AND this is not a non-interrupting command
-		if (discordSession.isModelActive() && !isNonInterruptingCommand) {
+		// Only abort if the agent is active AND this is not a non-interrupting command.
+		// Exception: when the main turn has already ended and the session merely looks
+		// active because pi-subagents is draining background subagents inside its
+		// agent_end handler (runs before the public agent_end event), there is nothing
+		// to interrupt — abort() would not stop the background runs (separate
+		// processes) and the "interrupted" message would be wrong. Queue instead.
+		const shouldInterrupt = shouldInterruptForIncomingMessage({
+			modelActive: discordSession.isModelActive(),
+			nonInterruptingCommand: isNonInterruptingCommand,
+			awaitingAgentEnd: sessionSubscriptions.get(channelId)?.isAwaitingAgentEnd() ?? false,
+			retrying: session.isRetrying,
+			compacting: session.isCompacting,
+			bashRunning: session.isBashRunning,
+			pendingBackgroundWork: discordSession.hasPendingBackgroundWork(),
+		});
+		let queuedBehindBackgroundDrain = false;
+		if (shouldInterrupt) {
 			log(`[${channelId}] User interrupted - aborting current operation`);
 			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
 			await discordSession.abortModelActivities()
 			// dont hide typing manager, fall through to sending the interrupted message to the agent
+		} else if (discordSession.isModelActive() && !isNonInterruptingCommand) {
+			queuedBehindBackgroundDrain = true;
+			log(`[${channelId}] Main turn settled, background subagents still draining - queueing message instead of interrupting`);
 		}
 
 		// Store the Discord message ID so it can be tracked when the user message is processed
@@ -2039,7 +2085,7 @@ async function main() {
 						// multimodal payloads make some providers (e.g. opencode-go) drop
 						// the stream before it finishes ("Stream ended without
 						// finish_reason"). Falls back to the original if resizing fails.
-						const { downscaleImage } = await import("./image-utils.js");
+						const { downscaleImage } = await import("./image-utils.ts");
 						const downscaled = await downscaleImage(base64Data, mimeType);
 						const imageData = downscaled.data;
 						const imageMime = downscaled.mimeType;
@@ -2613,7 +2659,7 @@ async function main() {
 		if (message.content.startsWith("/models ")) {
 			const search = message.content.replace("/models ", "").trim();
 			const available = await session.modelRuntime.getAvailable();
-			const { filterModels } = await import("./model-utils.js");
+			const { filterModels } = await import("./model-utils.ts");
 			const found = filterModels(available, search).map(({provider,id}) =>`${provider}/${id}`);
 			const foundJson = escapeForCodeBlock(JSON.stringify(found, null, 2));
 			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `🤖 Models:\n\`\`\`json\n${foundJson}\n\`\`\``);
@@ -2630,7 +2676,7 @@ async function main() {
 			const search = message.content.replace("/model ", "").trim();
 			try {
 				const available = await session.modelRuntime.getAvailable();
-				const { findModel } = await import("./model-utils.js");
+				const { findModel } = await import("./model-utils.ts");
 				const m = findModel(available, search);
 
 				if (!m) {
@@ -2732,15 +2778,22 @@ async function main() {
 				const entries = session.sessionManager.getBranch();
 				const { messages } = prepareBranchEntries(entries);
 				const settings = session.settingsManager.getCompactionSettings();
-				const auth = await session.modelRuntime.getApiKeyAndHeaders(session.model);
-				if (!auth.ok) throw new Error(auth.error);
-				if (!auth.apiKey) throw new Error(`No API key found for provider ${session.model.provider}`);
+				const currentModel = session.model;
+				if (!currentModel) throw new Error("No model is selected for this session");
+				const authResult = await session.modelRuntime.getAuth(currentModel);
+				if (!authResult) throw new Error(`Failed to resolve auth for provider ${currentModel.provider}`);
+				const apiKey = authResult.auth.apiKey;
+				if (!apiKey) throw new Error(`No API key found for provider ${currentModel.provider}`);
+				const headers = authResult.auth.headers
+					? Object.fromEntries(Object.entries(authResult.auth.headers).filter((entry): entry is [string, string] => entry[1] !== null))
+					: undefined;
+				const requestModel = authResult.auth.baseUrl ? { ...currentModel, baseUrl: authResult.auth.baseUrl } : currentModel;
 				const summary = await generateSummary(
 					messages,
-					session.model,
+					requestModel,
 					settings.reserveTokens,
-					auth.apiKey,
-					auth.headers,
+					apiKey,
+					headers,
 					undefined, // signal
 					instructions || undefined,
 					undefined, // previousSummary
@@ -2786,6 +2839,11 @@ async function main() {
 				// triggers the flush so the summary survives restarts.
 				compactedSession.sessionManager.appendMessage({
 					role: "assistant",
+					// A real AssistantMessage also carries the model identity; SDK session
+					// readers (stats, resume, compaction checks) expect these fields.
+					api: currentModel.api,
+					provider: currentModel.provider,
+					model: currentModel.id,
 					// Content must be an ARRAY (not a string): getSessionStats() and
 					// other SDK paths call content.filter() on assistant messages.
 					content: [{ type: "text", text: `[Session compacted, previous conversation summarized above. The full history is available in session ${oldSessionId}]` }],
@@ -2909,11 +2967,23 @@ async function main() {
 			// that fell through to the agent, e.g. unknown commands or spaced-out
 			// commands, and re-asserts after the pre-processing above).
 			typingManager.show(channelId, createTypingChannel(channelId));
-			await session.sendUserMessage(finalContent);
+			// When the message was held back from interrupting a background-subagent
+			// drain, the session still reports streaming: a bare send would throw
+			// "Agent is already processing" — queue it as a follow-up instead, which
+			// runs as soon as the drain (and settle) completes. If the drain finished
+			// in the meantime, isStreaming is false and the message runs normally.
+			await session.sendUserMessage(finalContent, queuedBehindBackgroundDrain ? { deliverAs: "followUp" } : undefined);
 
 			// Track user Discord message → user Pi entry
-			// getLeafId() is the assistant entry; its parent is the user entry
-			const assistantLeafId = session.sessionManager.getLeafId();
+			// getLeafId() is the assistant entry; its parent is the user entry.
+			// Omitted when the message was only queued behind the drain: no entries
+			// were appended yet, so the leaf still points at the previous turn and
+			// the mapping would record a wrong entry. Leaving it unset makes later
+			// reply-branching to that message fall back to the main branch instead
+			// of forking from the wrong place.
+			const assistantLeafId = queuedBehindBackgroundDrain && session.isStreaming
+				? undefined
+				: session.sessionManager.getLeafId();
 			if (assistantLeafId) {
 				const assistantEntry = session.sessionManager.getEntry(assistantLeafId);
 				const userEntryId = assistantEntry?.parentId ?? assistantLeafId;

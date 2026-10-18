@@ -4,10 +4,19 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { SessionStore } from "../src/session-store";
+import { SessionStore } from "../src/session-store.ts";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { tmpdir, homedir } from "os";
+
+/**
+ * Session-context messages are a union that includes BashExecutionMessage,
+ * which has no `content`. These assertions only ever read text-bearing
+ * messages, so narrow once here instead of casting at each call site.
+ */
+function messageText(message: unknown): string {
+	return (message as { content: Array<{ text: string }> }).content[0].text;
+}
 
 describe("SessionStore", () => {
 	const testDir = join(tmpdir(), `pi-discord-test-${Date.now()}`);
@@ -198,12 +207,15 @@ describe("SessionStore", () => {
 			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
 			const context = discordSession.session.sessionManager.buildSessionContext();
 			expect(context.messages.length).toBeGreaterThanOrEqual(2);
-			expect((context.messages[0].content as Array<{ text: string }>)[0].text).toBe("Remember this");
-			expect((context.messages[1].content as Array<{ text: string }>)[0].text).toBe("Noted");
+			expect(messageText(context.messages[0])).toBe("Remember this");
+			expect(messageText(context.messages[1])).toBe("Noted");
 		});
 	});
 
 	describe("Session Close Metadata", () => {
+		// Multiple real SDK session creations (getOrCreate + changeCwd's implicit
+		// recreation + closeAndNewSession + getOrCreate) routinely exceed the
+		// default 5s vitest timeout, so give this integration-style test its own.
 		it("should preserve cwd and model when closing a session", async () => {
 			const channelId = "close-meta-channel";
 			await store.getOrCreate(channelId);
@@ -220,7 +232,7 @@ describe("SessionStore", () => {
 			// The new session should pick up the preserved cwd
 			const discordSession = await store.getOrCreate(channelId);
 			expect(discordSession.session.sessionManager.getCwd()).toBe(join(homedir(), "Projects/rotz"));
-		});
+		}, 30000);
 	});
 
 	describe("Session Resume", () => {
@@ -287,8 +299,8 @@ describe("SessionStore", () => {
 			const restored = await store.getOrCreate(channelId);
 			const context = restored.session.sessionManager.buildSessionContext();
 			expect(context.messages.length).toBeGreaterThanOrEqual(2);
-			expect((context.messages[0].content as Array<{ text: string }>)[0].text).toBe("Hello there");
-			expect((context.messages[1].content as Array<{ text: string }>)[0].text).toBe("Hi!");
+			expect(messageText(context.messages[0])).toBe("Hello there");
+			expect(messageText(context.messages[1])).toBe("Hi!");
 		});
 
 		it("should remove the entry from closed sessions after resume", async () => {
@@ -380,8 +392,8 @@ describe("SessionStore", () => {
 			// Full history was copied into the new session
 			const context = forked.session.sessionManager.buildSessionContext();
 			expect(context.messages.length).toBeGreaterThanOrEqual(2);
-			expect((context.messages[0].content as Array<{ text: string }>)[0].text).toBe("Hello there");
-			expect((context.messages[1].content as Array<{ text: string }>)[0].text).toBe("Hi!");
+			expect(messageText(context.messages[0])).toBe("Hello there");
+			expect(messageText(context.messages[1])).toBe("Hi!");
 
 			// The live file at the default path carries the NEW UUID so
 			// restarts reopen the fork (not the pre-fork state)
@@ -534,7 +546,7 @@ describe("Concurrent Session Creation", () => {
 		// Track how many times createPiSession is called
 		let createCount = 0;
 		const originalCreate = store["createPiSession"].bind(store);
-		(store as any)["createPiSession"] = async function (...args: any[]) {
+		(store as any)["createPiSession"] = async function (...args: Parameters<typeof originalCreate>) {
 			createCount++;
 			return originalCreate(...args);
 		};

@@ -531,14 +531,14 @@ describe("Session command parsing", () => {
 	});
 
 	it("should not match /session with args", () => {
-		const content = "/session extra";
+		const content: string = "/session extra";
 		const isSession = content === "/session";
 
 		expect(isSession).toBe(false);
 	});
 
 	it("should not match partial commands", () => {
-		const content = "/sess";
+		const content: string = "/sess";
 		const isSession = content === "/session";
 
 		expect(isSession).toBe(false);
@@ -743,14 +743,14 @@ describe("New Session command parsing", () => {
 	});
 
 	it("should not match /clear with args", () => {
-		const content = "/clear extra";
+		const content: string = "/clear extra";
 		const isClear = content === "/clear";
 
 		expect(isClear).toBe(false);
 	});
 
 	it("should not match partial commands", () => {
-		const content = "/clearing";
+		const content: string = "/clearing";
 		const isClear = content === "/clear";
 
 		expect(isClear).toBe(false);
@@ -766,14 +766,14 @@ describe("Reload command parsing", () => {
 	});
 
 	it("should not match /reload with args", () => {
-		const content = "/reload extra";
+		const content: string = "/reload extra";
 		const isReload = content === "/reload";
 
 		expect(isReload).toBe(false);
 	});
 
 	it("should not match partial commands", () => {
-		const content = "/reloaded";
+		const content: string = "/reloaded";
 		const isReload = content === "/reload";
 
 		expect(isReload).toBe(false);

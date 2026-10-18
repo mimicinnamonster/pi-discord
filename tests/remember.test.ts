@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createSessionStore } from "../src/session-store";
+import { createSessionStore } from "../src/session-store.ts";
 import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -31,6 +31,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => {
 				session: {
 					bindExtensions: vi.fn().mockResolvedValue(undefined),
 					setSessionName: vi.fn(),
+					setActiveToolsByName: vi.fn(),
+					getAllTools: vi.fn(() => [{ name: "subagent" }, { name: "schedule_prompt" }]),
 					dispose: vi.fn(),
 					getSessionStats: () => ({ sessionId: "test-session-uuid-1" }),
 					...mockSessionState,

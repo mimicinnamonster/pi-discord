@@ -21,7 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import { loadBranchMetadata, saveBranchMetadata } from "../src/branch-manager";
+import { loadBranchMetadata, saveBranchMetadata } from "../src/branch-manager.ts";
 import { mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";

@@ -15,7 +15,7 @@ export interface ModelLike {
  * @param search - Search string, optionally in "provider/model" format
  * @returns First matching model or undefined
  */
-export function findModel<T extends ModelLike>(models: T[], search: string): T | undefined {
+export function findModel<T extends ModelLike>(models: readonly T[], search: string): T | undefined {
 	if (!search) return undefined;
 	const [providerPart, ...modelParts] = search.split("/");
 	const modelPart = modelParts.join("/");
@@ -62,7 +62,7 @@ export function findModel<T extends ModelLike>(models: T[], search: string): T |
  * @param search - Search string, optionally in "provider/model" format
  * @returns Filtered list of models
  */
-export function filterModels<T extends ModelLike>(models: T[], search: string): T[] {
+export function filterModels<T extends ModelLike>(models: readonly T[], search: string): T[] {
 	if (!search) return [];
 	const [providerPart, ...modelParts] = search.split("/");
 	const modelPart = modelParts.join("/");

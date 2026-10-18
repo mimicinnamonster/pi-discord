@@ -11,7 +11,7 @@ import {
 	upsertMemoryBlock,
 	patchCurrentSystemPrompt,
 	MEMORY_MARKER,
-} from "../src/session-memory";
+} from "../src/session-memory.ts";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";

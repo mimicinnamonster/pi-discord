@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { downscaleImage } from "../src/image-utils";
+import { downscaleImage } from "../src/image-utils.ts";
 
 // Mock the pi SDK's resizeImage (dynamically imported inside downscaleImage).
 // The path resolves to the same module file that src/image-utils.ts imports.
@@ -35,10 +35,14 @@ describe("downscaleImage", () => {
 		expect(result.data).toBe(resized);
 		expect(result.mimeType).toBe("image/jpeg");
 
-		// resizeImage must receive the image plus sane downscale limits
+		// resizeImage must receive decoded image bytes (SDK 0.87+ takes a
+		// Uint8Array, not a base64 string) plus sane downscale limits.
 		expect(resizeImageMock).toHaveBeenCalledTimes(1);
-		expect(resizeImageMock).toHaveBeenCalledWith(
-			{ type: "image", data: original, mimeType: "image/png" },
+		const [bytes, receivedMimeType, options] = resizeImageMock.mock.calls[0] as [Uint8Array, string, Record<string, unknown>];
+		expect(bytes).toBeInstanceOf(Uint8Array);
+		expect(Buffer.from(bytes).toString("base64")).toBe(original);
+		expect(receivedMimeType).toBe("image/png");
+		expect(options).toEqual(
 			expect.objectContaining({
 				maxWidth: expect.any(Number),
 				maxHeight: expect.any(Number),

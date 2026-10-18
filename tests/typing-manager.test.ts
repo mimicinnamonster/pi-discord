@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { TypingManager } from "../src/typing-manager";
+import { TypingManager } from "../src/typing-manager.ts";
 
 describe("TypingManager", () => {
 	let typingManager: TypingManager;

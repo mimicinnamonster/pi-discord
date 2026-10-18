@@ -10,7 +10,7 @@ import {
 	areOnSameBranch,
 	loadBranchMetadata,
 	saveBranchMetadata,
-} from "../src/branch-manager";
+} from "../src/branch-manager.ts";
 import { mkdtempSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -20,15 +20,17 @@ import type { SessionManager, SessionEntry, SessionMessageEntry } from "@earendi
 // Mocks
 // ============================================================================
 
-class MockSessionManager implements SessionManager {
+// `SessionManager` is a class, so it cannot be `implements`-ed without
+// inheriting its private members. The mock is cast at the assignment site below.
+class MockSessionManager {
 	private entries = new Map<string, SessionEntry>();
 
 	addEntry(entry: SessionEntry) {
 		this.entries.set(entry.id, entry);
 	}
 
-	getEntry(id: string): SessionEntry | null {
-		return this.entries.get(id) ?? null;
+	getEntry(id: string): SessionEntry | undefined {
+		return this.entries.get(id);
 	}
 
 	getBranch(entryId: string): SessionEntry[] {
@@ -68,10 +70,13 @@ function createMsg(id: string, parentId: string | null, role: string, content: s
 // ============================================================================
 
 describe("Branch Manager Unit Tests", () => {
-	let sm: MockSessionManager;
+	// The mock implements only the subset branch-manager reads. The intersection
+	// keeps `addEntry` available while letting tests pass it wherever a full
+	// `SessionManager` is expected.
+	let sm: SessionManager & MockSessionManager;
 
 	beforeEach(() => {
-		sm = new MockSessionManager();
+		sm = new MockSessionManager() as unknown as SessionManager & MockSessionManager;
 	});
 
 	describe("findCommonAncestor", () => {
@@ -154,7 +159,7 @@ describe("Branch Manager Unit Tests", () => {
 		});
 
 		it("getLastRootDeepestLeaf finds deepest leaf of the last root", () => {
-			const tree = [
+			const tree: any[] = [
 				{
 					entry: { id: "root1", parentId: null },
 					children: [{ entry: { id: "leaf1" }, children: [] }]

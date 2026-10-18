@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { findModel, filterModels } from "../src/model-utils";
+import { findModel, filterModels } from "../src/model-utils.ts";
 
 interface MockModel {
 	id: string;

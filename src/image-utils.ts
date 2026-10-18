@@ -26,8 +26,10 @@ const JPEG_QUALITY = 80;
 export async function downscaleImage(base64Data: string, mimeType: string): Promise<DownscaledImage> {
 	try {
 		const { resizeImage } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/utils/image-resize.js");
+		// resizeImage takes decoded bytes, not a base64 string, as of SDK 0.87.
 		const resized = await resizeImage(
-			{ type: "image", data: base64Data, mimeType },
+			Buffer.from(base64Data, "base64"),
+			mimeType,
 			{ maxWidth: MAX_DIMENSION, maxHeight: MAX_DIMENSION, maxBytes: MAX_BYTES, jpegQuality: JPEG_QUALITY }
 		);
 		if (resized && resized.data && resized.data.length < base64Data.length) {

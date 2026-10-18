@@ -10,15 +10,22 @@ import {
 	SettingsManager,
 	createCodingTools,
 	type AgentSession,
+	type ExtensionAPI,
+	type ExtensionFactory,
 	DefaultResourceLoader,
 	discoverAndLoadExtensions,
 } from "@earendil-works/pi-coding-agent";
-import mcpAdapter from "pi-mcp-adapter";
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, unlinkSync, readdirSync } from "fs";
-import { createSessionMemoryExtension, getChannelMemoryFilePath, getMemoryFilePath, loadMemory, patchCurrentSystemPrompt, saveChannelMemory } from "./session-memory.js";
-import { applyChannelThinkingMode, createThinkingModeTool } from "./thinking-mode.js";
+import { createSessionMemoryExtension, getChannelMemoryFilePath, getMemoryFilePath, loadMemory, patchCurrentSystemPrompt, saveChannelMemory } from "./session-memory.ts";
+import { applyChannelThinkingMode, createThinkingModeTool } from "./thinking-mode.ts";
+import {
+	SUBAGENT_ASYNC_STARTED_EVENT,
+	SUBAGENT_ASYNC_COMPLETE_EVENT,
+	createSubagentGate,
+	type SubagentGate,
+} from "./subagent-gate.ts";
 
 // ============================================================================
 // Types
@@ -45,6 +52,71 @@ export function withCurrentDate(prompt: string, now: Date = new Date()): string 
 	return `${prompt}\n\nCurrent date: ${localDate}`;
 }
 
+// ============================================================================
+// Parent Tool Allowlist
+// ============================================================================
+
+// Tools the Discord-facing PARENT session may use directly. `subagent` keeps
+// the delegation-only lockdown (the parent must never do work itself; child
+// agents resolve their own full tool plans). `schedule_prompt` is the one
+// direct exception: registered by the pi-schedule-prompt extension (loaded
+// from the ~/.pi/agent settings packages), it lets the model schedule prompts
+// for its channel without round-tripping through the subagent tool. The bot's
+// session keeper (src/index.ts) already watches the extension's
+// .pi/schedule-prompts.json storage, so directly-created jobs are rebound to
+// live sessions and caught up after restarts like any other scheduled prompt.
+export const PARENT_TOOL_ALLOWLIST = ["subagent", "schedule_prompt"];
+
+/**
+ * Filter the desired parent allowlist down to tools actually present in the
+ * session's tool registry. setActiveToolsByName silently drops unknown names
+ * (e.g. when the pi-schedule-prompt extension is not installed), so filtering
+ * here keeps the active set — and its log line — truthful.
+ */
+export function buildParentToolAllowlist(registeredToolNames: Iterable<string>): string[] {
+	const registered = new Set(registeredToolNames);
+	return PARENT_TOOL_ALLOWLIST.filter((name) => registered.has(name));
+}
+
+// Per-channel "max 1 subagent at a time" gate. Each channel session gets its
+// own SubagentGate instance (created here, keyed only by this session), so
+// channels are independent: one channel's in-flight subagent never blocks
+// another channel, while a single channel can never run two subagents at
+// once (sync or async). Sync subagent invocations are admitted/blocked at
+// tool_call time; tool_result releases the slot. Async subagent lifecycle
+// events (pi-subagents emits them on this session's own pi.events bus) are
+// tracked so async runs hold the slot for their full lifetime.
+//
+// The live gate is also registered per channel so DiscordSession (and through
+// it the interrupt decision in src/index.ts) can ask whether background
+// subagent work is still pending while the session reports isStreaming during
+// the pi-subagents agent_end drain.
+const subagentGates = new Map<string, SubagentGate>();
+
+function createSubagentGateExtension(channelId: string): ExtensionFactory {
+	const gate = createSubagentGate();
+	subagentGates.set(channelId, gate);
+	return (pi: ExtensionAPI): void => {
+		const api = pi as {
+			on(event: string, handler: (event: { toolName?: string; toolCallId?: string }) => any): void;
+			events: { on(channel: string, handler: (data: unknown) => void): unknown };
+		};
+		api.on("tool_call", (event) => {
+			if (event?.toolName !== "subagent") return undefined;
+			if (!gate.acquireSync(event.toolCallId ?? "")) {
+				return { block: true, reason: gate.blockReason() };
+			}
+			return undefined;
+		});
+		api.on("tool_result", (event) => {
+			if (event?.toolName === "subagent") gate.releaseSync(event.toolCallId ?? "");
+			return undefined;
+		});
+		api.events.on(SUBAGENT_ASYNC_STARTED_EVENT, (data) => gate.onAsyncStarted(data));
+		api.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (data) => gate.onAsyncComplete(data));
+	};
+}
+
 export class DiscordSession {
 	channelId: string;
 	session: AgentSession;
@@ -63,7 +135,11 @@ export class DiscordSession {
 		this.applyRetryOverrides();
 	}
 
-	private applyRetryOverrides() {
+	/**
+	 * Public so the Discord layer can re-apply retry overrides after
+	 * `session.reload()`, which resets in-memory settings.
+	 */
+	applyRetryOverrides() {
 		this.session.settingsManager.applyOverrides({
 			retry: { enabled: true, maxRetries: 10 },
 		});
@@ -77,6 +153,17 @@ export class DiscordSession {
 		this.session.abortCompaction();
 		this.session.abortRetry();
 		await this.session.abort();
+	}
+
+	/**
+	 * True while async (background) subagent runs started in this channel have
+	 * not completed yet. Used by the interrupt path in index.ts: during the
+	 * pi-subagents agent_end drain the session keeps reporting isStreaming even
+	 * though the main turn has finished, and aborting there would not stop the
+	 * background runs.
+	 */
+	hasPendingBackgroundWork(): boolean {
+		return (subagentGates.get(this.channelId)?.pendingAsyncWork() ?? 0) > 0;
 	}
 }
 
@@ -400,7 +487,7 @@ export class SessionStore {
 
 					// Downscale/compress so heavy images don't bloat the context payload
 					// (some providers drop streams on large multimodal requests).
-					const { downscaleImage } = await import("./image-utils.js");
+					const { downscaleImage } = await import("./image-utils.ts");
 					const downscaled = await downscaleImage(base64Data, mimeType);
 
 					// Inject the image via sendUserMessage (like Discord attachments) so it
@@ -409,7 +496,7 @@ export class SessionStore {
 					await sessionRef!.sendUserMessage([
 						{ type: "text", text: `[Attached Image: ${absolutePath}]` },
 						{ type: "image", data: downscaled.data, mimeType: downscaled.mimeType }
-					], { deliverAs: "nextTurn" });
+					], { deliverAs: "followUp" });
 
 					// Return proper content array — Google provider requires arrays for toolResult
 					return { content: [{ type: "text", text: `✅ Image loaded from: ${absolutePath}` }] };
@@ -448,11 +535,14 @@ export class SessionStore {
 			// Official `before_agent_start` hook: appends persisted `remember`
 			// memory to the system prompt at the start of every agent turn.
 			// Channel-scoped: memory follows the channel, not the pi session UUID.
-			extensionFactories: [createSessionMemoryExtension(this.sessionDir, channelId)],
+		extensionFactories: [
+				createSessionMemoryExtension(this.sessionDir, channelId),
+				createSubagentGateExtension(channelId),
+			],
 			appendSystemPrompt: [`\n\nYou are running on Discord (in a channel named "${getChannelName()}"), use @here in your every message that talks directly to the users (do not use it when just calling tools or thinking about something).`],
 			systemPromptOverride: (basePrompt) => {
 				if (!basePrompt) return basePrompt;
-				let prompt = withCurrentDate(basePrompt, now);
+				let prompt = withCurrentDate(basePrompt);
 
 				// Dynamically update channel name (handles renames)
 				const chanName = getChannelName();
@@ -476,6 +566,11 @@ export class SessionStore {
 			agentDir: join(homedir(), ".pi", "agent"),
 			modelRuntime,
 			tools,
+			// pi >= 0.84.3 added a built-in `powershell` tool (Windows-only). It is
+			// force-activated in our sessions by the pi-readonly-ssh strict-mode bug
+			// (it does setActiveTools(getAllTools() minus bash)), so the model sees it
+			// and calls it on macOS, getting "only available on Windows". Exclude it.
+			excludeTools: ["powershell"],
 			customTools: [rememberTool, lookAtFileTool, thinkingModeTool],
 			sessionManager,
 			settingsManager,
@@ -491,9 +586,34 @@ export class SessionStore {
 		// /session, /clear, /compact, /resume, forks and crashes.
 		applyChannelThinkingMode(this.sessionDir, channelId, session);
 
-    await session.bindExtensions({
-        mcp: mcpAdapter,
-    });
+		// `bindExtensions` accepts only UI/command bindings (uiContext, mode,
+		// commandContextActions, abortHandler, shutdownHandler, onError); there is
+		// no `mcp` key, so the former `{ mcp: mcpAdapter }` payload was silently
+		// ignored. `pi-mcp-adapter` is an ExtensionFactory and belongs in
+		// DefaultResourceLoader's `extensionFactories` if MCP is wanted back.
+		await session.bindExtensions({});
+
+		// The Discord-facing PARENT session is locked to a strict allowlist
+		// (PARENT_TOOL_ALLOWLIST): `subagent` for delegation, plus the direct
+		// `schedule_prompt` tool (pi-schedule-prompt extension) so the model can
+		// schedule channel prompts without going through the subagent tool. All
+		// built-in coding tools and the SDK custom tools
+		// (remember/look_at_file/thinkingmode) are intentionally NOT in the
+		// parent's active set. The global TUI-side lockdown extension
+		// (~/.pi/agent/extensions/parent-tools-lockdown.ts) already skips bot
+		// processes via PI_DISCORD_BOT=1, so THIS block is the single source of
+		// truth for the bot parent's restriction.
+		// Note: setActiveToolsByName is a strict allowlist resolved against the
+		// tool registry (unknown names are silently dropped); it does NOT
+		// propagate to pi-subagents children, which resolve their own tool plans.
+		const registeredToolNames = session.getAllTools().map((tool) => tool.name);
+		const parentToolAllowlist = buildParentToolAllowlist(registeredToolNames);
+		const droppedTools = PARENT_TOOL_ALLOWLIST.filter((name) => !registeredToolNames.includes(name));
+		session.setActiveToolsByName(parentToolAllowlist);
+		this.log(
+			`[${channelId}] Parent tool allowlist applied (${parentToolAllowlist.length}): ${parentToolAllowlist.join(", ")}` +
+				(droppedTools.length > 0 ? ` (dropped, not in registry: ${droppedTools.join(", ")})` : ""),
+		);
 
 		if (agent.extensionsResult.errors.length > 0) {
 			this.log(`[${channelId}] extensions results errors: ${agent.extensionsResult.errors.map(it => `${it.error} at ${it.path}`)}`);
@@ -656,6 +776,7 @@ export class SessionStore {
 			discordSession.session.dispose();
 			this.sessions.delete(channelId);
 		}
+		subagentGates.delete(channelId);
 	}
 
 	// Dispose all sessions and save index
@@ -671,6 +792,7 @@ export class SessionStore {
 
 		this.saveIndex(index);
 		this.sessions.clear();
+		subagentGates.clear();
 	}
 
 	// Get all active session channel IDs

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { withCurrentDate } from "../src/session-store.js";
+import { withCurrentDate } from "../src/session-store.ts";
 
 describe("Agent Date Awareness", () => {
 	it("appends the correct local date when the prompt has none (pi >= 0.84)", () => {

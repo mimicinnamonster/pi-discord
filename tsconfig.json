@@ -11,6 +11,7 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "allowImportingTsExtensions": true,
     "noEmit": true,
     "declaration": true,
     "declarationMap": true,
@@ -20,6 +21,8 @@
   },
   "include": [
     "*.ts",
+    "src/**/*.ts",
+    "tests/**/*.ts",
     ".pi/extensions/**/*.ts"
   ],
   "exclude": [
