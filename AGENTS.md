@@ -5,15 +5,15 @@ Discord bot for the pi coding agent.
 ## Getting Started
 
 1. Clone the repository
-2. Run `bun install`
+2. Run `npm install`
 3. Create `.env` with your `DISCORD_BOT_TOKEN`
-4. Run `bun start`
+4. Run `npm start`
 
 ## Development
 
-- `bun dev` - Run with auto-reload
-- `bun test` - Run tests
-- `bun build` - Type-check
+- `npm run dev` - Run with auto-reload
+- `npm test` - Run tests
+- `npm run build` - Type-check
 
 ## Deployment via launchd (macOS)
 

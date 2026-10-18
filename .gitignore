@@ -31,7 +31,8 @@ coverage/
 .env.local
 .env.*.local
 
-# Bun
+# Legacy lockfiles (project uses npm; see package-lock.json)
+bun.lock
 bun.lockb
 
 # Logs
@@ -53,8 +54,5 @@ Notes/
 tasks.json
 
 # Subtitle files (downloaded artifacts)
-subs_p4AzAaJ8Ick.en-orig.vtt
 subs_p4AzAaJ8Ick.en.vtt
-
-# package-lock.json not needed when using bun
-package-lock.json
+subs_p4AzAaJ8Ick.en-orig.vtt

@@ -1,0 +1,80 @@
+# systemd USER unit for the pi-discord bot (Linux).
+#
+# Install as a user service so it needs no root and starts at boot:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp pi-discord.service.example ~/.config/systemd/user/pi-discord.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pi-discord
+#   loginctl enable-linger "$USER"      # otherwise it only runs while you are logged in
+#
+# Adjust before installing:
+#   - WorkingDirectory and both /home/mimi paths -> your checkout + node install
+#   - ExecStart's node path -> must be ABSOLUTE (see NODE PATH note below)
+#
+# This runs alongside the macOS launchd example (com.pi-discord.plist.example);
+# use whichever matches the host.
+
+[Unit]
+Description=pi-discord bot (pi coding agent Discord bridge)
+Documentation=file:///home/mimi/Projects/pi-discord/README.md
+
+# The bot holds a persistent Discord gateway connection, so it wants the network
+# up before starting. Without Wants= it would start on boot and the initial
+# login could race the network coming up.
+After=network-online.target
+Wants=network-online.target
+
+# Restart=always means a crash loop would otherwise spin forever unnoticed.
+# 10 starts per 300s caps that; past the limit the unit enters failed state
+# (visible in `systemctl --user status`) instead of retrying endlessly.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mimi/Projects/pi-discord
+
+# NODE PATH: absolute, not `node`. systemd user units get a minimal PATH that
+# does NOT include the mise shims dir, so a bare `node` would not resolve, and
+# the shim itself resolves the version from the cwd's .mise.toml. This path is
+# the version pinned in that file (node 25.9.0); if the pin is bumped, this
+# line must be updated to match.
+#
+# --env-file-if-exists=.env: REQUIRED. The bot reads process.env.DISCORD_BOT_TOKEN
+# directly (src/index.ts:30) with no dotenv. It previously worked only because
+# bun auto-loads .env files; node does not. Without this flag the bot exits 1
+# with "DISCORD_BOT_TOKEN environment variable is required". The `-if-exists`
+# form is deliberate so the unit still starts (and logs a clear error) rather
+# than failing with a systemd-level missing-file error.
+#
+# No TypeScript loader is required. node 25.9 strips types natively, and every
+# src/ module was verified to load without one. jiti was previously needed only
+# because the pi-mcp-adapter dependency (raw TypeScript inside node_modules,
+# which node refuses to strip) was imported; that import was removed, so this
+# runs as plain node.
+ExecStart=/home/mimi/.local/share/mise/installs/node/25.9.0/bin/node --env-file-if-exists=.env src/index.ts
+
+Environment=NODE_ENV=production
+
+# The bot spawns child agent processes that shell out to node/npm/git, so the
+# shims dir must be on PATH even though ExecStart itself uses an absolute path.
+Environment=PATH=/home/mimi/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+
+# Always: the bot should come back after a crash or an OOM kill, not just a
+# clean exit. RestartSec=5 backs off enough to avoid hammering Discord's API
+# if the failure is a rejected token or an expired gateway session.
+Restart=always
+RestartSec=5
+
+# Give in-flight agent turns a chance to finish on `systemctl restart` before
+# SIGKILL. SIGTERM is handled by the bot; 20s matches the longest observed
+# shutdown.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

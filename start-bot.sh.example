@@ -5,9 +5,8 @@
 # Set the project directory
 PROJECT_DIR="/PATH/TO/pi-discord"
 
-# Locate bun - adjust to your installation
-# Common locations: /opt/homebrew/bin/bun, ~/.bun/bin/bun, or use mise
-BUN_PATH="/opt/homebrew/bin/bun"
+# Node/npm are resolved from PATH. With mise, the shims directory works well.
+# Common locations: /opt/homebrew/bin, ~/.local/share/mise/shims
 
 # Source shell configurations for environment setup
 [[ -f ~/.zshrc ]] && source ~/.zshrc
@@ -20,5 +19,5 @@ BUN_PATH="/opt/homebrew/bin/bun"
 # Change to project directory
 cd "$PROJECT_DIR" || { echo "Error: Project directory not found at $PROJECT_DIR"; exit 1; }
 
-# Run the bot
-exec "$BUN_PATH" run start:debug 2>&1 1>> "$PROJECT_DIR/logs.txt"
+# Run the bot (npm resolves the `start:debug` script from package.json)
+exec npm run start:debug 2>&1 1>> "$PROJECT_DIR/logs.txt"

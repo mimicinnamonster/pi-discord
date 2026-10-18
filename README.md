@@ -94,8 +94,7 @@ and stays up through tool calls, bash commands, retries, and long generations.
 ## Quick Start
 
 ### Prerequisites
-- [Bun](https://bun.sh) >= 1.0
-- [Node.js](https://nodejs.org) >= 22.19 (for `vitest`/test tooling; the bot itself runs on Bun).
+- [Node.js](https://nodejs.org) >= 22.19
   With [mise](https://mise.jdx.dev), the pinned version is picked up automatically from `.mise.toml` — run `mise trust` once if prompted.
 - A [Discord bot token](https://discord.com/developers/applications)
 - pi coding agent configuration (API keys set up via `pi` CLI)
@@ -106,13 +105,13 @@ and stays up through tool calls, bash commands, retries, and long generations.
 # Clone and install
 git clone https://github.com/mimicinnamonster/pi-discord.git
 cd pi-discord
-bun install
+npm install
 
 # Configure your bot token
 export DISCORD_BOT_TOKEN="your-token-here"
 
 # Run
-bun start
+npm start
 ```
 
 ### Discord Bot Setup
@@ -149,24 +148,24 @@ launchctl load ~/Library/LaunchAgents/com.pi-discord.plist
 ### ⚠️ Calendar access (ical) when running under launchd
 
 When the bot runs as a launchd LaunchAgent, macOS attributes any EventKit/Calendar
-request (e.g. the `ical` CLI used by agent sessions) to **bun** — the process that
-launchd spawns. bun is a hardened-runtime binary, and macOS **auto-denies**
-Calendar access for hardened-runtime binaries unless they carry the
+request (e.g. the `ical` CLI used by agent sessions) to the **Node.js** binary —
+the process that launchd spawns. Node is a hardened-runtime binary, and macOS
+**auto-denies** Calendar access for hardened-runtime binaries unless they carry the
 `com.apple.security.personal-information.calendars` entitlement.
 
-The fix is to re-sign bun with that entitlement (plus Reminders):
+The fix is to re-sign Node with that entitlement (plus Reminders):
 
 ```bash
-./scripts/re-sign-bun.sh
+./scripts/re-sign-node.sh
 ```
 
-This re-signs the bun binary ad-hoc with the Calendar/Reminders entitlements,
+This re-signs the Node binary ad-hoc with the Calendar/Reminders entitlements,
 enabling the one-time macOS permission prompt (click **Allow** on the
-"bun wants to access your calendar" dialog).
+"node wants to access your calendar" dialog).
 
-> **Caveat:** any bun update or reinstall (e.g. `mise upgrade bun`) overwrites
+> **Caveat:** any Node update or reinstall (e.g. `mise upgrade node`) overwrites
 > the signature and silently breaks calendar access again. Re-run
-> `./scripts/re-sign-bun.sh` after every bun update.
+> `./scripts/re-sign-node.sh` after every Node update.
 
 ## Architecture
 
@@ -196,11 +195,11 @@ enabling the one-time macOS permission prompt (click **Allow** on the
 ## Development
 
 ```bash
-bun dev           # Run with auto-reload
-bun dev:debug     # Run with debug logging + auto-reload
-bun test          # Run tests
-bun test:run      # Run tests once
-bun build         # Type-check only
+npm run dev           # Run with auto-reload
+npm run dev:debug     # Run with debug logging + auto-reload
+npm test              # Run tests
+npm run test:run      # Run tests once
+npm run build         # Type-check only
 ```
 
 ## License

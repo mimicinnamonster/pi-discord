@@ -5,25 +5,26 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "start": "bun run src/index.ts",
-    "start:debug": "DISCORD_DEBUG=true bun run src/index.ts",
-    "dev": "bun --watch run src/index.ts",
-    "dev:debug": "DISCORD_DEBUG=true bun --watch run src/index.ts",
-    "build": "bun run tsc",
+    "start": "node --env-file-if-exists=.env src/index.ts",
+    "start:debug": "DISCORD_DEBUG=true node --env-file-if-exists=.env src/index.ts",
+    "dev": "node --watch --env-file-if-exists=.env src/index.ts",
+    "dev:debug": "DISCORD_DEBUG=true node --watch --env-file-if-exists=.env src/index.ts",
+    "build": "tsc",
     "test": "vitest",
     "test:run": "vitest run"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-tui": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-ai": "^0.87.0",
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "@earendil-works/pi-server": "^0.87.0",
+    "@earendil-works/pi-tui": "^0.87.0",
     "croner": "^10.0.1",
     "discord.js": "14.26.4",
     "pi-mcp-adapter": "2.5.4"
   },
   "devDependencies": {
     "@sinclair/typebox": "^0.34.52",
-    "@types/node": "^25.9.5",
+    "@types/node": "^25.9.8",
     "typescript": "^6.0.3",
     "vitest": "^4.1.11"
   },
