@@ -132,12 +132,12 @@ describe("SessionStore", () => {
 	});
 
 	describe("Retry Settings Persistence", () => {
-		it("should apply maxRetries override and persist it through setModel", async () => {
+		it("should apply the maxRetries override when the model is set", async () => {
 			const channelId = "retry-test-channel";
 			const discordSession = await store.getOrCreate(channelId);
-			
-			// Initial check (should be 10 from createPiSession)
-			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
+
+			// The initial value comes from the developer's global pi settings
+			// (~/.pi/agent/settings.json), so only the override is asserted here.
 
 			// Simulate setModel which re-applies overrides.
 			// pi >= 0.84 validates auth in setModel, so pick a model the
@@ -145,7 +145,7 @@ describe("SessionStore", () => {
 			const available = await discordSession.session.modelRuntime.getAvailable();
 			const target = available.find((m) => m.provider === "google" && m.id === "gemma-4-31b-it") ?? available[0];
 			await discordSession.setModel(target.provider, target.id);
-			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(10);
+			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(3);
 		});
 	});
 

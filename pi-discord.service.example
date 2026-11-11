@@ -59,7 +59,40 @@ Environment=NODE_ENV=production
 
 # The bot spawns child agent processes that shell out to node/npm/git, so the
 # shims dir must be on PATH even though ExecStart itself uses an absolute path.
-Environment=PATH=/home/mimi/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+# ~/.pi/agent/bin is also on PATH so the bare-`pi` fallback in
+# pi-subagents/src/runs/shared/pi-spawn.js still resolves if it is ever used.
+Environment=PATH=/home/mimi/.local/share/mise/shims:/home/mimi/.pi/agent/bin:/usr/local/bin:/usr/bin:/bin
+
+# ---------------------------------------------------------------------------
+# pi-subagents wiring. These were supplied by the old start-bot.sh wrapper and
+# are easy to lose when moving to a service manager - without the first one,
+# every subagent delegation fails and the bot otherwise looks perfectly healthy.
+# ---------------------------------------------------------------------------
+
+# REQUIRED for subagents. pi-subagents normally infers the host SDK package from
+# process.argv[1], which works under the `pi` CLI but NOT in this embedded-SDK
+# process (argv[1] is `src/index.ts`). It then consults this override, then its
+# own install tree, and finally falls back to a bare import - which fails, since
+# pi-subagents declares @earendil-works/pi-coding-agent as a peerDependency that
+# is not present in its global extension dir. Without this the failure is:
+#   ERR_MODULE_NOT_FOUND: Cannot find package '@earendil-works/pi-coding-agent'
+#   imported from .../pi-subagents/src/runs/shared/child-session.js
+# Must be an ABSOLUTE path (systemd does not expand ~ or $HOME), and it must be
+# a real @earendil-works/pi-coding-agent install root whose package.json name
+# matches - pi-subagents validates that and rejects anything else.
+Environment=PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT=/home/mimi/Projects/pi-discord/node_modules/@earendil-works/pi-coding-agent
+
+# Makes the global ~/.pi/agent/extensions/parent-tools-lockdown.ts skip this
+# process. pi-discord locks its own parent tool set in code (src/session-store.ts,
+# setActiveToolsByName) and must keep its SDK custom tools
+# (remember/look_at_file/thinkingmode); the global lockdown would otherwise
+# re-narrow the parent to exactly ['subagent', ...] on every turn.
+Environment=PI_DISCORD_BOT=1
+
+# Matches the retired wrapper, which ran `npm run start:debug`. Optional: remove
+# this line to quiet the journal, at the cost of the per-session diagnostic
+# lines (e.g. the "Parent tool allowlist applied (N): ..." log).
+Environment=DISCORD_DEBUG=true
 
 # Always: the bot should come back after a crash or an OOM kill, not just a
 # clean exit. RestartSec=5 backs off enough to avoid hammering Discord's API

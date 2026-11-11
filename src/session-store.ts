@@ -78,6 +78,20 @@ export function buildParentToolAllowlist(registeredToolNames: Iterable<string>):
 	return PARENT_TOOL_ALLOWLIST.filter((name) => registered.has(name));
 }
 
+/**
+ * Auto-retry budget for failed model requests. Lowered from 10: a non-retryable
+ * provider error (out of balance, context overflow) used to burn ~10 minutes of
+ * exponential backoff before the user saw anything actionable. Non-retryable
+ * errors are additionally cancelled outright by the auto_retry_start handler in
+ * src/index.ts (see src/retry-policy.ts).
+ */
+const DEFAULT_MAX_RETRIES = 3;
+
+function resolveMaxRetries(): number {
+	const fromEnv = Number(process.env.PI_DISCORD_MAX_RETRIES);
+	return Number.isFinite(fromEnv) && fromEnv >= 0 ? fromEnv : DEFAULT_MAX_RETRIES;
+}
+
 // Per-channel "max 1 subagent at a time" gate. Each channel session gets its
 // own SubagentGate instance (created here, keyed only by this session), so
 // channels are independent: one channel's in-flight subagent never blocks
@@ -117,6 +131,21 @@ function createSubagentGateExtension(channelId: string): ExtensionFactory {
 	};
 }
 
+/**
+ * Release orphaned async subagent runs (one whose completion event never
+ * arrived) in every channel. Returns the channel ids whose gate was released so
+ * the caller can replay messages parked behind the drain.
+ */
+export function sweepStaleBackgroundWork(maxAgeMs?: number): string[] {
+	const releasedChannels: string[] = [];
+	for (const [channelId, gate] of subagentGates) {
+		if (gate.sweepStaleAsync(maxAgeMs).length > 0) {
+			releasedChannels.push(channelId);
+		}
+	}
+	return releasedChannels;
+}
+
 export class DiscordSession {
 	channelId: string;
 	session: AgentSession;
@@ -141,7 +170,7 @@ export class DiscordSession {
 	 */
 	applyRetryOverrides() {
 		this.session.settingsManager.applyOverrides({
-			retry: { enabled: true, maxRetries: 10 },
+			retry: { enabled: true, maxRetries: resolveMaxRetries() },
 		});
 	}
 
@@ -157,10 +186,8 @@ export class DiscordSession {
 
 	/**
 	 * True while async (background) subagent runs started in this channel have
-	 * not completed yet. Used by the interrupt path in index.ts: during the
-	 * pi-subagents agent_end drain the session keeps reporting isStreaming even
-	 * though the main turn has finished, and aborting there would not stop the
-	 * background runs.
+	 * not completed yet. Used by the self-heal sweep in src/index.ts to tell a
+	 * legitimately draining channel from one whose completion event was lost.
 	 */
 	hasPendingBackgroundWork(): boolean {
 		return (subagentGates.get(this.channelId)?.pendingAsyncWork() ?? 0) > 0;
@@ -518,7 +545,7 @@ export class SessionStore {
 		const finalCwd = cwd || process.cwd();
 		const settingsManager = SettingsManager.create(finalCwd, agentDir);
 		settingsManager.applyOverrides({
-			retry: { enabled: true, maxRetries: 10 },
+			retry: { enabled: true, maxRetries: resolveMaxRetries() },
 		});
 
 		// Store channel name if provided

@@ -4,8 +4,12 @@
  */
 
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
-import { createSessionStore, type ClosedSessionInfo } from "./session-store.ts";
+import { createSessionStore, sweepStaleBackgroundWork, type ClosedSessionInfo, type DiscordSession } from "./session-store.ts";
 import { shouldInterruptForIncomingMessage } from "./interrupt-decision.ts";
+import { isNonRetryableModelError, retryHintForModelError } from "./retry-policy.ts";
+import { splitMessagePreservingCodeBlocks, DISCORD_CHUNK_LIMIT } from "./message-chunker.ts";
+import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
+import { createPendingMessageStore, PENDING_MESSAGES_FILE } from "./pending-messages.ts";
 import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.ts";
 import { TypingManager, type TypingChannel } from "./typing-manager.ts";
 import { generateTokenStatsMessage } from "./token-stats.ts";
@@ -30,6 +34,17 @@ import {
 const discordToken = process.env.DISCORD_BOT_TOKEN;
 const debug = process.env.DISCORD_DEBUG === "true";
 const sessionDir = process.env.PI_DISCORD_SESSION_DIR || join(homedir(), ".pi-discord", "sessions");
+
+/**
+ * Upper bound on how long an incoming message waits for the previous run to
+ * abort. The SDK's abort() awaits waitForIdle(), which pi-subagents' agent_end
+ * drain can hold open for up to 30 minutes; blocking message handling that long
+ * is what made /exit and every follow-up appear ignored.
+ */
+const abortWaitTimeoutMs = Number(process.env.PI_DISCORD_ABORT_WAIT_MS) || 5_000;
+
+/** How long /exit waits for a clean shutdown before forcing process exit. */
+const shutdownHardExitTimeoutMs = Number(process.env.PI_DISCORD_SHUTDOWN_TIMEOUT_MS) || 3_000;
 
 // ============================================================================
 // Logging
@@ -60,16 +75,36 @@ const typingManager = new TypingManager();
 
 // ============================================================================
 // Process resilience — scheduled prompts must survive process death
-// (/kill, external kill, laptop battery, crashes). pi-schedule-prompt's widget
-// can throw "extension ctx is stale after session replacement" and otherwise
-// unhandled errors would kill the whole bot, taking every scheduled job with
-// it. Log loudly and keep running: the session keeper below re-creates
-// sessions and catches up any missed runs.
+// (/kill, external kill, laptop battery, crashes). Log loudly and keep running:
+// the session keeper below re-creates sessions and catches up any missed runs.
+//
+// One known-benign case is rate-limited instead: pi-schedule-prompt's CronWidget
+// throws "extension ctx is stale after session replacement" every 30s for the
+// lifetime of the process, which buries real errors in the journal.
 // ============================================================================
+const STALE_EXTENSION_CTX_PATTERN = "extension ctx is stale";
+let staleExtensionCtxSuppressed = 0;
+
+function isStaleExtensionCtxError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes(STALE_EXTENSION_CTX_PATTERN);
+}
+
 process.on("uncaughtException", (err) => {
+	if (isStaleExtensionCtxError(err)) {
+		staleExtensionCtxSuppressed++;
+		if (staleExtensionCtxSuppressed % 100 === 1) {
+			log(`[discord] Suppressed stale-extension-ctx exception (${staleExtensionCtxSuppressed} so far, benign)`);
+		}
+		return;
+	}
 	console.error("[discord] Uncaught exception (keeping bot alive):", err);
 });
 process.on("unhandledRejection", (reason) => {
+	if (isStaleExtensionCtxError(reason)) {
+		staleExtensionCtxSuppressed++;
+		return;
+	}
 	console.error("[discord] Unhandled rejection (keeping bot alive):", reason);
 });
 
@@ -86,6 +121,11 @@ const previousTokens = new Map<string, { contextPercent: number; inputTokens: nu
 
 // Track queued prompts per channel (persisted to disk)
 const promptQueue = new Map<string, string[]>();
+
+// User messages parked because the channel was still draining background
+// subagent work. Persisted to disk so a wedged run (or a restart) cannot lose
+// them; entries are removed once the message shows up in the session.
+const pendingMessages = createPendingMessageStore(join(sessionDir, PENDING_MESSAGES_FILE));
 
 // Track active session labels per channel (set via /label or /session [label])
 const sessionLabels = new Map<string, string>();
@@ -420,7 +460,7 @@ function restoreScheduledSessions(): void {
  */
 function startSessionKeeper(deps: {
 	subscribedSessions: Set<string>;
-	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void; isAwaitingAgentEnd: () => boolean }>;
+	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>;
 }): void {
 	/**
 	 * Ensure the channel's session is subscribed so agent output (from the
@@ -785,66 +825,6 @@ function extractFirstUserMessagePreview(fileHead: string, maxPreview = 140): { t
 // Discord Message Handling
 // ============================================================================
 
-function splitMessagePreservingCodeBlocks(text: string, maxLength: number): string[] {
-	const chunks: string[] = [];
-	let remaining = text;
-
-	while (remaining.length > 0) {
-		// If the remaining text fits in one chunk, we're done
-		if (remaining.length <= maxLength) {
-			chunks.push(remaining);
-			break;
-		}
-
-		// Try to find code blocks within the current chunk range
-		const visibleSlice = remaining.slice(0, maxLength);
-		const codeBlockMatch = visibleSlice.match(/```/g);
-		const codeBlockCount = codeBlockMatch ? codeBlockMatch.length : 0;
-
-		if (codeBlockCount === 0 || codeBlockCount % 2 === 0) {
-			// No code block or complete pairs within visible range
-			// Check if there's an opening ``` within a few chars of the boundary
-			const nearBoundaryArea = remaining.slice(maxLength, maxLength + 50);
-			const openingIndex = nearBoundaryArea.indexOf("```");
-			if (openingIndex !== -1) {
-				// Code block starts near boundary - include the whole block
-				const actualStart = maxLength + openingIndex;
-				const nextCloseIndex = remaining.indexOf("```", actualStart + 3);
-				if (nextCloseIndex !== -1) {
-					const endOfBlock = nextCloseIndex + 3;
-					chunks.push(remaining.slice(0, endOfBlock));
-					remaining = remaining.slice(endOfBlock);
-				} else {
-					// No closing - include what we can
-					chunks.push(remaining.slice(0, maxLength));
-					remaining = remaining.slice(maxLength);
-				}
-			} else {
-				// Safe to split at maxLength
-				chunks.push(remaining.slice(0, maxLength));
-				remaining = remaining.slice(maxLength);
-			}
-		} else {
-			// Odd number of ``` found in visible range - we're inside a code block
-			// Find the closing ``` and include the entire block
-			const nextCloseIndex = remaining.indexOf("```", maxLength);
-			if (nextCloseIndex !== -1) {
-				// Include the closing ``` plus a bit more if there's content
-				const endOfBlock = nextCloseIndex + 3;
-				chunks.push(remaining.slice(0, endOfBlock));
-				remaining = remaining.slice(endOfBlock);
-			} else {
-				// No closing ``` found - just take what we can
-				// This shouldn't happen for valid Discord messages
-				chunks.push(remaining.slice(0, maxLength));
-				remaining = remaining.slice(maxLength);
-			}
-		}
-	}
-
-	return chunks;
-}
-
 /**
  * Detect content type and determine appropriate file extension.
  */
@@ -964,8 +944,9 @@ async function sendToDiscord(
 		log(`[${channel.id}] File upload failed, falling back to splitting`);
 	}
 
-	const maxLength = 2000;
-	const chunks = splitMessagePreservingCodeBlocks(text, maxLength);
+	// Every chunk must be strictly under Discord's 2000-char content limit; the
+	// chunker enforces that invariant (see src/message-chunker.ts).
+	const chunks = splitMessagePreservingCodeBlocks(text, DISCORD_CHUNK_LIMIT);
 
 	log(`[${channel.id}] Will send ${chunks.length} chunk(s)`);
 
@@ -1035,7 +1016,7 @@ function subscribeToSession(
 	typingManager: TypingManager,
 	sessionDir: string,
 	getOutputSettings: (channelId: string) => ChannelOutputSettings
-): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void; isAwaitingAgentEnd: () => boolean } {
+): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
 	const typingChannel = createTypingChannel(channelId);
 	const responseBuffer: string[] = [];
 	const thinkingBuffer: string[] = [];
@@ -1046,37 +1027,27 @@ function subscribeToSession(
 	let pendingIsReply = false;
 	// Captured at agent_end (synchronous, all messages appended) for use in .then()
 	let capturedAssistantEntryId: string | null = null;
-	// True from the final turn_end (assistant message with a non-toolUse stop
-	// reason) until the next agent activity. pi-subagents drains background
-	// subagents inside its agent_end extension handler, which the SDK runs BEFORE
-	// emitting the public agent_end — so during that drain the bot has seen
-	// turn_end but not agent_end, and isStreaming stays true the whole time.
-	// The interrupt decision in handleMessage uses this to tell "main turn still
-	// executing" apart from "main turn over, only background work draining".
-	let awaitingAgentEnd = false;
-
 
 	session.subscribe(async (event: AgentSessionEvent) => {
 		switch (event.type) {
 			case "agent_start":
 				log(`[${channelId}] Agent starting...`);
-				awaitingAgentEnd = false;
 				responseBuffer.length = 0;
 				// LLM is processing - show typing indicator
 				typingManager.show(channelId, typingChannel);
 				break;
 
-			case "turn_start":
-				// A new turn of the same run is starting — work is genuinely executing again.
-				awaitingAgentEnd = false;
-				break;
-
 			case "message_start":
-				awaitingAgentEnd = false;
 				if (event.message.role === "user") {
 					// Capture pending discord info - entry id captured on message_end when appended
 					lastDiscordMessageId = pendingDiscordMsgId;
 					lastMessageIsReply = pendingIsReply;
+					// The message finally reached the session: drop its durable parking
+					// entry (it was only parked while the channel was draining
+					// background work). See src/pending-messages.ts.
+					if (lastDiscordMessageId) {
+						pendingMessages.remove(channelId, lastDiscordMessageId);
+					}
 					log(`[${channelId}] User message started, discordMsg=${lastDiscordMessageId}, isReply=${lastMessageIsReply}`);
 				} else if (event.message.role === "assistant") {
 					log(`[${channelId}] Assistant message started`);
@@ -1152,7 +1123,6 @@ function subscribeToSession(
 
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
-				awaitingAgentEnd = false;
 				// Skip sending (and index tracking) when tools are hidden
 				if (!getOutputSettings(channelId).hideTools) {
 					const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
@@ -1199,16 +1169,8 @@ function subscribeToSession(
 				}
 				break;
 
-			case "turn_end":
-				// Final turn of the run: the assistant answered without tool calls and
-				// agent_end (and pi-subagents' drain inside it) follows next. A toolUse
-				// stopReason means the loop continues with another turn instead.
-				awaitingAgentEnd = event.message.role === "assistant" && event.message.stopReason !== "toolUse";
-				break;
-
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
-				awaitingAgentEnd = false;
 				// Agent turn fully finished — stop typing until the next user message
 				// or queued prompt starts a new turn (agent_start re-shows it).
 				typingManager.hide(channelId);
@@ -1250,7 +1212,6 @@ function subscribeToSession(
 				break;
 
 			case "compaction_start":
-				awaitingAgentEnd = false;
 				typingManager.show(channelId, typingChannel);
 				log(`[${channelId}] Compacting context...`);
 				sendToDiscord(channel, "📦 Compacting context...").catch(() => {});
@@ -1268,9 +1229,22 @@ function subscribeToSession(
 				break;
 
 			case "auto_retry_start":
-				awaitingAgentEnd = false;
 				typingManager.show(channelId, typingChannel);
 				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts}). Error message: ${event.errorMessage}`);
+				if (isNonRetryableModelError(event.errorMessage)) {
+					// Retrying cannot fix a 402/401/400/context-overflow: cancel the backoff
+					// and tell the user what to do. The SDK creates the retry
+					// AbortController right AFTER emitting this event, so abortRetry() is a
+					// no-op until the next tick.
+					log(`[${channelId}] Non-retryable model error - cancelling retries`);
+					setTimeout(() => session.abortRetry(), 0);
+					typingManager.hide(channelId);
+					sendToDiscord(
+						channel,
+						`⛔ **Not retrying** — this error cannot succeed on retry.\n\`\`\`\n${escapeForCodeBlock(event.errorMessage)}\n\`\`\`\n${retryHintForModelError(event.errorMessage)}`
+					).catch(() => {});
+					break;
+				}
 				sendToDiscord(channel, `⚠️ Retrying (attempt ${event.attempt}/${event.maxAttempts})...\nError:\n\`\`\`\n${escapeForCodeBlock(event.errorMessage)}\n\`\`\``).catch(() => {});
 				break;
 
@@ -1295,7 +1269,6 @@ function subscribeToSession(
 			pendingDiscordMsgId = id;
 			pendingIsReply = isReply;
 		},
-		isAwaitingAgentEnd: () => awaitingAgentEnd,
 	};
 }
 
@@ -1927,9 +1900,76 @@ async function main() {
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
-	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void; isAwaitingAgentEnd: () => boolean }>();
+	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>();
+	/** Channels with a parked-message replay in flight (guards the 60s sweep). */
+	const replaysInFlight = new Set<string>();
 	let subscribeCount = 0;
 	let sendCount = 0;
+
+	/**
+	 * Re-send messages parked while the channel was draining background subagent
+	 * work (see src/pending-messages.ts) now that the blocking run is gone.
+	 *
+	 * Entries stay parked when the session is still busy or the send fails, so a
+	 * later sweep retries them instead of losing the message.
+	 */
+	async function replayPendingMessages(channelId: string): Promise<number> {
+		const parked = pendingMessages.forChannel(channelId);
+		if (parked.length === 0) return 0;
+		// The 60s sweep runs fire-and-forget: without this guard a slow replay (it
+		// used to await an unbounded abort) overlapped the next tick and re-sent the
+		// same parked snapshot.
+		if (replaysInFlight.has(channelId)) {
+			log(`[${channelId}] Replay already in flight - skipping ${parked.length} parked message(s)`);
+			return 0;
+		}
+
+		const discordSession = sessionStore.get(channelId);
+		if (!discordSession) {
+			log(`[${channelId}] Cannot replay ${parked.length} parked message(s): no session for this channel`);
+			return 0;
+		}
+
+		replaysInFlight.add(channelId);
+		try {
+			if (discordSession.isModelActive()) {
+				// The run that swallowed these messages still holds the session (a wedged
+				// agent_end drain). Nothing can be delivered until it lets go, so abort it
+				// - bounded, or the replay itself would hang forever.
+				log(`[${channelId}] Replay: aborting stuck model activity before re-delivering ${parked.length} message(s)`);
+				await abortModelActivitiesBounded(discordSession, channelId);
+			}
+
+			// Messages already sitting in the SDK's follow-up queue are delivered by the
+			// session itself; replaying them as well would send them twice. Leave them
+			// parked and let a later sweep retry once that queue has drained.
+			const alreadyQueued = discordSession.session.pendingMessageCount;
+			if (alreadyQueued > 0) {
+				log(`[${channelId}] Replay: ${alreadyQueued} message(s) still queued in the session - leaving ${parked.length} parked for a later sweep`);
+				return 0;
+			}
+
+			let replayed = 0;
+			for (const entry of parked) {
+				if (discordSession.isModelActive()) {
+					log(`[${channelId}] Replay: session active again, leaving ${parked.length - replayed} message(s) parked`);
+					break;
+				}
+				log(`[${channelId}] Replaying queued message ${entry.discordMessageId}: ${entry.content.slice(0, 50)}`);
+				try {
+					sessionSubscriptions.get(channelId)?.setPendingDiscordMessageId(entry.discordMessageId, false);
+					await discordSession.session.sendUserMessage(entry.content);
+					pendingMessages.remove(channelId, entry.discordMessageId);
+					replayed++;
+				} catch (error) {
+					log(`[${channelId}] Replay failed for ${entry.discordMessageId} (stays parked): ${error}`);
+				}
+			}
+			return replayed;
+		} finally {
+			replaysInFlight.delete(channelId);
+		}
+	}
 
 	function getChannelDisplayName(channel: DMChannel | TextChannel | NewsChannel | ThreadChannel): string {
 		if (channel.type === ChannelType.DM) {
@@ -1939,12 +1979,105 @@ async function main() {
 		return ((channel as TextChannel | NewsChannel | ThreadChannel).name) || "Unknown";
 	}
 
+	/**
+	 * Run the abort for the interrupt path with a hard time limit.
+	 *
+	 * The SDK's abort() awaits waitForIdle(), which stays open while pi-subagents
+	 * drains background subagents inside its agent_end handler (default timeout
+	 * 30 minutes) — and aborting does not stop that drain, because async subagents
+	 * are detached processes in their own process group. Waiting for it is what
+	 * made a new message look ignored, so give up after abortWaitTimeoutMs and let
+	 * the send path queue the message as a follow-up instead.
+	 *
+	 * Never throws. Returns true when the abort settled within the limit.
+	 */
+	async function abortModelActivitiesBounded(discordSession: DiscordSession, channelId: string): Promise<boolean> {
+		const abortSettled = discordSession.abortModelActivities().then(
+			() => true,
+			(error) => {
+				log(`[${channelId}] Abort failed: ${error}`);
+				return true;
+			}
+		);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timedOut = new Promise<boolean>((resolve) => {
+			timer = setTimeout(() => {
+				log(
+					`[${channelId}] abort did not settle within ${abortWaitTimeoutMs}ms (run still draining) - continuing`
+				);
+				resolve(false);
+			}, abortWaitTimeoutMs);
+		});
+		try {
+			return await Promise.race([abortSettled, timedOut]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * Shut the bot down for /exit.
+	 *
+	 * shutdown() can hang (disposing sessions waits on the same agent_end drain),
+	 * so a hard exit is armed first: the user asked to exit, and an unresponsive
+	 * bot that ignores /exit is worse than a slightly unclean exit.
+	 */
+	async function exitBot(
+		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
+		channelId: string
+	): Promise<void> {
+		// Armed before anything that can block: sendToDiscord() rethrows channel.send
+		// failures (missing permissions, unresolvable channel, 429) and shutdown()
+		// waits on the same agent_end drain that made /exit look ignored. The user
+		// asked to exit, so nothing here may prevent or delay it.
+		setTimeout(() => {
+			console.error(`[discord] Shutdown did not finish within ${shutdownHardExitTimeoutMs}ms - forcing exit`);
+			process.exit(0);
+		}, shutdownHardExitTimeoutMs).unref();
+
+		const queue = promptQueue.get(channelId);
+		if (queue && queue.length > 0) {
+			try {
+				await sendToDiscord(
+					channel as DMChannel | TextChannel | NewsChannel,
+					`⚠️ **Exiting with ${queue.length} queued prompt(s) that will be lost:**\n${queue.map((p, i) => `${i + 1}. ${p.length > 80 ? p.slice(0, 80) + '...' : p}`).join('\n')}`
+				);
+				promptQueue.delete(channelId);
+			} catch (error) {
+				// Keep the queue so savePromptQueue() below persists it for the restart.
+				console.error("[discord] Failed to announce discarded queued prompts:", error);
+			}
+		}
+		try {
+			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
+		} catch (error) {
+			console.error("[discord] Failed to send exit notice:", error);
+		}
+		try {
+			savePromptQueue();
+		} catch (error) {
+			console.error("[discord] Failed to save the prompt queue on exit:", error);
+		}
+		shutdown().catch((error) => {
+			console.error("[discord] Shutdown failed - forcing exit:", error);
+			process.exit(1);
+		});
+	}
+
 	async function handleMessage(
 		channel: DMChannel | TextChannel | NewsChannel | ThreadChannel,
 		message: any
 	): Promise<void> {
 		const channelId = channel.id;
 		const channelName = getChannelDisplayName(channel);
+
+		// /exit is control-plane: it must work even when the session is wedged.
+		// Handling it before any session lookup, subscribe or abort means it can
+		// never be parked behind a turn that never settles.
+		if (message.content?.trim() === "/exit") {
+			await exitBot(channel, channelId);
+			return;
+		}
 
 		// Show typing immediately for real prompts (non-command messages) so the
 		// user sees activity during session setup, image downloads and the wait
@@ -1996,29 +2129,20 @@ async function main() {
 			message.content === "/compact" || message.content.startsWith("/compact ");
 
 		// Only abort if the agent is active AND this is not a non-interrupting command.
-		// Exception: when the main turn has already ended and the session merely looks
-		// active because pi-subagents is draining background subagents inside its
-		// agent_end handler (runs before the public agent_end event), there is nothing
-		// to interrupt — abort() would not stop the background runs (separate
-		// processes) and the "interrupted" message would be wrong. Queue instead.
+		// Any new message aborts the running main turn: async background subagents
+		// live in their own process group and keep running, so there is nothing to
+		// wait for (waiting is what used to swallow messages behind a stuck turn).
 		const shouldInterrupt = shouldInterruptForIncomingMessage({
 			modelActive: discordSession.isModelActive(),
 			nonInterruptingCommand: isNonInterruptingCommand,
-			awaitingAgentEnd: sessionSubscriptions.get(channelId)?.isAwaitingAgentEnd() ?? false,
-			retrying: session.isRetrying,
-			compacting: session.isCompacting,
-			bashRunning: session.isBashRunning,
-			pendingBackgroundWork: discordSession.hasPendingBackgroundWork(),
 		});
-		let queuedBehindBackgroundDrain = false;
 		if (shouldInterrupt) {
 			log(`[${channelId}] User interrupted - aborting current operation`);
 			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
-			await discordSession.abortModelActivities()
+			// Bounded: abort() can stay open for as long as the agent_end drain. The
+			// send path below parks the message if the session is still busy.
+			await abortModelActivitiesBounded(discordSession, channelId);
 			// dont hide typing manager, fall through to sending the interrupted message to the agent
-		} else if (discordSession.isModelActive() && !isNonInterruptingCommand) {
-			queuedBehindBackgroundDrain = true;
-			log(`[${channelId}] Main turn settled, background subagents still draining - queueing message instead of interrupting`);
 		}
 
 		// Store the Discord message ID so it can be tracked when the user message is processed
@@ -2269,17 +2393,8 @@ async function main() {
 			return;
 		}
 
-		if (message.content === "/exit") {
-			const queue = promptQueue.get(channelId);
-			if (queue && queue.length > 0) {
-				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, `⚠️ **Exiting with ${queue.length} queued prompt(s) that will be lost:**\n${queue.map((p, i) => `${i + 1}. ${p.length > 80 ? p.slice(0, 80) + '...' : p}`).join('\n')}`);
-				promptQueue.delete(channelId);
-			}
-			await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "😵 Exiting");
-			savePromptQueue();
-			shutdown();
-			return;
-		}
+		// /exit is handled at the top of handleMessage, before the session is
+		// touched, so a wedged turn can never swallow it.
 
 		// Handle /session command
 		// /session - Close current session and start fresh (no label)
@@ -2944,6 +3059,9 @@ async function main() {
 		sessionSubscriptions.get(channelId)?.setPendingDiscordMessageId(message.id, !!message.reference);
 
 		// Send user message to pi agent
+		// Set once the SDK accepted the message: a failure afterwards (branch metadata,
+		// Discord bookkeeping) must not park an already-delivered message.
+		let delivered = false;
 		try {
 			const finalContent: any[] = [];
 			
@@ -2967,21 +3085,45 @@ async function main() {
 			// that fell through to the agent, e.g. unknown commands or spaced-out
 			// commands, and re-asserts after the pre-processing above).
 			typingManager.show(channelId, createTypingChannel(channelId));
-			// When the message was held back from interrupting a background-subagent
-			// drain, the session still reports streaming: a bare send would throw
+			// Park a durable copy before handing the message to the SDK whenever the
+			// session still reports activity after the bounded abort wait (a wedged
+			// agent_end drain, or a tool that ignores its abort signal). A followUp
+			// only materialises when the current run settles; if that run never
+			// settles the message would be lost. See src/pending-messages.ts.
+			const sessionStillActive = discordSession.isModelActive();
+			if (sessionStillActive) {
+				const parkedText = message.content ?? "";
+				if (parkedText.trim()) {
+					pendingMessages.add({
+						channelId,
+						discordMessageId: message.id,
+						authorId: message.author?.id,
+						authorName: message.author?.username,
+						content: parkedText,
+						queuedAt: Date.now(),
+						reason: "run-still-active",
+					});
+				} else {
+					log(
+						`[${channelId}] Message ${message.id} has no text (attachments only) and cannot be parked for replay`
+					);
+				}
+			}
+			// While the aborted run is still winding down a bare send would throw
 			// "Agent is already processing" — queue it as a follow-up instead, which
-			// runs as soon as the drain (and settle) completes. If the drain finished
-			// in the meantime, isStreaming is false and the message runs normally.
-			await session.sendUserMessage(finalContent, queuedBehindBackgroundDrain ? { deliverAs: "followUp" } : undefined);
+			// runs as soon as that run settles. If it settled in the meantime,
+			// isStreaming is false and the message runs normally.
+			await session.sendUserMessage(finalContent, sessionStillActive ? { deliverAs: "followUp" } : undefined);
+			delivered = true;
 
 			// Track user Discord message → user Pi entry
 			// getLeafId() is the assistant entry; its parent is the user entry.
-			// Omitted when the message was only queued behind the drain: no entries
-			// were appended yet, so the leaf still points at the previous turn and
-			// the mapping would record a wrong entry. Leaving it unset makes later
-			// reply-branching to that message fall back to the main branch instead
-			// of forking from the wrong place.
-			const assistantLeafId = queuedBehindBackgroundDrain && session.isStreaming
+			// Omitted when the message was only queued behind a run that is still
+			// settling: no entries were appended yet, so the leaf still points at the
+			// previous turn and the mapping would record a wrong entry. Leaving it
+			// unset makes later reply-branching to that message fall back to the main
+			// branch instead of forking from the wrong place.
+			const assistantLeafId = sessionStillActive && session.isStreaming
 				? undefined
 				: session.sessionManager.getLeafId();
 			if (assistantLeafId) {
@@ -3004,9 +3146,27 @@ async function main() {
 			// The turn died without agent_end — stop typing so the user knows
 			// nothing is running anymore.
 			typingManager.hide(channelId);
+			// The usual cause is a run that never settled: the SDK rejects a new
+			// prompt with "Agent is already processing" while the old run is still
+			// streaming. Park the text so replayPendingMessages() and the 60s sweep
+			// can deliver it later instead of dropping it on the floor.
+			const undeliveredText = (message.content ?? "").trim();
+			if (!delivered && undeliveredText) {
+				pendingMessages.add({
+					channelId,
+					discordMessageId: message.id,
+					authorId: message.author?.id,
+					authorName: message.author?.username,
+					content: message.content ?? "",
+					queuedAt: Date.now(),
+					reason: "send-failed",
+				});
+			}
 			try {
 				await (channel as DMChannel | TextChannel | NewsChannel).send(
-					"❌ Sorry, I encountered an error processing your message."
+					!delivered && undeliveredText
+						? "⏳ The previous turn is still winding down, so I queued your message — it will be delivered automatically."
+						: "❌ Sorry, I encountered an error processing your message."
 				);
 			} catch {
 				// Channel might be unavailable
@@ -3019,6 +3179,15 @@ async function main() {
 	// =========================================================================
 	async function shutdown() {
 		log("Shutting down...");
+
+		// Flush anything that only lives in memory. Parked user messages are
+		// already on disk (persisted before they reached the SDK); the /queue
+		// prompt list is only written on mutation, so flush it here to be safe.
+		const parkedCount = pendingMessages.size();
+		savePromptQueue();
+		if (parkedCount > 0) {
+			log(`${parkedCount} parked user message(s) stay on disk and will be replayed on startup`);
+		}
 
 		// Dispose typing manager (stops all typing indicators)
 		typingManager.dispose();
@@ -3056,6 +3225,39 @@ async function main() {
 			console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
 		});
 	}
+
+	// Re-deliver user messages that were parked behind background subagent work
+	// when the process last stopped. They were persisted for exactly this case.
+	log(
+		`Parked-message store armed: ${pendingMessages.size()} message(s) on disk, ` +
+			`orphaned background work released after ${STALE_ASYNC_WORK_TIMEOUT_MS / 60_000} min`
+	);
+	const restartParkedChannels = [...new Set(pendingMessages.all().map((entry) => entry.channelId))];
+	for (const chId of restartParkedChannels) {
+		const count = pendingMessages.forChannel(chId).length;
+		console.log(`[discord] Replaying ${count} parked message(s) for channel ${chId} after restart`);
+		try {
+			await sessionStore.getOrCreate(chId);
+			await replayPendingMessages(chId);
+		} catch (err) {
+			console.error(`[discord] Replay after restart failed for ${chId} (stays parked):`, err);
+		}
+	}
+
+	// Self-heal: release orphaned background subagent runs (completion event never
+	// arrived) and replay anything parked behind them. Also retries messages left
+	// parked after a normal drain. Runs without user input, so a wedged channel
+	// recovers on its own instead of silently swallowing every message.
+	setInterval(() => {
+		const releasedChannels = sweepStaleBackgroundWork();
+		const candidates = new Set([...releasedChannels, ...pendingMessages.all().map((entry) => entry.channelId)]);
+		for (const chId of candidates) {
+			if (sessionStore.get(chId)?.hasPendingBackgroundWork()) continue; // legitimately draining still
+			replayPendingMessages(chId).catch((err) => {
+				console.error(`[discord] Replay sweep error for ${chId}:`, err);
+			});
+		}
+	}, 60_000);
 
 	console.log("[discord] Bot is ready and listening for messages!");
 }

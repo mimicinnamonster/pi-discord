@@ -29,6 +29,21 @@ export const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
 // acquireSync() always succeeds and isGateHeld() is always false.
 const MAX_CONCURRENT = Infinity;
 
+/**
+ * How long an async run may stay pending before it is treated as orphaned.
+ *
+ * Without this, a run whose completion event never arrives (crash, killed child
+ * process, empty run directory) pins `pendingAsyncWork()` above zero forever.
+ * Every incoming message is then queued "behind the drain" instead of being
+ * answered — one channel stayed wedged this way for ~20 hours.
+ */
+export const STALE_ASYNC_WORK_TIMEOUT_MS = 10 * 60_000;
+
+interface AsyncRun {
+	id: string;
+	startedAt: number;
+}
+
 export interface SubagentGate {
 	isGateHeld(): boolean;
 	/**
@@ -42,17 +57,41 @@ export interface SubagentGate {
 	releaseSync(toolCallId: string): void;
 	onAsyncStarted(payload: unknown): void;
 	onAsyncComplete(payload: unknown): void;
+	/**
+	 * Release async runs older than `maxAgeMs` and return their ids. Callers
+	 * replay any messages parked behind them.
+	 */
+	sweepStaleAsync(maxAgeMs?: number): string[];
 	blockReason(): string;
 	getStatus(): string;
 }
 
-export function createSubagentGate(): SubagentGate {
+export interface SubagentGateOptions {
+	/** Injectable clock for tests. */
+	now?: () => number;
+}
+
+function readPayloadId(payload: unknown): string | undefined {
+	if (typeof payload !== "object" || payload === null) return undefined;
+	const record = payload as Record<string, unknown>;
+	for (const key of ["runId", "id", "agentId", "subagentId"]) {
+		const value = record[key];
+		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return undefined;
+}
+
+export function createSubagentGate(options: SubagentGateOptions = {}): SubagentGate {
+	const now = options.now ?? Date.now;
 	// Tool-call ids of sync subagent invocations that were admitted and are
 	// still in flight. Async runs and sync calls share the same slot counter.
 	const activeSyncCalls = new Set<string>();
-	let asyncHolders = 0;
+	// Async runs keyed by run id (payload id when pi-subagents provides one,
+	// otherwise a synthetic id). Insertion order is start order.
+	const asyncRuns = new Map<string, AsyncRun>();
+	let syntheticRunCounter = 0;
 
-	const holderCount = () => activeSyncCalls.size + asyncHolders;
+	const holderCount = () => activeSyncCalls.size + asyncRuns.size;
 
 	return {
 		isGateHeld() {
@@ -60,7 +99,7 @@ export function createSubagentGate(): SubagentGate {
 		},
 
 		pendingAsyncWork(): number {
-			return asyncHolders;
+			return asyncRuns.size;
 		},
 
 		acquireSync(toolCallId: string): boolean {
@@ -77,11 +116,13 @@ export function createSubagentGate(): SubagentGate {
 			}
 		},
 
-		onAsyncStarted(_payload: unknown): void {
+		onAsyncStarted(payload: unknown): void {
 			if (holderCount() >= MAX_CONCURRENT) {
 				console.log(`[subagent-gate] async started while gate held (${holderCount()} holders)`);
 			}
-			asyncHolders++;
+			syntheticRunCounter++;
+			const id = readPayloadId(payload) ?? `async-run-${syntheticRunCounter}`;
+			asyncRuns.set(id, { id, startedAt: now() });
 		},
 
 		onAsyncComplete(payload: unknown): void {
@@ -92,11 +133,39 @@ export function createSubagentGate(): SubagentGate {
 			if (status !== "completed") {
 				console.log(`[subagent-gate] async subagent completed with status: ${status}`);
 			}
-			if (asyncHolders > 0) {
-				asyncHolders--;
+			const id = readPayloadId(payload);
+			if (id !== undefined) {
+				// An id that is no longer tracked means a duplicate/unknown completion:
+				// never fall through to releasing a different run on its behalf.
+				if (!asyncRuns.delete(id)) {
+					console.log(`[subagent-gate] async-complete for unknown run ${id} — ignored`);
+				}
+				return;
+			}
+			// No id to match on: release the oldest run still pending.
+			const oldest = asyncRuns.keys().next();
+			if (!oldest.done) {
+				asyncRuns.delete(oldest.value);
 			} else {
 				console.log("[subagent-gate] async-complete with nothing held — ignored");
 			}
+		},
+
+		sweepStaleAsync(maxAgeMs: number = STALE_ASYNC_WORK_TIMEOUT_MS): string[] {
+			const cutoff = now() - maxAgeMs;
+			const released: string[] = [];
+			for (const [id, run] of asyncRuns) {
+				if (run.startedAt <= cutoff) {
+					asyncRuns.delete(id);
+					released.push(id);
+				}
+			}
+			for (const id of released) {
+				console.log(
+					`[subagent-gate] Stale async work ${id} timed out after ${Math.round(maxAgeMs / 1000)}s — releasing gate`
+				);
+			}
+			return released;
 		},
 
 		blockReason() {
