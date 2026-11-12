@@ -28,6 +28,17 @@ cp start-bot.sh.example start-bot.sh  # Edit paths in start-bot.sh
 launchctl load ~/Library/LaunchAgents/com.pi-discord.plist
 ```
 
+## Deployment via systemd (Linux)
+
+On Linux the bot runs as a `pi-discord.service` systemd unit, as a non-root user,
+with runtime state in `~/.pi-discord/` rather than in the checkout. The checkout is
+**pull-only** (public HTTPS remote, no credentials stored on the host), so updates
+are pushed from a development machine and applied by fetching on the host.
+
+See [Deployment (Linux systemd)](README.md#deployment-linux-systemd) for the unit
+body, the required `ExecStart` / `PATH` / `--env-file-if-exists` and `Environment=`
+gotchas, and the update procedure.
+
 ## Environment Variables
 
 | Variable | Required | Description |

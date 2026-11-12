@@ -167,6 +167,78 @@ enabling the one-time macOS permission prompt (click **Allow** on the
 > the signature and silently breaks calendar access again. Re-run
 > `./scripts/re-sign-node.sh` after every Node update.
 
+## Deployment (Linux systemd)
+
+Run the bot as a systemd service so it comes back after a crash or reboot. Two
+shapes work — pick whichever matches how the host is administered:
+
+- **System unit** — install to `/etc/systemd/system/pi-discord.service` with
+  `User=<user>`, then `sudo systemctl restart pi-discord`.
+- **User unit** — install to `~/.config/systemd/user/pi-discord.service`, then
+  `systemctl --user restart pi-discord`. Needs `loginctl enable-linger <user>`,
+  otherwise it only runs while that user is logged in.
+
+Minimal unit body:
+
+```ini
+[Unit]
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+WorkingDirectory=/home/<user>/Projects/pi-discord
+ExecStart=<node-bin> --env-file-if-exists=.env src/index.ts
+Environment=PATH=<mise-shims>:<pi-bin>:/usr/local/bin:/usr/bin:/bin
+Environment=PI_DISCORD_BOT=1
+Environment=PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT=<pi-coding-agent-root>
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+> **User unit:** drop `User=<user>` (the user manager ignores it) and set
+> `WantedBy=default.target`. A `multi-user.target` unit enabled with
+> `systemctl --user` is linked into a target the user manager never reaches, so it
+> silently never starts at boot.
+
+### Unit gotchas
+
+- **`ExecStart` must use an absolute node path, not `node`.** systemd's PATH does
+  not include the mise shims dir, and the shim resolves its version from the
+  checkout's `.mise.toml` — so this path has to track that pin.
+- **`--env-file-if-exists=.env` is required.** `src/index.ts` reads
+  `process.env.DISCORD_BOT_TOKEN` directly with no dotenv; without the flag the
+  process exits 1 with "DISCORD_BOT_TOKEN environment variable is required".
+- **`PATH` must still contain the mise shims and the `pi` bin dir**, even though
+  `ExecStart` is absolute: the bot spawns child agent processes that shell out to
+  `node`, `npm`, and `git`.
+- **`PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` must be set** to the absolute path
+  of the local `@earendil-works/pi-coding-agent` install. pi-subagents cannot
+  infer it from `argv[1]` in an embedded-SDK process, and otherwise fails every
+  delegation with `ERR_MODULE_NOT_FOUND`.
+- **Set `PI_DISCORD_BOT=1`** so a global `parent-tools-lockdown` extension, if one
+  is installed, skips this process — the bot locks its own parent tool set in code.
+- Runtime state (`sessions/`, plus per-feature state such as `email-state.json`)
+  lives in `~/.pi-discord/`, outside the checkout, so redeploys never touch it.
+
+### Deploying updates
+
+The server checkout is **pull-only**:
+
+```bash
+cd ~/Projects/pi-discord
+git pull --ff-only
+sudo systemctl restart pi-discord   # or: systemctl --user restart pi-discord
+```
+
+`origin` is the public HTTPS URL, so the host needs no SSH key and stores no
+credentials. Anonymous HTTPS is read-only by design — push from a development
+machine, not from the server.
+
 ## Architecture
 
 ```
