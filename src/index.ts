@@ -38,6 +38,7 @@ import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
 import { createPendingMessageStore, PENDING_MESSAGES_FILE } from "./pending-messages.ts";
 import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.ts";
 import { TypingManager, type TypingChannel } from "./typing-manager.ts";
+import { createTypingState, decideTyping, type TypingEvent, type TypingState } from "./typing-policy.ts";
 import { generateTokenStatsMessage } from "./token-stats.ts";
 import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { generateSummary, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
@@ -120,6 +121,57 @@ if (!discordToken) {
 let discordClient: Client | null = null;
 const sessionStore = createSessionStore({ sessionDir, debug });
 const typingManager = new TypingManager();
+
+// ============================================================================
+// Typing indicator policy wiring
+// ============================================================================
+/**
+ * Per-channel typing state, so the indicator means "the main agent is working"
+ * rather than "a turn exists". See src/typing-policy.ts for the decision table.
+ */
+const typingStates = new Map<string, TypingState>();
+const typingHideTimers = new Map<string, NodeJS.Timeout>();
+
+function clearPendingTypingHide(channelId: string): void {
+	const timer = typingHideTimers.get(channelId);
+	if (!timer) return;
+	clearTimeout(timer);
+	typingHideTimers.delete(channelId);
+}
+
+/** Applies one typing-relevant event and the visibility it implies. */
+function applyTypingEvent(channelId: string, event: TypingEvent): void {
+	const previous = typingStates.get(channelId) ?? createTypingState();
+	const decision = decideTyping(previous, event);
+
+	clearPendingTypingHide(channelId);
+	if (decision.hideAfterMs !== undefined) {
+		const timer = setTimeout(() => {
+			typingHideTimers.delete(channelId);
+			const state = typingStates.get(channelId);
+			if (!state) return;
+			state.visible = false;
+			state.hidePending = false;
+			typingManager.hide(channelId);
+		}, decision.hideAfterMs);
+		timer.unref?.();
+		typingHideTimers.set(channelId, timer);
+	}
+
+	typingStates.set(channelId, decision.state);
+	if (decision.action === "show") {
+		typingManager.show(channelId, createTypingChannel(channelId));
+	} else if (decision.action === "hide") {
+		typingManager.hide(channelId);
+	}
+}
+
+/** Drops per-channel typing state (session recreated, shutdown). */
+function resetTypingState(channelId: string): void {
+	clearPendingTypingHide(channelId);
+	typingStates.delete(channelId);
+}
+
 
 // ============================================================================
 // Process resilience — scheduled prompts must survive process death
@@ -1167,6 +1219,7 @@ async function finishChannelTurn(
 	terminalMessageAt.delete(channelId);
 	// Agent turn fully finished — stop typing until the next user message
 	// or queued prompt starts a new turn (agent_start re-shows it).
+	resetTypingState(channelId);
 	typing.hide(channelId);
 
 	// Token utilization alert (catches the final response if message_end did not fire)
@@ -1266,8 +1319,8 @@ function subscribeToSession(
 				// A new turn cannot inherit a tool from the previous one.
 				inFlightToolCounts.delete(channelId);
 				responseBuffer.length = 0;
-				// LLM is processing - show typing indicator
-				typingManager.show(channelId, typingChannel);
+				// Main agent is working again: a turn starts here.
+				applyTypingEvent(channelId, { type: "turn_start" });
 				break;
 
 			case "message_start":
@@ -1290,8 +1343,8 @@ function subscribeToSession(
 					// Increment session index for this new assistant message
 					const currentIdx = (sessionMessageIndex.get(channelId) ?? 0) + 1;
 					sessionMessageIndex.set(channelId, currentIdx);
-					// LLM is generating response - show typing indicator
-					typingManager.show(channelId, typingChannel);
+					// The main agent is writing this message.
+					applyTypingEvent(channelId, { type: "generating" });
 				}
 				break;
 
@@ -1301,11 +1354,13 @@ function subscribeToSession(
 				if (assistantEvent?.type === "text_delta") {
 					log(`[${channelId}] text_delta: "${assistantEvent.delta}" (${assistantEvent.delta?.length || 0} chars)`);
 					responseBuffer.push(assistantEvent.delta);
+					// Streaming text is main-agent generation (never a subagent's output).
+					applyTypingEvent(channelId, { type: "generating" });
 				}
 				if (assistantEvent?.type === "thinking_delta") {
 					log(`[${channelId}] thinking_delta: "${assistantEvent.delta}"`);
 					// Show typing indicator when thinking starts
-					typingManager.show(channelId, typingChannel);
+					applyTypingEvent(channelId, { type: "generating" });
 					thinkingBuffer.push(assistantEvent.delta);
 					// Only send when thinking is complete (on message_end) to avoid spam
 				}
@@ -1368,21 +1423,22 @@ function subscribeToSession(
 					sessionMessageIndex.set(channelId, currentIdx);
 					sendToDiscord(channel, `🔧 Running \`${event.toolName}\`\n\`\`\`json\n${args}\n\`\`\``, { trackInSession: true, type: "tool" }).catch(() => {});
 				}
-				// Keep typing indicator visible during tool execution
-				typingManager.show(channelId, typingChannel);
+				// The main agent is now blocked on this tool (including a subagent call):
+				// hide the indicator, after the anti-flicker grace for fast tools.
+				applyTypingEvent(channelId, { type: "tool_start" });
 				break;
 			}
 
 			case "tool_execution_update":
-				// Streaming tool output — keep typing alive for long-running tools
-				typingManager.show(channelId, typingChannel);
+				// Tool/subagent output is NOT main-agent work: it must not re-enable typing.
+				applyTypingEvent(channelId, { type: "tool_activity" });
 				break;
 
 			case "tool_execution_end":
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
 				inFlightToolCounts.set(channelId, Math.max(0, (inFlightToolCounts.get(channelId) ?? 0) - 1));
 				// Turn continues after the tool (more LLM calls may follow)
-				typingManager.show(channelId, typingChannel);
+				applyTypingEvent(channelId, { type: "tool_end" });
 				const outputSettings = getOutputSettings(channelId);
 				if (event.isError) {
 					if (!outputSettings.hideTools) {
@@ -1416,7 +1472,8 @@ function subscribeToSession(
 				break;
 
 			case "compaction_start":
-				typingManager.show(channelId, typingChannel);
+				// Summarizing is main-agent work, not delegation.
+				applyTypingEvent(channelId, { type: "generating" });
 				log(`[${channelId}] Compacting context...`);
 				sendToDiscord(channel, "📦 Compacting context...").catch(() => {});
 				break;
@@ -1425,7 +1482,7 @@ function subscribeToSession(
 				if (!event.willRetry) {
 					// Terminal compaction (threshold cleanup, or overflow recovery that
 					// won't retry): the turn is done. The next agent_start re-shows.
-					typingManager.hide(channelId);
+					applyTypingEvent(channelId, { type: "turn_end" });
 				}
 				// Overflow compaction with willRetry continues via agent.continue() —
 				// keep typing visible through the retry.
@@ -1433,7 +1490,8 @@ function subscribeToSession(
 				break;
 
 			case "auto_retry_start":
-				typingManager.show(channelId, typingChannel);
+				// Backoff belongs to the main agent's own turn, not to delegation.
+				applyTypingEvent(channelId, { type: "generating" });
 				log(`[${channelId}] Retrying (attempt ${event.attempt}/${event.maxAttempts}). Error message: ${event.errorMessage}`);
 				if (isNonRetryableModelError(event.errorMessage)) {
 					// Retrying cannot fix a 402/401/400/context-overflow: cancel the backoff
@@ -1442,7 +1500,7 @@ function subscribeToSession(
 					// no-op until the next tick.
 					log(`[${channelId}] Non-retryable model error - cancelling retries`);
 					setTimeout(() => session.abortRetry(), 0);
-					typingManager.hide(channelId);
+					applyTypingEvent(channelId, { type: "turn_end" });
 					sendToDiscord(
 						channel,
 						`⛔ **Not retrying** — this error cannot succeed on retry.\n\`\`\`\n${escapeForCodeBlock(event.errorMessage)}\n\`\`\`\n${retryHintForModelError(event.errorMessage)}`
@@ -1455,10 +1513,10 @@ function subscribeToSession(
 			case "auto_retry_end":
 				if (event.success) {
 					// Retry succeeded — the turn continues with more LLM calls/tools.
-					typingManager.show(channelId, typingChannel);
+					applyTypingEvent(channelId, { type: "generating" });
 				} else {
 					// Retries exhausted — the turn is over.
-					typingManager.hide(channelId);
+					applyTypingEvent(channelId, { type: "turn_end" });
 				}
 				log(`[${channelId}] Retry ${event.success ? "succeeded" : "failed"}`);
         if (!event.success) {
@@ -2803,7 +2861,7 @@ async function main() {
 		sessionStore.dispose(channelId);
 		// The wedged turn never reached its agent_end cleanup, so its typing
 		// indicator would otherwise keep pulsing until Discord's own timeout.
-		typingManager.hide(channelId);
+		applyTypingEvent(channelId, { type: "turn_end" });
 		// Drop every per-channel binding to the dead session, or the re-subscribe
 		// below makes every agent event fire twice (the duplicate-output hazard
 		// subscribeToSession() cannot dedup by itself).
@@ -2914,7 +2972,7 @@ async function main() {
 		// they actually trigger work.
 		const messageContent = message.content?.trim() ?? "";
 		if (!messageContent.startsWith("/") && !messageContent.startsWith("!")) {
-			typingManager.show(channelId, createTypingChannel(channelId));
+			applyTypingEvent(channelId, { type: "turn_start" });
 		}
 
 		sessionStore.setChannelName(channelId, channelName);
@@ -3003,7 +3061,7 @@ async function main() {
 						reason: "recovery-failed",
 					});
 				}
-				typingManager.hide(channelId);
+				applyTypingEvent(channelId, { type: "turn_end" });
 				await sendToDiscord(
 					channel as DMChannel | TextChannel | NewsChannel,
 					"⚠️ Session recovery failed - your message is queued and will be retried."
@@ -3185,7 +3243,7 @@ async function main() {
 		}
 
 		if (message.content === "/stop") {
-			typingManager.hide(channelId);
+			applyTypingEvent(channelId, { type: "turn_end" });
 			return;
 		}
 
@@ -3202,7 +3260,7 @@ async function main() {
 			}
 
 			log(`[${channelId}] Executing bash command: ${command}`);
-			typingManager.show(channelId, createTypingChannel(channelId));
+			applyTypingEvent(channelId, { type: "turn_start" });
 
 			try {
 				const output: string[] = [];
@@ -3224,8 +3282,8 @@ async function main() {
 				const errorMessage = `❌ Bash error: ${truncatedError}`;
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, errorMessage);
 			} finally {
-				// Bash execution doesn't emit agent events — hide typing explicitly.
-				typingManager.hide(channelId);
+				// Bash execution doesn't emit agent events — end the turn explicitly.
+				applyTypingEvent(channelId, { type: "turn_end" });
 			}
 			return;
 		}
@@ -3759,8 +3817,9 @@ async function main() {
 				return;
 			}
 			try {
-				// Show typing during the (potentially slow) summarization LLM call
-				typingManager.show(channelId, createTypingChannel(channelId));
+				// Typing during the (potentially slow) summarization LLM call: this is
+				// main-agent work, not delegation.
+				applyTypingEvent(channelId, { type: "generating" });
 
 				// 1) Stop anything still running (the agent may be mid-turn since
 				//    /compact is a non-interrupting command).
@@ -3884,7 +3943,7 @@ async function main() {
 					`✅ **Session compacted** — started a fresh session seeded with a summary of the previous one (~${totalTokens.toLocaleString()} tokens of history → summary).\n\nUse \`/resume ${oldSessionId}\` to go back to the original session.`);
 			} catch (error) {
 				console.error(`[${channelId}] /compact error:`, error);
-				typingManager.hide(channelId);
+				applyTypingEvent(channelId, { type: "turn_end" });
 				await sendToDiscord(channel as DMChannel | TextChannel | NewsChannel,
 					`❌ Compaction failed:\n${escapeForCodeBlock(String(error))}`);
 			}
@@ -3961,10 +4020,9 @@ async function main() {
 					}
 				});
 			}
-			// Ensure typing is active for the whole agent turn (covers slash commands
-			// that fell through to the agent, e.g. unknown commands or spaced-out
-			// commands, and re-asserts after the pre-processing above).
-			typingManager.show(channelId, createTypingChannel(channelId));
+			// Ensure typing reflects an active turn (covers slash commands that fell
+			// through to the agent, e.g. unknown or spaced-out commands).
+			applyTypingEvent(channelId, { type: "turn_start" });
 			// Park a durable copy before handing the message to the SDK whenever the
 			// session still reports activity after the bounded abort wait (a wedged
 			// agent_end drain, or a tool that ignores its abort signal). A followUp
@@ -4025,7 +4083,7 @@ async function main() {
 			console.error(`[${channelId}] Error sending message:`, error);
 			// The turn died without agent_end — stop typing so the user knows
 			// nothing is running anymore.
-			typingManager.hide(channelId);
+			applyTypingEvent(channelId, { type: "turn_end" });
 			// The usual cause is a run that never settled: the SDK rejects a new
 			// prompt with "Agent is already processing" while the old run is still
 			// streaming. Park the text so replayPendingMessages() and the 60s sweep
@@ -4069,7 +4127,11 @@ async function main() {
 			log(`${parkedCount} parked user message(s) stay on disk and will be replayed on startup`);
 		}
 
-		// Dispose typing manager (stops all typing indicators)
+		// Dispose typing manager (stops all typing indicators) and drop the
+		// per-channel typing state so a restart cannot resume a stale one.
+		for (const typingChannelId of [...typingStates.keys()]) {
+			resetTypingState(typingChannelId);
+		}
 		typingManager.dispose();
 
 		// Dispose all sessions (saves index)
@@ -4181,7 +4243,7 @@ async function main() {
 						} else {
 							// No channel to stream a queued prompt into, so the queue waits for
 							// the next message instead of being sent into the void.
-							typingManager.hide(chId);
+							applyTypingEvent(chId, { type: "turn_end" });
 							terminalMessageAt.delete(chId);
 						}
 					}
