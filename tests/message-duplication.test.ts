@@ -637,6 +637,60 @@ describe("Stale-run recovery vs replay ordering", () => {
             return replayed;
         }
 
+        // ------------------------------------------------------------------
+        // Replay delivery semantics (live incident 2026-11-14)
+        // ------------------------------------------------------------------
+        // The SDK's sendUserMessage() resolves only when the whole turn settles
+        // (sendUserMessage -> prompt -> the run's finally). The replayed turn was
+        // delivered and answered, yet the entry stayed on disk because the await
+        // never returned; the next restart replayed it again. So delivery, not turn
+        // completion, decides removal, and delivery is observed on the user
+        // message_start event.
+        let turnWedges = false;
+        let sendRejects = false;
+        let deliveryObserved = true;
+        let replayInFlight = false;
+        const REPLAY_TIMEOUT_MS = 20;
+
+        type ReplayOutcome = "delivered" | "settled" | "rejected" | "timeout";
+
+        // Mirrors one iteration of the fixed replay loop: race the send promise
+        // against the delivery event, so a wedged turn cannot keep an already
+        // delivered message parked.
+        function deliverOnce(text: string): Promise<ReplayOutcome> {
+            if (sendRejects) return Promise.resolve("rejected");
+            delivered.push(text);
+            const sendSettled: Promise<ReplayOutcome> = turnWedges
+                ? new Promise<ReplayOutcome>(() => {})
+                : Promise.resolve("settled");
+            const deliveryEvent: Promise<ReplayOutcome> = deliveryObserved
+                ? Promise.resolve("delivered")
+                : new Promise<ReplayOutcome>((resolve) => setTimeout(() => resolve("timeout"), REPLAY_TIMEOUT_MS));
+            return Promise.race([sendSettled, deliveryEvent]);
+        }
+
+        // Mirrors replayPendingMessages() with the delivery-tied accounting. The
+        // in-flight guard stands in for replaysInFlight.
+        async function replayAsync(): Promise<number> {
+            const parked = store.forChannel(CHANNEL);
+            if (parked.length === 0) return 0;
+            if (replayInFlight) return 0;
+            replayInFlight = true;
+            try {
+                let replayed = 0;
+                for (const entry of parked) {
+                    if (session.isModelActive()) break;
+                    const outcome = await deliverOnce(entry.content);
+                    if (outcome === "rejected" || outcome === "timeout") break;
+                    store.remove(CHANNEL, entry.discordMessageId);
+                    replayed++;
+                }
+                return replayed;
+            } finally {
+                replayInFlight = false;
+            }
+        }
+
         function shouldRecover(): boolean {
             return shouldRecoverStuckRun({
                 modelActive: session.isModelActive(),
@@ -757,6 +811,10 @@ describe("Stale-run recovery vs replay ordering", () => {
             recoveries: () => recoveries,
             recoveryWaits: () => recoveryWaits,
             markFreshActivity: () => { lastEventAt = Date.now(); },
+            replayAsync,
+            wedgeTurn: () => { turnWedges = true; },
+            rejectNextSend: () => { sendRejects = true; },
+            hideDelivery: () => { deliveryObserved = false; },
         };
     }
 
@@ -795,6 +853,94 @@ describe("Stale-run recovery vs replay ordering", () => {
         expect(rig.aborts()).toBe(0);
         expect(rig.delivered).toEqual([]);
         expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-1"]);
+    });
+
+    // ============================================================================
+    // A replayed message is done once it is DELIVERED, not once the turn settles
+    // ============================================================================
+    //
+    // Live incident 2026-11-14: the replay logged
+    //   "Replaying queued message 1571248765061566615: on friday it didn't fire either"
+    // and the turn was answered, but no "[pending-messages] Delivered" line was
+    // ever emitted and both entries were still on disk hours later - so the next
+    // restart replayed an already-answered message. The send promise only resolves
+    // when the run settles, and a settle can be wedged after the final message.
+
+    describe("replay accounting follows delivery, not the turn promise", () => {
+        it("removes the entry when delivery lands while the turn never settles", async () => {
+            const rig = createRig();
+            rig.park();
+            // The sweep always recovers before it replays, so the replay sees a free
+            // session (see the ordering tests above).
+            rig.recover();
+            rig.wedgeTurn();
+
+            expect(await rig.replayAsync()).toBe(1);
+
+            expect(rig.delivered).toEqual(["any progress?"]);
+            expect(rig.store.size()).toBe(0);
+
+            // A later sweep (or a restart) has nothing left to replay: that is the
+            // duplicate this test exists to prevent.
+            expect(await rig.replayAsync()).toBe(0);
+            expect(rig.delivered).toEqual(["any progress?"]);
+        });
+
+        it("keeps the entry parked when the send is rejected", async () => {
+            const rig = createRig();
+            rig.park();
+            rig.recover();
+            rig.rejectNextSend();
+
+            expect(await rig.replayAsync()).toBe(0);
+
+            expect(rig.delivered).toEqual([]);
+            expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-1"]);
+        });
+
+        it("keeps the entry parked when delivery is never confirmed", async () => {
+            const rig = createRig();
+            rig.park();
+            rig.recover();
+            rig.wedgeTurn();
+            rig.hideDelivery();
+
+            expect(await rig.replayAsync()).toBe(0);
+
+            // Delivered text stays on disk until the session confirms it, so a
+            // missing confirmation can never silently drop a message.
+            expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-1"]);
+        });
+
+        it("delivers once when two replays overlap", async () => {
+            const rig = createRig();
+            rig.park();
+            rig.recover();
+            rig.wedgeTurn();
+
+            const [first, second] = await Promise.all([rig.replayAsync(), rig.replayAsync()]);
+
+            expect(first + second).toBe(1);
+            expect(rig.delivered).toEqual(["any progress?"]);
+            expect(rig.store.size()).toBe(0);
+        });
+
+        it("keeps two parked messages in order and stops when the session goes busy", async () => {
+            const rig = createRig();
+            rig.park();
+            rig.recover();
+            rig.store.add({
+                channelId: CHANNEL,
+                discordMessageId: "m-2",
+                content: "and?",
+                queuedAt: 1_700_000_100_000,
+                reason: "run-still-active",
+            });
+
+            expect(await rig.replayAsync()).toBe(2);
+            expect(rig.delivered).toEqual(["any progress?", "and?"]);
+            expect(rig.store.size()).toBe(0);
+        });
     });
 
     // ============================================================================

@@ -614,7 +614,7 @@ function restoreScheduledSessions(): void {
  */
 function startSessionKeeper(deps: {
 	subscribedSessions: Set<string>;
-	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>;
+	sessionSubscriptions: Map<string, SessionSubscription>;
 	/** Channels currently being rebuilt by the stale-run watchdog. */
 	recoveringChannels: Set<string>;
 }): void {
@@ -1227,6 +1227,20 @@ async function finishChannelTurn(
 	}
 }
 
+/**
+ * What the message handler and the parked-message replay need from a subscription.
+ *
+ * `waitForUserMessageDelivered` is what makes a replay observable: the SDK's
+ * sendUserMessage() resolves only once the whole turn settles, and the turn a
+ * replay exists for is the wedged one that never settles. Delivery is therefore
+ * observed on the user `message_start` event instead.
+ */
+interface SessionSubscription {
+	setPendingDiscordMessageId: (id: string, isReply: boolean) => void;
+	/** Resolves true when that Discord message is appended as a user message. */
+	waitForUserMessageDelivered: (discordMessageId: string, timeoutMs: number) => Promise<boolean>;
+}
+
 function subscribeToSession(
 	session: AgentSession,
 	channelId: string,
@@ -1234,7 +1248,7 @@ function subscribeToSession(
 	typingManager: TypingManager,
 	sessionDir: string,
 	getOutputSettings: (channelId: string) => ChannelOutputSettings
-): { setPendingDiscordMessageId: (id: string, isReply: boolean) => void } {
+): SessionSubscription {
 	const typingChannel = createTypingChannel(channelId);
 	const responseBuffer: string[] = [];
 	const thinkingBuffer: string[] = [];
@@ -1243,6 +1257,16 @@ function subscribeToSession(
 	let lastMessageIsReply = false;
 	let pendingDiscordMsgId: string | undefined;
 	let pendingIsReply = false;
+	/** Replay waiters, keyed by Discord message id, woken on the user message_start. */
+	const deliveryWaiters = new Map<string, Set<(delivered: boolean) => void>>();
+
+	/** Wakes a parked-message replay as soon as its text reaches the session. */
+	function notifyUserMessageDelivered(discordMessageId: string): void {
+		const waiters = deliveryWaiters.get(discordMessageId);
+		if (!waiters) return;
+		deliveryWaiters.delete(discordMessageId);
+		for (const finish of [...waiters]) finish(true);
+	}
 	// Captured at agent_end (synchronous, all messages appended) for use in .then()
 	let capturedAssistantEntryId: string | null = null;
 
@@ -1283,6 +1307,7 @@ function subscribeToSession(
 					// background work). See src/pending-messages.ts.
 					if (lastDiscordMessageId) {
 						pendingMessages.remove(channelId, lastDiscordMessageId);
+						notifyUserMessageDelivered(lastDiscordMessageId);
 					}
 					log(`[${channelId}] User message started, discordMsg=${lastDiscordMessageId}, isReply=${lastMessageIsReply}`);
 				} else if (event.message.role === "assistant") {
@@ -1475,6 +1500,24 @@ function subscribeToSession(
 			pendingDiscordMsgId = id;
 			pendingIsReply = isReply;
 		},
+		waitForUserMessageDelivered: (discordMessageId: string, timeoutMs: number) =>
+			new Promise<boolean>((resolve) => {
+				const waiters = deliveryWaiters.get(discordMessageId) ?? new Set<(delivered: boolean) => void>();
+				deliveryWaiters.set(discordMessageId, waiters);
+				let settled = false;
+				const finish = (delivered: boolean) => {
+					if (settled) return;
+					settled = true;
+					waiters.delete(finish);
+					if (waiters.size === 0) deliveryWaiters.delete(discordMessageId);
+					clearTimeout(timer);
+					resolve(delivered);
+				};
+				const timer = setTimeout(() => finish(false), timeoutMs);
+				// A pending waiter must not keep the process alive during shutdown.
+				timer.unref?.();
+				waiters.add(finish);
+			}),
 	};
 }
 
@@ -2106,7 +2149,7 @@ async function main() {
 	// Message Processing
 	// =========================================================================
 	const subscribedSessions = new Set<string>();
-	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>();
+	const sessionSubscriptions = new Map<string, SessionSubscription>();
 	/** Channels with a parked-message replay in flight (guards the 60s sweep). */
 	const replaysInFlight = new Set<string>();
 	/**
@@ -2186,6 +2229,12 @@ async function main() {
 	}
 
 	/**
+	 * How long a replay waits for the delivered user message to surface before it
+	 * leaves the durable copy parked for a later sweep.
+	 */
+	const REPLAY_DELIVERY_TIMEOUT_MS = 30_000;
+
+	/**
 	 * Re-send messages parked while the channel was draining background subagent
 	 * work (see src/pending-messages.ts) now that the blocking run is gone.
 	 *
@@ -2211,6 +2260,27 @@ async function main() {
 
 		replaysInFlight.add(channelId);
 		try {
+			// A replay without a subscription is invisible: the user message never
+			// surfaces as an event, so delivery cannot be observed and the answer would
+			// post nowhere. Subscribe first, exactly as handleMessage() does.
+			if (!sessionSubscriptions.has(channelId) && !subscribedSessions.has(channelId)) {
+				const replayChannel = await fetchChannelObject(channelId);
+				if (replayChannel) {
+					sessionSubscriptions.set(
+						channelId,
+						subscribeToSession(
+							discordSession.session,
+							channelId,
+							replayChannel,
+							typingManager,
+							sessionDir,
+							getChannelOutputSettings
+						)
+					);
+					subscribedSessions.add(channelId);
+					log(`[${channelId}] Replay: subscribed to the session so delivery can be observed`);
+				}
+			}
 			if (discordSession.isModelActive()) {
 				// Parked messages are re-delivered for a run that swallowed them, but an
 				// active run is not by itself proof of a wedge: a long bash tool or a sync
@@ -2253,14 +2323,47 @@ async function main() {
 					break;
 				}
 				log(`[${channelId}] Replaying queued message ${entry.discordMessageId}: ${entry.content.slice(0, 50)}`);
-				try {
-					sessionSubscriptions.get(channelId)?.setPendingDiscordMessageId(entry.discordMessageId, false);
-					await discordSession.session.sendUserMessage(entry.content);
-					pendingMessages.remove(channelId, entry.discordMessageId);
-					replayed++;
-				} catch (error) {
-					log(`[${channelId}] Replay failed for ${entry.discordMessageId} (stays parked): ${error}`);
+				// Delivery, not turn completion, decides whether the entry is done. The SDK's
+				// sendUserMessage() resolves only when the whole run settles
+				// (sendUserMessage -> prompt -> the run's finally), and a run can wedge
+				// AFTER its final assistant message - the exact failure this replay exists
+				// for. Awaiting it left an already-delivered message parked forever: seen
+				// live as "Replaying queued message <id>" with no matching
+				// "[pending-messages] Delivered queued message <id>", still on disk, and
+				// replayed a second time after the next restart.
+				const subscription = sessionSubscriptions.get(channelId);
+				subscription?.setPendingDiscordMessageId(entry.discordMessageId, false);
+				const sendOutcome = discordSession.session.sendUserMessage(entry.content).then(
+					() => ({ kind: "settled" as const }),
+					(error: unknown) => ({ kind: "rejected" as const, error })
+				);
+				const delivered = subscription?.waitForUserMessageDelivered(
+					entry.discordMessageId,
+					REPLAY_DELIVERY_TIMEOUT_MS
+				);
+				const outcome = await Promise.race([
+					sendOutcome,
+					...(delivered ? [delivered.then((ok) => ({ kind: "delivered" as const, ok }))] : []),
+				]);
+
+				if (outcome.kind === "rejected") {
+					// Nothing was queued: leave it parked and stop this sweep so a failing
+					// session is not hammered with the rest of the backlog.
+					log(`[${channelId}] Replay failed for ${entry.discordMessageId} (stays parked): ${outcome.error}`);
+					break;
 				}
+				if (outcome.kind === "delivered" && !outcome.ok) {
+					// No delivery event within the window and the run never settled either.
+					// Keep the durable copy: a later sweep retries once the session is free.
+					log(
+						`[${channelId}] Replay: ${entry.discordMessageId} not confirmed delivered within ` +
+							`${REPLAY_DELIVERY_TIMEOUT_MS}ms - stays parked`
+					);
+					break;
+				}
+
+				pendingMessages.remove(channelId, entry.discordMessageId);
+				replayed++;
 			}
 			return replayed;
 		} finally {
