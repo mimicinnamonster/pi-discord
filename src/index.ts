@@ -38,6 +38,7 @@ import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
 import { createPendingMessageStore, PENDING_MESSAGES_FILE } from "./pending-messages.ts";
 import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.ts";
 import { TypingManager, type TypingChannel } from "./typing-manager.ts";
+import { ChannelSendQueue } from "./send-queue.ts";
 import { createTypingState, decideTyping, type TypingEvent, type TypingState } from "./typing-policy.ts";
 import { generateTokenStatsMessage } from "./token-stats.ts";
 import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
@@ -121,6 +122,13 @@ if (!discordToken) {
 let discordClient: Client | null = null;
 const sessionStore = createSessionStore({ sessionDir, debug });
 const typingManager = new TypingManager();
+/**
+ * Every post goes through this queue, in enqueue order, one whole message at a
+ * time. Discord does not order concurrent REST calls, and our sends are all
+ * event-driven, so without it a slow reply is overtaken by a later tool line.
+ * See src/send-queue.ts.
+ */
+const sendQueue = new ChannelSendQueue((message) => log(message));
 
 // ============================================================================
 // Typing indicator policy wiring
@@ -1049,6 +1057,10 @@ function getContentExtension(text: string, type?: string): string {
 
 /**
  * Upload text content as a Discord attachment file.
+ *
+ * One attempt only: the retry budget belongs to the REST client (`rest.timeout` ×
+ * `rest.retries`), and a failed upload falls back to chunked text instead of
+ * holding the channel for another full budget.
  */
 async function uploadAsFile(
 	channel: DMChannel | TextChannel | NewsChannel,
@@ -1100,7 +1112,15 @@ function updatePreviousTokens(
 	});
 }
 
-async function sendToDiscord(
+/**
+ * Sends one logical message immediately: upload-as-file above the threshold,
+ * otherwise sequential chunks.
+ *
+ * Callers must go through `sendToDiscord` (the ordered wrapper below); this
+ * function neither orders itself against other sends nor guards against
+ * interleaving, which is exactly what the queue exists to prevent.
+ */
+async function sendToDiscordNow(
 	channel: DMChannel | TextChannel | NewsChannel,
 	text: string,
 	options?: { trackInSession?: boolean; type?: string; replyToMessageId?: string }
@@ -1167,6 +1187,24 @@ async function sendToDiscord(
 
 	return sentMessages;
 }
+
+/**
+ * The single entry point for posting to a channel.
+ *
+ * Each logical message is serialised per channel, so the order in which events
+ * enqueue output is the order the channel displays it — including chunks of one
+ * message, which can no longer be split by a later send.
+ */
+async function sendToDiscord(
+	channel: DMChannel | TextChannel | NewsChannel,
+	text: string,
+	options?: { trackInSession?: boolean; type?: string; replyToMessageId?: string }
+): Promise<Message[]> {
+	return sendQueue.enqueue(channel.id, () => sendToDiscordNow(channel, text, options), {
+		droppedResult: [],
+		label: options?.type ?? "message",
+	});
+} 
 
 /**
  * Direct fetch to Discord typing endpoint — bypasses Discord.js's sendTyping()
@@ -1563,7 +1601,12 @@ async function main() {
 	// =========================================================================
 	// Initialize Discord Client
 	// =========================================================================
+	// Discord's default REST budget is 15s × (3 retries + 1) = 60s per call, and a
+	// >2000-char reply that falls back from the upload path pays that twice while
+	// the channel waits. 10s × (2 + 1) = 30s worst case keeps the fallback prompt
+	// without giving up retry resilience. See uploadAsFile().
 	discordClient = new Client({
+		rest: { timeout: 10_000, retries: 2 },
 		intents: [
 			GatewayIntentBits.Guilds,
 			GatewayIntentBits.GuildMessages,
@@ -2858,6 +2901,11 @@ async function main() {
 		// console.warn, not log(): log() is gated on DISCORD_DEBUG, and a session
 		// teardown on a live channel must be visible in the journal.
 		console.warn(`[watchdog] ${channelId} idle ${idleSeconds}s, abort did not settle - recreating session`);
+		// Output already accepted for this channel is flushed before the rebuild, so
+		// the pre-recovery turn's last lines still land in order instead of racing
+		// the recreated session's first output. Bounded: a stuck send is abandoned
+		// rather than blocking recovery.
+		await sendQueue.release(channelId, 10_000);
 		sessionStore.dispose(channelId);
 		// The wedged turn never reached its agent_end cleanup, so its typing
 		// indicator would otherwise keep pulsing until Discord's own timeout.
@@ -4136,6 +4184,11 @@ async function main() {
 
 		// Dispose all sessions (saves index)
 		sessionStore.disposeAll();
+
+		// Flush queued output before the socket dies, so a reply already accepted
+		// for sending is not lost mid-restart. Bounded: a stuck send must not block
+		// shutdown past the unit's TimeoutStopSec.
+		await sendQueue.releaseAll(10_000);
 
 		// Destroy Discord client
 		discordClient?.destroy();
