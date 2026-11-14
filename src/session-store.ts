@@ -24,6 +24,7 @@ import {
 	SUBAGENT_ASYNC_STARTED_EVENT,
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
 	createSubagentGate,
+	type PendingAsyncRun,
 	type SubagentGate,
 } from "./subagent-gate.ts";
 
@@ -226,6 +227,28 @@ export class DiscordSession {
 	 */
 	hasActiveSubagentWork(): boolean {
 		return subagentGates.get(this.channelId)?.hasActiveWork() ?? false;
+	}
+
+	/**
+	 * True while a sync subagent tool call is executing in this channel.
+	 *
+	 * This is the half of the gate the watchdog may trust on its own: a sync child
+	 * is a live process, so its silence is work by construction.
+	 */
+	hasSyncSubagentWork(): boolean {
+		return subagentGates.get(this.channelId)?.hasSyncWork() ?? false;
+	}
+
+	/**
+	 * Async runs the gate still counts, for cross-checking against the run store.
+	 *
+	 * The gate cannot drop a run on its own: only pi-subagents' async-complete
+	 * event releases it, and that event is delivered through the session. Callers
+	 * must resolve these against the store (hasProgressingAsyncWork) rather than
+	 * treating a non-zero count as work in progress.
+	 */
+	pendingAsyncRuns(): PendingAsyncRun[] {
+		return subagentGates.get(this.channelId)?.pendingAsyncRuns() ?? [];
 	}
 }
 

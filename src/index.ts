@@ -15,7 +15,7 @@ import {
 	type PostCompletionStallRefusal,
 } from "./post-completion-stall.ts";
 import { probeLiveChildProcesses } from "./child-process-probe.ts";
-import { formatOutstandingRuns, summarizeRunStore } from "./subagent-run-store.ts";
+import { formatOutstandingRuns, hasProgressingAsyncWork, summarizeRunStore } from "./subagent-run-store.ts";
 import { isNonRetryableModelError, retryHintForModelError } from "./retry-policy.ts";
 import { splitMessagePreservingCodeBlocks, DISCORD_CHUNK_LIMIT } from "./message-chunker.ts";
 import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
@@ -226,6 +226,43 @@ function logOutstandingSubagentRuns(channelId: string): void {
 		if (runStoreUnavailableLogged) return;
 		runStoreUnavailableLogged = true;
 		console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns([])} (snapshot failed: ${String(err)})`);
+	}
+}
+
+/**
+ * How often a refusing stall check may repeat its snapshot for one channel.
+ *
+ * The sweep runs every 60s and a legitimate drain can hold for 30 minutes, so an
+ * unthrottled line would be noise exactly when nothing is wrong. Five minutes
+ * keeps a wedged channel visible without burying the journal.
+ */
+const STALL_REFUSAL_LOG_INTERVAL_MS = 5 * 60_000;
+
+/** Last time each channel logged a refused stall check, for the throttle above. */
+const stallRefusalLoggedAt = new Map<string, number>();
+
+/**
+ * Log why the stall fast path refused, with the run snapshot.
+ *
+ * Only the subagent gate is logged: every other refusal rests on something
+ * directly observable (a tool, a pid, a timestamp), while this one rests on
+ * pi-subagents' bookkeeping — the one input that can be wrong, and the one that
+ * produced a silent 45-minute non-recovery on the server.
+ */
+function logStallRefusal(channelId: string, refusal: PostCompletionStallRefusal): void {
+	if (refusal !== "subagent-work-pending") return;
+	const now = Date.now();
+	const last = stallRefusalLoggedAt.get(channelId) ?? 0;
+	if (now - last < STALL_REFUSAL_LOG_INTERVAL_MS) return;
+	stallRefusalLoggedAt.set(channelId, now);
+	try {
+		const summary = summarizeRunStore();
+		const snapshot = summary.error
+			? `${formatOutstandingRuns([])} (store unavailable: ${summary.error})`
+			: formatOutstandingRuns(summary.runs);
+		console.warn(`[watchdog] ${channelId} stall check refused by ${refusal} - ${snapshot}`);
+	} catch (err) {
+		console.warn(`[watchdog] ${channelId} stall check refused by ${refusal} (snapshot failed: ${String(err)})`);
 	}
 }
 
@@ -2094,6 +2131,32 @@ async function main() {
 	let sendCount = 0;
 
 	/**
+	 * Split the channel's subagent work into "provably live" and "only counted".
+	 *
+	 * `sync` is a subagent tool call holding a live child process: work by
+	 * construction. `async` comes from the gate's in-memory tally, which is
+	 * released only by pi-subagents' async-complete event — and that event is
+	 * delivered through the session, so the wedge that blocks the settle path also
+	 * blocks the release. Reading that tally as work in progress deadlocks the
+	 * recovery that would break the loop, so each counted run is resolved against
+	 * the on-disk run store instead.
+	 *
+	 * A run that is terminal, or whose pid is dead and whose status is older than
+	 * RUN_PROGRESS_RECENT_MS, is not work — its pending delivery is a consequence
+	 * of the wedge, not evidence against recovering from it. When the store cannot
+	 * be read the async half reports live: an unverifiable input must not be the
+	 * reason a turn is destroyed.
+	 */
+	function subagentWorkLiveness(
+		discordSession: DiscordSession
+	): { sync: boolean; async: boolean } {
+		const sync = discordSession.hasSyncSubagentWork();
+		const pendingRuns = discordSession.pendingAsyncRuns();
+		if (pendingRuns.length === 0) return { sync, async: false };
+		return { sync, async: hasProgressingAsyncWork(pendingRuns, summarizeRunStore()) };
+	}
+
+	/**
 	 * Why re-delivering parked messages may not abort this channel's active run.
 	 *
 	 * Returns the refusing liveness gate, a child-process summary, or null when the
@@ -2106,13 +2169,14 @@ async function main() {
 		discordSession: DiscordSession,
 		channelId: string
 	): Promise<string | null> {
+		const work = subagentWorkLiveness(discordSession);
 		const refusal = evaluateStuckRunLiveness({
 			modelActive: discordSession.isModelActive(),
 			idleMs: Date.now() - (lastSdkEventAt.get(channelId) ?? Date.now()),
 			thresholdMs: stuckRunThresholdMs,
-			hasPendingBackgroundWork: discordSession.hasPendingBackgroundWork(),
+			hasPendingBackgroundWork: work.async,
 			inFlightToolCount: inFlightToolCounts.get(channelId) ?? 0,
-			hasActiveSubagentWork: discordSession.hasActiveSubagentWork(),
+			hasActiveSubagentWork: work.sync,
 			priorConfirmations: 0,
 		});
 		if (refusal) return refusal;
@@ -2257,13 +2321,14 @@ async function main() {
 	 * a live turn ends up destroyed by one path while the other refuses.
 	 */
 	function evaluateStuckRunForChannel(channelId: string, discordSession: DiscordSession): StuckRunEvaluation {
+		const work = subagentWorkLiveness(discordSession);
 		return evaluateStuckRun({
 			modelActive: discordSession.isModelActive(),
 			idleMs: Date.now() - (lastSdkEventAt.get(channelId) ?? Date.now()),
 			thresholdMs: stuckRunThresholdMs,
-			hasPendingBackgroundWork: discordSession.hasPendingBackgroundWork(),
+			hasPendingBackgroundWork: work.async,
 			inFlightToolCount: inFlightToolCounts.get(channelId) ?? 0,
-			hasActiveSubagentWork: discordSession.hasActiveSubagentWork(),
+			hasActiveSubagentWork: work.sync,
 			priorConfirmations: stuckRunConfirmations.get(channelId) ?? 0,
 		});
 	}
@@ -2285,6 +2350,7 @@ async function main() {
 		discordSession: DiscordSession
 	): Promise<{ refusal: PostCompletionStallRefusal | null; liveChildPids: number[] }> {
 		const terminalAt = terminalMessageAt.get(channelId);
+		const work = subagentWorkLiveness(discordSession);
 		const base: PostCompletionStallInput = {
 			modelActive: discordSession.isModelActive(),
 			msSinceTerminalMessage: terminalAt === undefined ? undefined : Date.now() - terminalAt,
@@ -2293,9 +2359,10 @@ async function main() {
 			inFlightToolCount: inFlightToolCounts.get(channelId) ?? 0,
 			// Async subagent children run detached (own process group), so they are
 			// neither a tool in flight nor a child of this process: only the gate
-			// accounting can see that a drain is legitimately still waiting.
-			hasPendingSubagentWork:
-				discordSession.hasPendingBackgroundWork() || discordSession.hasActiveSubagentWork(),
+			// accounting can see that a drain is legitimately still waiting — and that
+			// accounting is cross-checked against the run store, because a *finished*
+			// run whose completion notice is still queued is the wedge itself.
+			hasPendingSubagentWork: work.sync || work.async,
 			liveChildProcessCount: 0,
 			graceMs: postCompletionStallGraceMs,
 		};
@@ -3802,6 +3869,11 @@ async function main() {
 				}
 				continue;
 			}
+
+			// The only refusal that is not directly observable is the subagent gate, so
+			// it is the only one worth a periodic snapshot: it names the run that is
+			// (or is not) holding recovery off.
+			logStallRefusal(chId, stall.refusal);
 
 			const idleMs = Date.now() - (lastSdkEventAt.get(chId) ?? Date.now());
 			const evaluation = evaluateStuckRunForChannel(chId, discordSession);

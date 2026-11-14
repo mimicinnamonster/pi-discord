@@ -44,6 +44,12 @@ interface AsyncRun {
 	startedAt: number;
 }
 
+/** One async run the gate still counts, for cross-checking against the run store. */
+export interface PendingAsyncRun {
+	id: string;
+	startedAt: number;
+}
+
 export interface SubagentGate {
 	isGateHeld(): boolean;
 	/**
@@ -51,12 +57,31 @@ export interface SubagentGate {
 	 * have not reported completion yet. Sync in-flight tool calls are excluded:
 	 * they only exist mid-turn, while this counter is what can outlive the
 	 * main turn (and therefore overlap the agent_end drain in src/index.ts).
+	 *
+	 * NOT a liveness signal by itself: this tally is released only by
+	 * pi-subagents' async-complete event, which is delivered through the session,
+	 * so a wedged session keeps finished runs here forever. Watchdog gates must
+	 * use pendingAsyncRuns() plus the on-disk run store instead (see
+	 * hasProgressingAsyncWork in src/subagent-run-store.ts).
 	 */
 	pendingAsyncWork(): number;
 	/**
+	 * The async runs this gate still counts, with their start time.
+	 *
+	 * The caller resolves each against the run store, which is the ground truth on
+	 * whether the run is still progressing.
+	 */
+	pendingAsyncRuns(): PendingAsyncRun[];
+	/**
+	 * Sync (in-flight) subagent tool calls in this channel. A sync child emits no
+	 * session event for its whole duration, so its silence must not look like a
+	 * wedged run — which is why this is the half of the gate the watchdog trusts
+	 * unconditionally: a live child process is an unmistakable liveness signal.
+	 */
+	hasSyncWork(): boolean;
+	/**
 	 * Any subagent work in this channel, async runs *and* sync in-flight tool
-	 * calls. Used by the stale-run watchdog: a sync child emits no session event
-	 * for its whole duration, so its silence must not look like a wedged run.
+	 * calls. Answers "is anything possibly running", not "is it progressing".
 	 */
 	hasActiveWork(): boolean;
 	acquireSync(toolCallId: string): boolean;
@@ -106,6 +131,14 @@ export function createSubagentGate(options: SubagentGateOptions = {}): SubagentG
 
 		pendingAsyncWork(): number {
 			return asyncRuns.size;
+		},
+
+		pendingAsyncRuns(): PendingAsyncRun[] {
+			return [...asyncRuns.values()].map((run) => ({ id: run.id, startedAt: run.startedAt }));
+		},
+
+		hasSyncWork(): boolean {
+			return activeSyncCalls.size > 0;
 		},
 
 		hasActiveWork(): boolean {

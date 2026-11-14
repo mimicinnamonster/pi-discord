@@ -15,16 +15,28 @@ import { join } from "path";
 import { describe, expect, it } from "vitest";
 import {
 	formatOutstandingRuns,
+	hasProgressingAsyncWork,
 	isOutstandingState,
+	isProgressingRun,
 	parseRunStatus,
 	resolveAsyncRunStoreDir,
+	RUN_PROGRESS_RECENT_MS,
 	summarizeRunStore,
 	type OutstandingRun,
+	type RunStoreSummary,
 } from "../src/subagent-run-store.ts";
 
 function makeStore(): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-discord-run-store-"));
 	return dir;
+}
+
+function run(overrides: Partial<OutstandingRun> = {}): OutstandingRun {
+	return { runId: "853692be-1111-2222-3333-444455556666", state: "running", ...overrides };
+}
+
+function summary(runs: OutstandingRun[], error?: string): RunStoreSummary {
+	return error === undefined ? { dir: "/store", runs } : { dir: "/store", runs: [], error };
 }
 
 function writeRun(dir: string, runId: string, status: unknown): void {
@@ -188,5 +200,96 @@ describe("summarizeRunStore", () => {
 		const summary = summarizeRunStore({ dir: missing });
 		expect(summary.runs).toEqual([]);
 		expect(summary.error).toContain("cannot read");
+	});
+});
+
+// ============================================================================
+// Progressing work: the input the watchdog must not deadlock on
+// ============================================================================
+
+describe("isProgressingRun", () => {
+	it("trusts a live pid over any timestamp", () => {
+		// A long-running child writes its status rarely; the process is the evidence.
+		expect(isProgressingRun(run({ pid: 99, pidAlive: true, ageMs: 60 * 60_000 }))).toBe(true);
+	});
+
+	it("treats a dead pid with a recent status write as progressing", () => {
+		expect(isProgressingRun(run({ pid: 99, pidAlive: false, ageMs: 10_000 }))).toBe(true);
+	});
+
+	it("treats a dead pid with an old status write as finished", () => {
+		expect(isProgressingRun(run({ pid: 99, pidAlive: false, ageMs: 10 * 60_000 }))).toBe(false);
+	});
+
+	it("treats a queued run with no pid and an old status as finished", () => {
+		expect(isProgressingRun(run({ state: "queued", ageMs: 10 * 60_000 }))).toBe(false);
+	});
+
+	it("assumes work when there is no timestamp to say otherwise", () => {
+		// No pid and no lastUpdate: nothing says it stopped, so hands off.
+		expect(isProgressingRun(run({ state: "queued" }))).toBe(true);
+	});
+
+	it("honours a custom recent window", () => {
+		expect(isProgressingRun(run({ pidAlive: false, ageMs: 5_000 }), 1_000)).toBe(false);
+	});
+});
+
+describe("hasProgressingAsyncWork", () => {
+	const NOW = 10_000_000;
+
+	it("ignores a finished run the gate still counts (the wedge itself)", () => {
+		// Live incident shape: run 853692be completed, its result was never delivered,
+		// so the gate kept it. The store has no entry for it -> not work.
+		const pending = [{ id: "853692be-1111-2222-3333-444455556666", startedAt: NOW - 30 * 60_000 }];
+		expect(hasProgressingAsyncWork(pending, summary([]), { now: NOW })).toBe(false);
+	});
+
+	it("reports a run that is still running with a live child", () => {
+		const pending = [{ id: "aaaa1111-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = summary([run({ runId: pending[0]!.id, pid: 42, pidAlive: true, ageMs: 60_000 })]);
+		expect(hasProgressingAsyncWork(pending, store, { now: NOW })).toBe(true);
+	});
+
+	it("reports a run with a dead pid whose status was just written", () => {
+		const pending = [{ id: "bbbb2222-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = summary([run({ runId: pending[0]!.id, pid: 42, pidAlive: false, ageMs: 10_000 })]);
+		expect(hasProgressingAsyncWork(pending, store, { now: NOW })).toBe(true);
+	});
+
+	it("ignores a run with a dead pid and a stale status", () => {
+		const pending = [{ id: "cccc3333-0000-0000-0000-000000000000", startedAt: NOW - 60 * 60_000 }];
+		const store = summary([run({ runId: pending[0]!.id, pid: 42, pidAlive: false, ageMs: 30 * 60_000 })]);
+		expect(hasProgressingAsyncWork(pending, store, { now: NOW })).toBe(false);
+	});
+
+	it("treats a just-started run with no status yet as work", () => {
+		// The gap between the gate's async-started event and the first status write.
+		const pending = [{ id: "dddd4444-0000-0000-0000-000000000000", startedAt: NOW - 5_000 }];
+		expect(hasProgressingAsyncWork(pending, summary([]), { now: NOW })).toBe(true);
+	});
+
+	it("matches a counted id against the store by short id", () => {
+		const pending = [{ id: "eeee5555-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = summary([run({ runId: "eeee5555-ffff-ffff-ffff-ffffffffffff", pid: 7, pidAlive: true })]);
+		expect(hasProgressingAsyncWork(pending, store, { now: NOW })).toBe(true);
+	});
+
+	it("fails closed when the store cannot be read", () => {
+		// An unverifiable input must never be the reason a live turn is destroyed.
+		const pending = [{ id: "ffff6666-0000-0000-0000-000000000000", startedAt: NOW - 60 * 60_000 }];
+		expect(hasProgressingAsyncWork(pending, summary([], "cannot read /store: ENOENT"), { now: NOW })).toBe(
+			true
+		);
+	});
+
+	it("is false when the gate counts nothing", () => {
+		expect(hasProgressingAsyncWork([], summary([run({ pid: 1, pidAlive: true })]), { now: NOW })).toBe(false);
+	});
+
+	it("uses the exported recent window by default", () => {
+		const pending = [{ id: "99998888-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const aging = summary([run({ runId: pending[0]!.id, pid: 42, pidAlive: false, ageMs: RUN_PROGRESS_RECENT_MS + 1 })]);
+		expect(hasProgressingAsyncWork(pending, aging, { now: NOW })).toBe(false);
 	});
 });

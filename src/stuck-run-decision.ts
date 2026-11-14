@@ -13,7 +13,11 @@ export interface StuckRunDecisionInput {
 	idleMs: number;
 	/** Silence after which an active run is considered wedged. */
 	thresholdMs?: number;
-	/** Async subagent runs started in this channel that never reported completion. */
+	/**
+	 * Async subagent work that is still *progressing*, i.e. verified against the run
+	 * store rather than read off the gate's in-memory tally. A finished run whose
+	 * completion notice is still queued is the wedge itself, not work.
+	 */
 	hasPendingBackgroundWork: boolean;
 	/**
 	 * Sync subagent tool calls currently executing in this channel. A sync child
@@ -21,7 +25,7 @@ export interface StuckRunDecisionInput {
 	 * that silence is work rather than a wedge.
 	 */
 	inFlightToolCount: number;
-	/** Sync subagent gate holders: a live child process is still doing work. */
+	/** Sync subagent tool calls currently executing: a live child process is work. */
 	hasActiveSubagentWork: boolean;
 	/** Confirming sweeps already observed for this channel (see REQUIRED_CONFIRMING_SWEEPS). */
 	priorConfirmations: number;
@@ -87,10 +91,12 @@ export function evaluateStuckRunLiveness(input: StuckRunDecisionInput): StuckRun
 	if (!input.modelActive) return "not-active";
 	// A tool call in flight emits nothing until it ends, so silence here is work.
 	if (input.inFlightToolCount > 0) return "tool-in-flight";
-	// Sync subagent invocations are excluded from pendingAsyncWork(): they only
-	// exist mid-turn, which is exactly the state we must not tear down.
+	// A sync subagent call is a live child process, and its silence is work.
 	if (input.hasActiveSubagentWork) return "sync-subagent-work";
-	// An agent_end drain keeps the run open without emitting agent events.
+	// A drain waiting on async children keeps the run open without emitting agent
+	// events. Only runs that are still progressing count: a completed run with an
+	// undelivered result is the signature of this wedge, so treating it as work
+	// would make this watchdog refuse exactly the case it exists for.
 	if (input.hasPendingBackgroundWork) return "async-subagent-work";
 	if (input.idleMs < thresholdMs) return "not-idle";
 	return null;

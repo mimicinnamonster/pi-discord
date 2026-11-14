@@ -71,10 +71,10 @@ export interface PostCompletionStallInput {
 	/** Tool calls currently executing: a tool emits nothing until it ends. */
 	inFlightToolCount: number;
 	/**
-	 * Subagent work the session still owes a completion notice for: async runs that
-	 * have not reported (detached processes, invisible to a child-process probe) or
-	 * a sync gate holder. Checked before the grace window so a live drain is never
-	 * mistaken for a stalled settle path.
+	 * Subagent work the session is still *progressing* on: async runs verified
+	 * against the run store, or a sync subagent tool call holding a live child.
+	 * A finished run whose completion notice is still queued must report false
+	 * here — that pending delivery is the wedge, not work countering it.
 	 */
 	hasPendingSubagentWork: boolean;
 	/** Live (non-zombie) child processes of the bot, e.g. a sync subagent child. */
@@ -108,7 +108,10 @@ export function evaluatePostCompletionStall(
 	if (!input.modelActive) return "not-active";
 	if (input.msSinceTerminalMessage === undefined) return "no-terminal-message";
 	if (input.eventSinceTerminal) return "event-since-terminal";
-	// A drain waiting on detached children is work even with no tool in flight.
+	// A drain waiting on detached children is work even with no tool in flight —
+	// but only when those children are actually progressing. The gate's tally is
+	// released through the session, so in a wedge it still counts a finished run;
+	// refusing on that would disable this check exactly when it is needed.
 	if (input.hasPendingSubagentWork) return "subagent-work-pending";
 	if (input.inFlightToolCount > 0) return "tool-in-flight";
 	if (input.msSinceTerminalMessage < graceMs) return "within-grace";

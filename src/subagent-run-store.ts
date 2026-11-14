@@ -41,6 +41,15 @@ const OUTSTANDING_STATES: ReadonlySet<string> = new Set(["queued", "running"]);
 /** Prefix length for a run id: long enough to find the run dir, short enough to read. */
 const SHORT_RUN_ID_LENGTH = 8;
 
+/**
+ * How recently a run's status must have been written for that alone to count as
+ * progress.
+ *
+ * Covers the gap between a runner starting and its first status write, plus one
+ * status-write interval, without ever spanning a plausible pause in a live run.
+ */
+export const RUN_PROGRESS_RECENT_MS = 90_000;
+
 /** The subset of a run's `status.json` worth printing. */
 export interface RunStatusRecord {
 	runId: string;
@@ -149,6 +158,76 @@ export function parseRunStatus(json: string, fallbackRunId: string): RunStatusRe
 /** States the drain is still waiting for; everything else is terminal or paused. */
 export function isOutstandingState(state: string): boolean {
 	return OUTSTANDING_STATES.has(state);
+}
+
+/** One async run the channel's subagent gate still counts, with its start time. */
+export interface PendingAsyncRunRef {
+	id: string;
+	startedAt: number;
+}
+
+/**
+ * Whether a single outstanding run is still doing something.
+ *
+ * Ordering matters. A live pid is direct evidence of work and is trusted over
+ * any timestamp. With no pid and no timestamp (a run that has not written a
+ * status yet) there is nothing to say it stopped, so it is assumed to be
+ * working — the safe direction for a watchdog that must never destroy a live
+ * turn.
+ */
+export function isProgressingRun(
+	run: OutstandingRun,
+	recentMs: number = RUN_PROGRESS_RECENT_MS
+): boolean {
+	if (run.pidAlive === true) return true;
+	if (run.ageMs === undefined) return true;
+	return run.ageMs <= recentMs;
+}
+
+/**
+ * Whether any async run the gate still counts is genuinely progressing.
+ *
+ * The gate's tally is event-driven and its completion event is delivered *through
+ * the session* — so the exact wedge that keeps a run from settling also keeps
+ * that run in the tally: delivery needs an idle session, the session is not idle
+ * because the settle path is blocked, and the settle path is blocked by a drain
+ * waiting for that delivery. Reading the tally as "work in progress" therefore
+ * deadlocks the recovery that would break the loop.
+ *
+ * The run store is the ground truth. A run that is absent from the store's
+ * outstanding set has terminalised (complete/failed) or never wrote a status; in
+ * either case it is not work, unless it started so recently that its status may
+ * simply not exist yet. Fails closed (reports work) when the store could not be
+ * read, because an unverifiable diagnostic must never be the reason a live turn
+ * is torn down.
+ */
+export function hasProgressingAsyncWork(
+	pendingRuns: readonly PendingAsyncRunRef[],
+	summary: RunStoreSummary,
+	options: { now?: number; recentMs?: number } = {}
+): boolean {
+	if (pendingRuns.length === 0) return false;
+	if (summary.error) return true;
+
+	const now = options.now ?? Date.now();
+	const recentMs = options.recentMs ?? RUN_PROGRESS_RECENT_MS;
+	const outstanding = new Map(summary.runs.map((run) => [shortRunId(run.runId), run]));
+
+	for (const pending of pendingRuns) {
+		const record = outstanding.get(shortRunId(pending.id));
+		if (record === undefined) {
+			// Not outstanding on disk: terminalised, or still too young to have written
+			// a status. Only the latter is work.
+			if (now - pending.startedAt < recentMs) return true;
+			continue;
+		}
+		if (isProgressingRun(record, recentMs)) return true;
+	}
+	return false;
+}
+
+function shortRunId(runId: string): string {
+	return runId.slice(0, SHORT_RUN_ID_LENGTH);
 }
 
 /**

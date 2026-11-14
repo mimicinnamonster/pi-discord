@@ -19,6 +19,7 @@ import {
 	shouldRecoverStuckRun,
 	type StuckRunDecisionInput,
 } from "../src/stuck-run-decision.ts";
+import { hasProgressingAsyncWork } from "../src/subagent-run-store.ts";
 
 /** Inputs for a session that is silent, idle past the threshold and fully confirmed. */
 function wedgedInput(overrides: Partial<StuckRunDecisionInput> = {}): StuckRunDecisionInput {
@@ -130,5 +131,57 @@ describe("stuck run liveness gates", () => {
 			const input = wedgedInput(overrides);
 			expect(evaluateStuckRunLiveness(input)).toBe(evaluateStuckRun(input).refusedBy);
 		}
+	});
+});
+
+// ============================================================================
+// The gate's counted runs must be verified before they may refuse recovery
+// ============================================================================
+
+describe("async subagent work is verified against the run store", () => {
+	const NOW = 10_000_000;
+
+	/**
+	 * Mirrors subagentWorkLiveness() in src/index.ts: the gate's in-memory tally is
+	 * cross-checked against the run store before it may refuse recovery.
+	 */
+	function inputFor(
+		pendingAsyncRuns: { id: string; startedAt: number }[],
+		storeRuns: { runId: string; state: string; pidAlive?: boolean; ageMs?: number }[]
+	): StuckRunDecisionInput {
+		return wedgedInput({
+			hasPendingBackgroundWork: hasProgressingAsyncWork(pendingAsyncRuns, { runs: storeRuns }, { now: NOW }),
+		});
+	}
+
+	it("recovers a channel whose counted run already finished (the wedge itself)", () => {
+		// Live incident: run 853692be reached state=complete, but the gate only drops
+		// a run on async-complete, which is delivered through the session. Trusting
+		// the tally here deadlocks the very recovery that unblocks delivery.
+		const pending = [{ id: "853692be-1111-2222-3333-444455556666", startedAt: NOW - 30 * 60_000 }];
+
+		expect(shouldRecoverStuckRun(inputFor(pending, []))).toBe(true);
+	});
+
+	it("still refuses while the counted run has a live child process", () => {
+		const pending = [{ id: "aaaa1111-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = [{ runId: pending[0]!.id, state: "running", pidAlive: true, ageMs: 60_000 }];
+
+		expect(evaluateStuckRun(inputFor(pending, store)).refusedBy).toBe("async-subagent-work");
+	});
+
+	it("recovers when the counted run's pid is dead and its status is ten minutes old", () => {
+		const pending = [{ id: "bbbb2222-0000-0000-0000-000000000000", startedAt: NOW - 60 * 60_000 }];
+		const store = [{ runId: pending[0]!.id, state: "running", pidAlive: false, ageMs: 10 * 60_000 }];
+
+		// Dead pid plus ten minutes of silence: the record is stale, not work.
+		expect(shouldRecoverStuckRun(inputFor(pending, store))).toBe(true);
+	});
+
+	it("still refuses while the counted run wrote its status within the recent window", () => {
+		const pending = [{ id: "cccc3333-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = [{ runId: pending[0]!.id, state: "running", pidAlive: false, ageMs: 10_000 }];
+
+		expect(evaluateStuckRun(inputFor(pending, store)).refusedBy).toBe("async-subagent-work");
 	});
 });

@@ -127,3 +127,47 @@ test("sweepStaleAsync returns nothing when everything is recent", () => {
 	expect(gate.sweepStaleAsync()).toEqual([]);
 	expect(gate.pendingAsyncWork()).toBe(1);
 });
+
+// ============================================================================
+// The sync/async split the watchdog relies on
+// ============================================================================
+
+test("hasSyncWork reports only in-flight sync tool calls", () => {
+	const gate = createSubagentGate();
+	expect(gate.hasSyncWork()).toBe(false);
+
+	// An async run is not a sync call: only a live child process can be trusted
+	// unconditionally, and an async run's child is detached from this process.
+	gate.onAsyncStarted({ runId: "run-a" });
+	expect(gate.hasSyncWork()).toBe(false);
+	expect(gate.hasActiveWork()).toBe(true);
+
+	gate.acquireSync("call-1");
+	expect(gate.hasSyncWork()).toBe(true);
+
+	gate.releaseSync("call-1");
+	expect(gate.hasSyncWork()).toBe(false);
+});
+
+test("pendingAsyncRuns exposes the ids and start times for store cross-checking", () => {
+	let clock = 1_000;
+	const gate = createSubagentGate({ now: () => clock });
+	gate.onAsyncStarted({ runId: "run-a" });
+	clock = 2_000;
+	gate.onAsyncStarted({});
+
+	// The synthetic counter advances for every start, id or not: ids stay unique.
+	expect(gate.pendingAsyncRuns()).toEqual([
+		{ id: "run-a", startedAt: 1_000 },
+		{ id: "async-run-2", startedAt: 2_000 },
+	]);
+
+	// A run dropped by the sweep disappears from the snapshot too.
+	gate.onAsyncComplete({ runId: "run-a", status: "completed" });
+	expect(gate.pendingAsyncRuns().map((run) => run.id)).toEqual(["async-run-2"]);
+});
+
+test("pendingAsyncRuns is empty once nothing is held", () => {
+	const gate = createSubagentGate();
+	expect(gate.pendingAsyncRuns()).toEqual([]);
+});

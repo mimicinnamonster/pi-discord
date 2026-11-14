@@ -16,6 +16,7 @@ import {
 	POST_COMPLETION_STALL_GRACE_MS,
 	type PostCompletionStallInput,
 } from "../src/post-completion-stall.ts";
+import { hasProgressingAsyncWork } from "../src/subagent-run-store.ts";
 
 function input(overrides: Partial<PostCompletionStallInput> = {}): PostCompletionStallInput {
 	return {
@@ -254,5 +255,62 @@ describe("Post-completion fast path", () => {
 
 		expect(rig.stallRefusal()).toBe("no-terminal-message");
 		expect(rig.recoveries()).toBe(0);
+	});
+});
+
+// ============================================================================
+// A finished run whose completion notice is still queued is the wedge, not work
+// ============================================================================
+
+describe("Post-completion stall with a finished-but-undelivered subagent run", () => {
+	const NOW = 10_000_000;
+
+	/**
+	 * Mirrors subagentWorkLiveness() in src/index.ts: the gate's counted runs are
+	 * resolved against the run store before they may refuse recovery.
+	 */
+	function stallRefusalWithStore(
+		pendingAsyncRuns: { id: string; startedAt: number }[],
+		storeRuns: { runId: string; state: string; pidAlive?: boolean; ageMs?: number }[]
+	): string | null {
+		return evaluatePostCompletionStall({
+			modelActive: true,
+			msSinceTerminalMessage: POST_COMPLETION_STALL_GRACE_MS + 1,
+			eventSinceTerminal: false,
+			inFlightToolCount: 0,
+			hasPendingSubagentWork: hasProgressingAsyncWork(pendingAsyncRuns, { runs: storeRuns }, { now: NOW }),
+			liveChildProcessCount: 0,
+		});
+	}
+
+	it("recovers: the run is complete but its result was never delivered", () => {
+		// Live incident shape (run 853692be): the gate still counted the run because
+		// async-complete is delivered through the session, delivery needs an idle
+		// session, and the settle path is what is blocked. Reading that tally as work
+		// is what kept the channel wedged for 45 minutes with no watchdog line.
+		const pending = [{ id: "853692be-1111-2222-3333-444455556666", startedAt: NOW - 30 * 60_000 }];
+
+		expect(stallRefusalWithStore(pending, [])).toBeNull();
+	});
+
+	it("refuses while the counted run is still running with a live child", () => {
+		const pending = [{ id: "aaaa1111-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = [{ runId: pending[0]!.id, state: "running", pidAlive: true, ageMs: 60_000 }];
+
+		expect(stallRefusalWithStore(pending, store)).toBe("subagent-work-pending");
+	});
+
+	it("refuses while the counted run wrote its status moments ago", () => {
+		const pending = [{ id: "bbbb2222-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
+		const store = [{ runId: pending[0]!.id, state: "running", pidAlive: false, ageMs: 10_000 }];
+
+		expect(stallRefusalWithStore(pending, store)).toBe("subagent-work-pending");
+	});
+
+	it("recovers when the counted run's pid is dead and its status is stale", () => {
+		const pending = [{ id: "cccc3333-0000-0000-0000-000000000000", startedAt: NOW - 60 * 60_000 }];
+		const store = [{ runId: pending[0]!.id, state: "running", pidAlive: false, ageMs: 30 * 60_000 }];
+
+		expect(stallRefusalWithStore(pending, store)).toBeNull();
 	});
 });
