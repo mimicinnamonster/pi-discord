@@ -65,12 +65,22 @@ export function withTimeout<T>(task: Promise<T>, timeoutMs: number, label: strin
 export class ChannelSendQueue {
 	private readonly states = new Map<string, QueueState>();
 	private sequence = 0;
+	// Fields assigned in the constructor rather than declared as parameter
+	// properties: the bot runs these sources through Node's strip-only type
+	// removal (`node src/index.ts`), which rejects parameter properties.
+	private readonly log: (message: string) => void;
+	readonly maxPending: number;
+	private readonly itemTimeoutMs: number;
 
 	constructor(
-		private readonly log: (message: string) => void = () => {},
-		readonly maxPending: number = DEFAULT_MAX_PENDING_SENDS,
-		private readonly itemTimeoutMs: number = DEFAULT_SEND_ITEM_TIMEOUT_MS
-	) {}
+		log: (message: string) => void = () => {},
+		maxPending: number = DEFAULT_MAX_PENDING_SENDS,
+		itemTimeoutMs: number = DEFAULT_SEND_ITEM_TIMEOUT_MS
+	) {
+		this.log = log;
+		this.maxPending = maxPending;
+		this.itemTimeoutMs = itemTimeoutMs;
+	}
 
 	/**
 	 * Queues one logical message behind everything already queued for the

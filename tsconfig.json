@@ -12,6 +12,10 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "allowImportingTsExtensions": true,
+    // The bot runs `node src/index.ts`, i.e. Node's strip-only type removal,
+    // which rejects non-erasable syntax (parameter properties, enums, namespaces).
+    // Without this flag `tsc` accepts code that crashes the service at startup.
+    "erasableSyntaxOnly": true,
     "noEmit": true,
     "declaration": true,
     "declarationMap": true,
