@@ -94,6 +94,13 @@ Environment=PI_DISCORD_BOT=1
 # lines (e.g. the "Parent tool allowlist applied (N): ..." log).
 Environment=DISCORD_DEBUG=true
 
+# Cron expressions for scheduled prompts (`!schedule` / schedule_prompt) are
+# evaluated in the process timezone: pi-schedule-prompt has no timezone option.
+# Without this line the host's zone applies, so `0 0 7 * * 1-5` on a UTC host
+# actually fires at 08:00 Amsterdam in winter. Catch-up evaluates slots in the
+# same zone (src/schedule-catchup.ts), so the two always agree.
+Environment=TZ=Europe/Amsterdam
+
 # Always: the bot should come back after a crash or an OOM kill, not just a
 # clean exit. RestartSec=5 backs off enough to avoid hammering Discord's API
 # if the failure is a rejected token or an expired gateway session.

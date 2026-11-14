@@ -46,6 +46,12 @@ import { join } from "path";
 import { writeFileSync, readFileSync, existsSync, readdirSync, openSync, readSync, closeSync, statSync } from "fs";
 import { Cron } from "croner";
 import {
+	decideCatchup,
+	jobBelongsToChannel,
+	jobNeedsRebind,
+	type ScheduledJobLike,
+} from "./schedule-catchup.ts";
+import {
 	loadBranchMetadata,
 	saveBranchMetadata,
 	findCommonAncestor,
@@ -397,67 +403,53 @@ function buildSessionChannelMap(): Map<string, string> {
 }
 
 /**
- * Rebind all cron jobs for a Discord channel to the given session UUID.
- * Called after session creation (e.g., /session, restart) so jobs remain
- * scoped to their correct channel and don't fire in random channels.
+ * Channels whose "binding already current" debug line has been logged, so the
+ * 60s keeper does not repeat it for every job on every tick.
  */
-function rebindChannelJobs(channelId: string, sessionId: string): void {
-	const path = join(process.cwd(), ".pi", "schedule-prompts.json");
-	if (!existsSync(path)) return;
-	try {
-		const data = JSON.parse(readFileSync(path, "utf-8"));
-		const jobs: any[] = data.jobs || [];
-		let dirty = false;
-		for (const job of jobs) {
-			if (job.description?.startsWith(`channel:${channelId}`) && job.session !== sessionId) {
-				job.session = sessionId;
-				dirty = true;
-				console.log(`[discord] Rebound job ${job.name || job.id} to session ${sessionId} for channel ${channelId}`);
-			}
-		}
-		if (dirty) {
-			writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
-		}
-	} catch {}
-}
+const bindSkipLogged = new Set<string>();
 
 /**
- * Read the session UUID from an existing session file for a channel.
- * Returns undefined if the file doesn't exist or can't be read.
- */
-function readChannelSessionUUID(channelId: string): string | undefined {
-	const sessionDir = join(homedir(), ".pi-discord", "sessions");
-	const sessionPath = join(sessionDir, `discord-${channelId}.jsonl`);
-	try {
-		if (existsSync(sessionPath)) {
-			const firstLine = readFileSync(sessionPath, "utf-8").split("\n")[0];
-			const meta = JSON.parse(firstLine);
-			return meta.id;
-		}
-	} catch {}
-	return undefined;
-}
-
-/**
- * Given a session ID (UUID) and channel ID, update all jobs for that channel
- * in schedule-prompts.json to use the given session UUID.
- * Returns true if any jobs were updated.
+ * Point every job of a Discord channel at the channel's LIVE session UUID.
+ *
+ * The live runtime id (`getSessionStats().sessionId`) is the only source of
+ * truth: it is exactly what pi-schedule-prompt compares against at fire time
+ * (scheduler.ts:61, :205-211), and a mismatch makes it return silently, with
+ * no log anywhere.
+ *
+ * Writes only when the stored id differs. Rewriting an equal id would be a
+ * no-op for correctness but a write race for the scheduler: it arms the cron
+ * against the id it loaded, and the store being touched after that point is
+ * what used to orphan jobs on every restart.
+ *
+ * Returns true when the store was modified.
  */
 function setChannelJobsSessionSync(channelId: string, sessionId: string): boolean {
 	const path = join(process.cwd(), ".pi", "schedule-prompts.json");
 	if (!existsSync(path)) return false;
 	try {
 		const data = JSON.parse(readFileSync(path, "utf-8"));
-		const jobs: any[] = data.jobs || [];
+		const jobs: ScheduledJobLike[] = data.jobs || [];
 		let dirty = false;
+		let loggedSkip = false;
 		for (const job of jobs) {
-			if (job.description?.startsWith(`channel:${channelId}`) && job.session !== sessionId) {
-				job.session = sessionId;
-				dirty = true;
+			if (!jobBelongsToChannel(job, channelId)) continue;
+			if (!jobNeedsRebind(job, channelId, sessionId)) {
+				if (!loggedSkip) loggedSkip = true;
+				continue;
 			}
+			job.session = sessionId;
+			dirty = true;
+			console.log(`[discord] Bound job ${job.name || job.id} to session ${sessionId} for channel ${channelId}`);
 		}
 		if (dirty) {
 			writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
+		}
+		if (!dirty && loggedSkip) {
+			const key = `${channelId}:${sessionId}`;
+			if (!bindSkipLogged.has(key)) {
+				bindSkipLogged.add(key);
+				console.log(`[discord] Job binding already current for channel ${channelId} (session ${sessionId}) - no write`);
+			}
 		}
 		return dirty;
 	} catch {}
@@ -484,13 +476,18 @@ function rebindChannelJobsToLiveSession(channelId: string): void {
 /**
  * Restore sessions for channels with scheduled prompts.
  *
- * On startup, reads schedule-prompts.json, ensures each job's `session` field
- * points to the current session UUID for its channel, and pre-creates Discord
- * sessions so the pi-schedule-prompt scheduler has a live session to fire into.
+ * On startup, reads schedule-prompts.json, creates Discord sessions for every
+ * channel with a scheduled job so the pi-schedule-prompt scheduler has a live
+ * session to fire into, and then binds each job to that session's runtime id.
  *
- * CRITICAL: Never sets `job.session` to undefined — that makes the job fire in
- * ALL channels (isLoadedFor returns true for undefined). We instead keep stale
- * UUIDs in the file and only update them after creating the new session.
+ * CRITICAL: never bind from the on-disk session file's meta id. That is a
+ * second source of truth for the same value and the two disagree whenever a
+ * session is recreated; the scheduler compares the stored id against the live
+ * one at fire time (scheduler.ts:61, :205-211) and skips silently on mismatch.
+ * Binding happens once, after the session exists, from the live id only.
+ *
+ * Also never bind before the session exists: `job.session` must not be deleted
+ * (undefined makes the job fire in ALL channels, isLoadedFor returns true).
  */
 function restoreScheduledSessions(): void {
 	try {
@@ -506,7 +503,6 @@ function restoreScheduledSessions(): void {
 
 		let dirty = false;
 		const channelsToCreate = new Set<string>();
-		const channelsWithStaleSession: string[] = [];
 
 		for (const job of jobs) {
 			// --- Resolve channel from description (persisted format) ---
@@ -528,10 +524,10 @@ function restoreScheduledSessions(): void {
 					// Keep job.session — the session file still exists with this UUID.
 					// getOrCreate() below will open the existing file, preserving the UUID.
 				} else if (descMatch) {
-					// Session UUID is stale (e.g., after /session renamed the file).
-					// Keep the stale UUID in the file! Deleting it would make the job
-					// fire in ALL channels. We'll update it after creating the new session.
-					channelsWithStaleSession.push(descMatch[1]);
+					// Stale session UUID, but the job is routable by channel. Keep the
+					// stale id in the file for now (deleting it would make the job fire
+					// in every channel); it is rewritten from the live id below, after
+					// the channel's session has been created.
 				} else {
 					// No channel info at all — truly orphaned session reference.
 					// Safe to delete because there's no way to route it.
@@ -539,18 +535,10 @@ function restoreScheduledSessions(): void {
 					dirty = true;
 				}
 			} else if (descMatch) {
-				// Job has channel info but no session field. Try to pre-set from
-				// existing session file so the scheduler loads it correctly.
-				const chId = descMatch[1];
-				const fileUUID = readChannelSessionUUID(chId);
-				if (fileUUID) {
-					// Pre-set the UUID from the existing session file so the scheduler
-					// loads the job on first try.
-					job.session = fileUUID;
-					dirty = true;
-				}
-				// If no existing session file, leave undefined — the startSessionKeeper
-				// or first user message will create the session and rebind.
+				// Job has channel info but no session field. Leave it unbound until
+				// the live session exists: binding from the on-disk file id here is
+				// what created the second source of truth. The scheduler re-reads the
+				// store at fire time, so binding after creation is sufficient.
 			}
 		}
 
@@ -561,59 +549,28 @@ function restoreScheduledSessions(): void {
 			console.log(`[discord] Prepared session references, identified ${channelsToCreate.size} channel(s) for scheduled prompts`);
 		}
 
-		// Now create sessions for all identified channels
-		// For channels with a matching session UUID, the scheduler will load the job correctly.
+		// Now create sessions for all identified channels, then bind each job to
+		// the session's live runtime id. A single creation pass - the old code
+		// disposed and re-created the session twice to "pick up" the rebind,
+		// which minted a new UUID on every pass and never converged.
 		const promises: Array<Promise<void>> = [];
 		for (const chId of channelsToCreate) {
 			console.log(`[discord] Pre-creating session for scheduled channel ${chId}`);
 			const p = sessionStore.getOrCreate(chId).then((discordSession) => {
 				const sessionId = discordSession.session.getSessionStats().sessionId;
-				// Rebind all jobs for this channel to the current session UUID
-				for (const job of jobs) {
-					if (job.description?.startsWith(`channel:${chId}`) && job.session !== sessionId) {
-						job.session = sessionId;
-						dirty = true;
-						console.log(`[discord] Bound job ${job.name || job.id} to session ${sessionId} for channel ${chId}`);
-					}
-				}
+				setChannelJobsSessionSync(chId, sessionId);
 			}).catch((err) => {
 				console.error(`[discord] Failed to pre-create session for ${chId}:`, err);
 			});
 			promises.push(p);
 		}
 
-		// Save once all sessions are created and jobs are rebound
-		Promise.all(promises).then(async () => {
+		Promise.all(promises).then(() => {
 			if (dirty) {
 				try {
 					writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
 					console.log(`[discord] Saved job session bindings`);
 				} catch {}
-			}
-
-			// For channels with stale sessions whose UUID was updated, restart
-			// the session so the scheduler picks up the rebound job.
-			const channelsToRestart = channelsWithStaleSession.filter(chId => sessionStore.has(chId));
-			for (const chId of channelsToRestart) {
-				try {
-					sessionStore.dispose(chId);
-					const restarted = await sessionStore.getOrCreate(chId);
-					const restartedId = restarted.session.getSessionStats().sessionId;
-					// The restart may have created a NEW session UUID (e.g. the old
-					// session file was moved by /session or /clear), so rebind the
-					// jobs to the actual restarted session, then restart once more
-					// so the scheduler reads schedule-prompts.json with the new UUID.
-					setChannelJobsSessionSync(chId, restartedId);
-					sessionStore.dispose(chId);
-					const finalSession = await sessionStore.getOrCreate(chId);
-					const finalSessionId = finalSession.session.getSessionStats().sessionId;
-					if (finalSessionId !== restartedId) {
-						setChannelJobsSessionSync(chId, finalSessionId);
-					}
-					console.log(`[discord] Rebound jobs to session ${finalSessionId} for channel ${chId} after restart`);
-				} catch (err) {
-					console.error(`[discord] Failed to restart session for ${chId}:`, err);
-				}
 			}
 		}).catch(() => {});
 	} catch {}
@@ -629,10 +586,11 @@ function restoreScheduledSessions(): void {
  * no active session.
  *
  * CRITICAL: Never deletes `job.session` first — setting it to undefined makes
- * the job fire in ALL channels (isLoadedFor returns true for everyone).
- * Instead, pre-sets the session UUID from the existing session file (so the
- * new scheduler loads it), or creates the session first, then updates the
- * session field and restarts the session for new channels.
+ * the job fire in ALL channels (isLoadedFor returns true for everyone) — and
+ * never binds from the on-disk session file either. The session is created once
+ * per channel and the job is then bound to that session's live runtime id; the
+ * scheduler re-reads the store at fire time, so it does not need to be re-armed
+ * for a rebind to take effect.
  */
 function startSessionKeeper(deps: {
 	subscribedSessions: Set<string>;
@@ -679,36 +637,67 @@ function startSessionKeeper(deps: {
 	}
 
 	/**
-	 * Fire any scheduled job whose `nextRun` passed without being executed
-	 * (bot was down: /kill, crash, laptop battery). This is what makes the
-	 * schedule survive process death — the extension only fires while its
-	 * session is alive and has loaded the job; the bot catches up the rest.
+	 * Fire any scheduled job whose fire time was missed (bot was down: /kill,
+	 * crash, deploy restart, laptop off). This is what makes the schedule
+	 * survive process death — the extension only fires while its session is
+	 * alive and has loaded the job; the bot catches up the rest.
+	 *
+	 * Due slots are computed from the cron expression (see schedule-catchup.ts),
+	 * NOT from `nextRun`: pi-schedule-prompt only persists `nextRun` after a
+	 * successful fire, so gating on it made a never-fired job impossible to
+	 * catch up, forever.
 	 */
+	const catchupInFlight = new Set<string>();
+	const catchupSkipLogged = new Set<string>();
+
 	async function fireMissedScheduledJobs(chId: string, jobs: any[]): Promise<void> {
 		const discordSession = sessionStore.get(chId);
 		if (!discordSession) return;
 		const sessionId = discordSession.session.getSessionStats().sessionId;
 		const now = Date.now();
+
 		for (const job of jobs) {
-			if (job.type !== "cron") continue;
-			if (!job.nextRun) continue;
-			const next = new Date(job.nextRun).getTime();
-			if (Number.isNaN(next)) continue;
-			// Grace: only catch up runs due more than 60s ago, so we never race
-			// the extension's own on-time fire (it updates nextRun when it fires).
-			if (next > now - 60_000) continue;
-			const last = job.lastRun ? new Date(job.lastRun).getTime() : 0;
-			if (last >= next) continue;
+			const decision = decideCatchup(job, { nowMs: now });
+
+			if (decision.action === "none") {
+				// Only the never-fired case is worth a line: that is the state the
+				// old `!job.nextRun` gate hid completely, and it is the one that
+				// looks like "the scheduler is broken" from the outside.
+				if (!job.nextRun && decision.reason !== "disabled" && decision.reason !== "not-cron" && !catchupSkipLogged.has(job.id)) {
+					catchupSkipLogged.add(job.id);
+					console.log(
+						`[discord] Catch-up: job "${job.name}" (${job.id}) not fired - reason=${decision.reason}, ` +
+						`anchor=${decision.anchor?.source ?? "none"}${decision.anchor?.anchorMs ? ` (${new Date(decision.anchor.anchorMs).toISOString()})` : ""}`,
+					);
+				}
+				continue;
+			}
+
 			// Session-bound jobs only fire in their own session (same rule as
 			// pi-schedule-prompt's isLoadedFor).
-			if (job.session && job.session !== sessionId) continue;
+			if (job.session && job.session !== sessionId) {
+				console.log(`[discord] Catch-up: job "${job.name}" (${job.id}) is bound to ${job.session}, not this session ${sessionId} - skipping`);
+				continue;
+			}
 
-			console.log(`[discord] Catching up missed scheduled job "${job.name}" (${job.id}) for channel ${chId}`);
+			// Two overlapping sweeps (60s tick + initial run) must not double-fire.
+			if (catchupInFlight.has(job.id)) continue;
+			catchupInFlight.add(job.id);
+
+			const slot = decision.slot!;
+			const missed = decision.missedSlots ?? 1;
+			console.log(
+				`[discord] Catching up missed scheduled job "${job.name}" (${job.id}) for channel ${chId}: ` +
+				`${missed} slot(s) since ${decision.anchor?.source ?? "unknown"}, firing the most recent (${slot.toISOString()})`,
+			);
+
+			// Advance BEFORE delivering so a crash in between cannot re-fire the
+			// same slot: lastRun is set to the SLOT time (not now), so the next
+			// tick sees no due slot. Older missed slots are coalesced into this
+			// one rather than dumped into the channel as a burst of stale runs.
 			const nextRun = getNextCronRun(job.schedule) ?? new Date(now + 24 * 3600 * 1000).toISOString();
-			// Advance nextRun BEFORE delivering so a crash in between can't cause
-			// a duplicate fire on the next tick (email scans dedupe anyway).
 			updateScheduledJob(job.id, {
-				lastRun: new Date().toISOString(),
+				lastRun: slot.toISOString(),
 				lastStatus: "success",
 				runCount: (job.runCount ?? 0) + 1,
 				nextRun,
@@ -718,7 +707,7 @@ function startSessionKeeper(deps: {
 			if (channel) {
 				sendToDiscord(
 					channel,
-					`⏰ Running scheduled job **"${job.name}"** — was scheduled for ${new Date(next).toLocaleString("en-GB", { timeZone: "Europe/Amsterdam" })}, executing now (it missed its scheduled time — e.g. the bot was offline or the session was recreated).`,
+					`⏰ Running scheduled job **"${job.name}"** — was scheduled for ${slot.toLocaleString("en-GB", { timeZone: "Europe/Amsterdam" })}, executing now (it missed its scheduled time — e.g. the bot was offline or the session was recreated).`,
 				).catch(() => {});
 			}
 
@@ -726,8 +715,10 @@ function startSessionKeeper(deps: {
 			// the agent's response to Discord.
 			discordSession.session.sendUserMessage([{ type: "text", text: job.prompt }]).catch((err) => {
 				console.error(`[discord] Failed to deliver scheduled prompt ${job.id}:`, err);
-				// Delivery failed — put nextRun back so the next tick retries.
-				updateScheduledJob(job.id, { lastStatus: "error", nextRun: new Date(next).toISOString() });
+				// Delivery failed — roll lastRun back so the next tick retries.
+				updateScheduledJob(job.id, { lastStatus: "error", lastRun: job.lastRun, nextRun: job.nextRun });
+			}).finally(() => {
+				catchupInFlight.delete(job.id);
 			});
 		}
 	}
@@ -758,58 +749,18 @@ function startSessionKeeper(deps: {
 		if (channelJobs.size === 0) return;
 
 		// --- Create sessions for channels that don't have one ---
-		if (channelsNeeded.size > 0) {
-			const channelsWithExistingFile: string[] = [];
-			const channelsNewSession: string[] = [];
-
-			// Pre-compute: for channels with existing session files, set
-			// job.session to the file's UUID BEFORE any session starts,
-			// so their schedulers load the job on the first try.
-			let preDirty = false;
-			for (const chId of channelsNeeded) {
-				const fileUUID = readChannelSessionUUID(chId);
-				if (fileUUID) {
-					for (const job of jobs) {
-						if (job.description?.startsWith(`channel:${chId}`) && job.session !== fileUUID) {
-							job.session = fileUUID;
-							preDirty = true;
-						}
-					}
-					channelsWithExistingFile.push(chId);
-				} else {
-					channelsNewSession.push(chId);
-				}
-			}
-
-			// Save the pre-computed session bindings BEFORE creating sessions
-			if (preDirty) {
-				writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf-8");
-			}
-
-			// Create sessions for channels with existing files
-			for (const chId of channelsWithExistingFile) {
-				try {
-					await sessionStore.getOrCreate(chId);
-					console.log(`[discord] Session keeper: created session for channel ${chId}`);
-				} catch (err) {
-					console.error(`[discord] Session keeper: failed to create session for ${chId}:`, err);
-				}
-			}
-
-			// For channels without existing session files, create the session
-			// first, then update job.session and restart the scheduler so it
-			// picks up the bound job.
-			for (const chId of channelsNewSession) {
-				try {
-					const discordSession = await sessionStore.getOrCreate(chId);
-					const sessionId = discordSession.session.getSessionStats().sessionId;
-					setChannelJobsSessionSync(chId, sessionId);
-					sessionStore.dispose(chId);
-					await sessionStore.getOrCreate(chId);
-					console.log(`[discord] Session keeper: created and bound session for channel ${chId}`);
-				} catch (err) {
-					console.error(`[discord] Session keeper: failed for new channel ${chId}:`, err);
-				}
+		// One creation pass per channel, then bind the job to the live runtime id.
+		// The old flow pre-bound from the on-disk file id and then disposed and
+		// re-created the session to "pick up" the rebind, which minted a fresh
+		// UUID each pass and left the store rewritten after the cron was armed.
+		for (const chId of channelsNeeded) {
+			try {
+				const discordSession = await sessionStore.getOrCreate(chId);
+				const sessionId = discordSession.session.getSessionStats().sessionId;
+				setChannelJobsSessionSync(chId, sessionId);
+				console.log(`[discord] Session keeper: created session for channel ${chId} (session ${sessionId})`);
+			} catch (err) {
+				console.error(`[discord] Session keeper: failed to create session for ${chId}:`, err);
 			}
 		}
 

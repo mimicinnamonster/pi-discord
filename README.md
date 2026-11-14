@@ -192,6 +192,9 @@ WorkingDirectory=/home/<user>/Projects/pi-discord
 ExecStart=<node-bin> --env-file-if-exists=.env src/index.ts
 Environment=PATH=<mise-shims>:<pi-bin>:/usr/local/bin:/usr/bin:/bin
 Environment=PI_DISCORD_BOT=1
+# Cron expressions for scheduled prompts are evaluated in this zone. Without it
+# the host's UTC applies, so "0 0 7 * * 1-5" fires at 08:00/09:00 Amsterdam.
+Environment=TZ=Europe/Amsterdam
 Environment=PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT=<pi-coding-agent-root>
 Restart=always
 RestartSec=5
@@ -204,6 +207,12 @@ WantedBy=multi-user.target
 > `WantedBy=default.target`. A `multi-user.target` unit enabled with
 > `systemctl --user` is linked into a target the user manager never reaches, so it
 > silently never starts at boot.
+
+> **Timezone:** keep `Environment=TZ=Europe/Amsterdam`. `pi-schedule-prompt` has
+> no timezone option and evaluates cron expressions in the process zone, so on a
+> UTC host a job written as `0 0 7 * * 1-5` otherwise fires at 08:00 (winter) /
+> 09:00 (summer) local time. The catch-up path in `src/schedule-catchup.ts` uses
+> the same process zone, so the two agree.
 
 ### Unit gotchas
 
