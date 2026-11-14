@@ -14,8 +14,24 @@ import {
 	type PostCompletionStallInput,
 	type PostCompletionStallRefusal,
 } from "./post-completion-stall.ts";
-import { probeLiveChildProcesses } from "./child-process-probe.ts";
-import { formatOutstandingRuns, hasProgressingAsyncWork, summarizeRunStore } from "./subagent-run-store.ts";
+import { probeLiveChildProcesses, isProcessAlive } from "./child-process-probe.ts";
+import {
+	findResultPayload,
+	formatOutstandingRuns,
+	hasProgressingAsyncWork,
+	listRunStatuses,
+	summarizeRunStore,
+} from "./subagent-run-store.ts";
+import {
+	buildWakePrompt,
+	isFinishedRunState,
+	isOrphanCompletion,
+	parseTranscriptTail,
+	readTranscriptTail,
+	type FinishedRunRef,
+	type OrphanCompletionDecision,
+} from "./completion-orphans.ts";
+import { createOrphanWakeStore, ORPHAN_WAKES_FILE } from "./orphan-wake-store.ts";
 import { isNonRetryableModelError, retryHintForModelError } from "./retry-policy.ts";
 import { splitMessagePreservingCodeBlocks, DISCORD_CHUNK_LIMIT } from "./message-chunker.ts";
 import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
@@ -27,7 +43,7 @@ import type { AgentSession, AgentSessionEvent, SessionMessageEntry, SessionEntry
 import { generateSummary, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
 import { homedir } from "os";
 import { join } from "path";
-import { writeFileSync, readFileSync, existsSync, readdirSync, openSync, readSync, closeSync } from "fs";
+import { writeFileSync, readFileSync, existsSync, readdirSync, openSync, readSync, closeSync, statSync } from "fs";
 import { Cron } from "croner";
 import {
 	loadBranchMetadata,
@@ -280,6 +296,12 @@ const promptQueue = new Map<string, string[]>();
 // subagent work. Persisted to disk so a wedged run (or a restart) cannot lose
 // them; entries are removed once the message shows up in the session.
 const pendingMessages = createPendingMessageStore(join(sessionDir, PENDING_MESSAGES_FILE));
+
+//
+// Background completions already announced by the orphan watchdog. Persisted so a
+// restart cannot wake the same completion twice and post its report again.
+// See src/completion-orphans.ts.
+const orphanWakes = createOrphanWakeStore(join(sessionDir, ORPHAN_WAKES_FILE));
 
 // Track active session labels per channel (set via /label or /session [label])
 const sessionLabels = new Map<string, string>();
@@ -2235,6 +2257,255 @@ async function main() {
 	const REPLAY_DELIVERY_TIMEOUT_MS = 30_000;
 
 	/**
+	 * Register the Discord-forwarding subscriber for a channel's session, once.
+	 *
+	 * Anything that sends a prompt without a Discord message behind it (a replayed
+	 * parked message, a scheduled job, the orphan-completion wake) is invisible
+	 * until the session has a subscriber: the agent's output is forwarded from
+	 * session events, so without one the answer posts nowhere. Returns the existing
+	 * subscription when there is one, and undefined when the channel cannot be
+	 * fetched.
+	 */
+	function ensureChannelSubscription(
+		channelId: string,
+		discordSession: DiscordSession,
+		channel?: DMChannel | TextChannel | NewsChannel
+	): SessionSubscription | undefined {
+		const existing = sessionSubscriptions.get(channelId);
+		if (existing) return existing;
+		if (!channel) {
+			log(`[${channelId}] Cannot subscribe: channel object unavailable`);
+			return undefined;
+		}
+		const subscription = subscribeToSession(
+			discordSession.session,
+			channelId,
+			channel,
+			typingManager,
+			sessionDir,
+			getChannelOutputSettings
+		);
+		sessionSubscriptions.set(channelId, subscription);
+		subscribedSessions.add(channelId);
+		return subscription;
+	}
+
+	/**
+	 * How long a wake prompt is given to be handed to the session before the wake is
+	 * recorded as sent.
+	 *
+	 * `sendUserMessage()` resolves only when the whole run settles, and the run this
+	 * wake exists for is the one that never settled — awaiting it would hang the
+	 * sweep. Acceptance is what matters here: a rejection is detectable immediately,
+	 * and anything else means the prompt is in the session.
+	 */
+	const ORPHAN_WAKE_ACCEPT_MS = 2_000;
+
+	/** How far back the sweep looks for a channel transcript worth inspecting. */
+	const ORPHAN_SCAN_LOOKBACK_MS = 48 * 60 * 60_000;
+
+	/** Runs inspected per orphan check. Generous: each status file is a few KB. */
+	const ORPHAN_RUN_SCAN_LIMIT = 500;
+
+	/** `discord-<channelId>.jsonl` is the live transcript; timestamped files are backups. */
+	const ACTIVE_TRANSCRIPT_PATTERN = /^discord-(\d+)\.jsonl$/;
+
+	/** Channel id encoded in a session path, if this is a channel transcript. */
+	function channelIdFromSessionPath(sessionPath: string | undefined): string | undefined {
+		if (!sessionPath) return undefined;
+		const name = sessionPath.slice(sessionPath.lastIndexOf("/") + 1);
+		return name.match(/^discord-(\d+)(?:-\d+)?\.jsonl$/)?.[1];
+	}
+
+	/**
+	 * Channels worth checking for an orphaned completion: live subscriptions plus
+	 * recently written channel transcripts.
+	 *
+	 * The transcripts are included because the orphan case that matters most (a
+	 * restart that killed the run which would have announced itself) leaves exactly
+	 * one trace: the notify record in that file, with no session loaded for the
+	 * channel yet.
+	 */
+	function orphanCandidateChannels(): string[] {
+		const candidates = new Set<string>(subscribedSessions);
+		try {
+			const cutoff = Date.now() - ORPHAN_SCAN_LOOKBACK_MS;
+			for (const name of readdirSync(sessionDir)) {
+				const channelId = name.match(ACTIVE_TRANSCRIPT_PATTERN)?.[1];
+				if (!channelId) continue;
+				try {
+					if (statSync(join(sessionDir, name)).mtimeMs < cutoff) continue;
+				} catch {
+					continue;
+				}
+				candidates.add(channelId);
+			}
+		} catch (err) {
+			log(`[discord] Orphan sweep: cannot list ${sessionDir}: ${String(err)}`);
+		}
+		return [...candidates];
+	}
+
+	/**
+	 * Newest run in this channel that has already terminalised.
+	 *
+	 * Attribution uses the run's recorded `sessionId`, which for this bot is the
+	 * channel transcript. A run that finished without announcing itself is the
+	 * second orphan shape: no notify record exists at all, so there is nothing in
+	 * the transcript to detect.
+	 */
+	function newestFinishedRun(channelId: string): FinishedRunRef | undefined {
+		// The diagnostic snapshot caps at a handful of runs; here the whole store has to
+		// be considered, because the run that matters may sort anywhere in it.
+		const snapshot = listRunStatuses({ maxRuns: ORPHAN_RUN_SCAN_LIMIT });
+		if (snapshot.error) return undefined;
+		let newest: FinishedRunRef | undefined;
+		for (const run of snapshot.runs) {
+			if (!isFinishedRunState(run.state)) continue;
+			if (channelIdFromSessionPath(run.sessionId) !== channelId) continue;
+			const endedAt = run.endedAt ?? run.lastUpdate;
+			if (endedAt === undefined) continue;
+			if (newest && (newest.endedAt ?? 0) >= endedAt) continue;
+			newest = {
+				runId: run.runId,
+				state: run.state,
+				endedAt,
+				pidAlive: run.pid === undefined ? undefined : isProcessAlive(run.pid),
+				hasResult: findResultPayload(run.runId) !== undefined,
+			};
+		}
+		return newest;
+	}
+
+	/**
+	 * Send the wake for a confirmed orphan and record it.
+	 *
+	 * The completion is re-evaluated just before sending: subscribing and creating a
+	 * session can take long enough for the normal delivery path to catch up, and a
+	 * second report would be a duplicate message.
+	 */
+	async function wakeOrphanedCompletion(
+		channelId: string,
+		decision: OrphanCompletionDecision
+	): Promise<boolean> {
+		const channel = await fetchChannelObject(channelId);
+		if (!channel) {
+			log(`[watchdog] ${channelId} orphan completion cannot be announced: channel unavailable`);
+			return false;
+		}
+
+		let discordSession = sessionStore.get(channelId);
+		if (!discordSession) {
+			// Channel name, not the channel object: getOrCreate() uses it for the
+			// session header, and it resolves the transcript path itself.
+			discordSession = await sessionStore.getOrCreate(
+				channelId,
+				"name" in channel && typeof channel.name === "string" ? channel.name : undefined
+			);
+		}
+		if (discordSession.isModelActive()) {
+			log(`[watchdog] ${channelId} orphan completion deferred: session became active`);
+			return false;
+		}
+
+		ensureChannelSubscription(channelId, discordSession, channel);
+
+		const tail = parseTranscriptTail(readTranscriptTail(currentTranscriptPath(channelId, discordSession)));
+		const finishedRun = newestFinishedRun(channelId);
+		const recheck = isOrphanCompletion({
+			channelId,
+			tail,
+			finishedRun,
+			now: Date.now(),
+			isWoken: (key) => orphanWakes.has(key),
+		});
+		if (!recheck.orphan) {
+			log(`[watchdog] ${channelId} orphan completion withdrawn (${recheck.refusal})`);
+			return false;
+		}
+
+		const prompt = buildWakePrompt({
+			runId: recheck.runId ?? finishedRun?.runId,
+			state: recheck.state ?? finishedRun?.state,
+			wakeAt: recheck.wakeAt ?? decision.wakeAt ?? Date.now(),
+			resultAvailable: finishedRun?.hasResult === true,
+			notifyContent: tail.lastNotifyContent,
+		});
+
+		const sendOutcome = discordSession.session.sendUserMessage(prompt).then(
+			() => ({ kind: "settled" as const }),
+			(error: unknown) => ({ kind: "rejected" as const, error })
+		);
+		const acceptance = await Promise.race([
+			sendOutcome,
+			new Promise<{ kind: "pending" }>((finish) => setTimeout(() => finish({ kind: "pending" }), ORPHAN_WAKE_ACCEPT_MS)),
+		]);
+
+		if (acceptance.kind === "rejected") {
+			// Nothing was queued, so the next sweep retries instead of marking it done.
+			console.error(
+				`[watchdog] ${channelId} orphan completion wake rejected (will retry): ${String(acceptance.error)}`
+			);
+			return false;
+		}
+
+		const key = recheck.key ?? decision.key;
+		if (key) orphanWakes.mark(key);
+		console.warn(
+			`[watchdog] orphan completion run=${recheck.runId ?? finishedRun?.runId ?? "unknown"} channel=${channelId} ` +
+				`ageMs=${Date.now() - (recheck.wakeAt ?? decision.wakeAt ?? Date.now())} via=${recheck.detectedBy ?? "notify"}`
+		);
+		return true;
+	}
+
+	/** Transcript a channel's live session writes to, falling back to the default path. */
+	function currentTranscriptPath(channelId: string, discordSession?: DiscordSession): string {
+		return discordSession?.session.sessionFile || join(sessionDir, `discord-${channelId}.jsonl`);
+	}
+
+	/**
+	 * Announce background completions that were written to a transcript but never
+	 * delivered, so the bot reacts without a user prompt.
+	 *
+	 * Runs on startup (a restart mid-workflow is the observed cause) and on every
+	 * sweep. Deliberately narrow: a channel with parked messages is left to the
+	 * replay path, an active session is left alone, and every wake is keyed so a
+	 * restart cannot post the same completion twice.
+	 */
+	async function runOrphanCompletionSweep(): Promise<void> {
+		for (const channelId of orphanCandidateChannels()) {
+			try {
+				if (recoveringChannels.has(channelId)) continue;
+				// The replay path owns a channel whose waiters are already queued.
+				if (pendingMessages.forChannel(channelId).length > 0) continue;
+
+				const discordSession = sessionStore.get(channelId);
+				if (discordSession?.isModelActive()) continue;
+
+				const tail = parseTranscriptTail(
+					readTranscriptTail(currentTranscriptPath(channelId, discordSession))
+				);
+				// An unreadable tail is not evidence of an orphan; only an unparseable
+				// mixture with zero usable records is worth refusing on.
+				if (tail.meaningfulCount === 0) continue;
+
+				const decision = isOrphanCompletion({
+					channelId,
+					tail,
+					finishedRun: newestFinishedRun(channelId),
+					now: Date.now(),
+					isWoken: (key) => orphanWakes.has(key),
+				});
+				if (!decision.orphan) continue;
+
+				await wakeOrphanedCompletion(channelId, decision);
+			} catch (err) {
+				console.error(`[discord] Orphan completion check failed for ${channelId}:`, err);
+			}
+		}
+	}
+
+	/**
 	 * Re-send messages parked while the channel was draining background subagent
 	 * work (see src/pending-messages.ts) now that the blocking run is gone.
 	 *
@@ -2263,21 +2534,10 @@ async function main() {
 			// A replay without a subscription is invisible: the user message never
 			// surfaces as an event, so delivery cannot be observed and the answer would
 			// post nowhere. Subscribe first, exactly as handleMessage() does.
-			if (!sessionSubscriptions.has(channelId) && !subscribedSessions.has(channelId)) {
+			if (!sessionSubscriptions.has(channelId)) {
 				const replayChannel = await fetchChannelObject(channelId);
 				if (replayChannel) {
-					sessionSubscriptions.set(
-						channelId,
-						subscribeToSession(
-							discordSession.session,
-							channelId,
-							replayChannel,
-							typingManager,
-							sessionDir,
-							getChannelOutputSettings
-						)
-					);
-					subscribedSessions.add(channelId);
+					ensureChannelSubscription(channelId, discordSession, replayChannel);
 					log(`[${channelId}] Replay: subscribed to the session so delivery can be observed`);
 				}
 			}
@@ -3913,6 +4173,15 @@ async function main() {
 		}
 	}
 
+	// One catch-up pass for background completions that were written to a transcript
+	// but never announced: a restart while a workflow was still running is how that
+	// happens, and without this the channel stays silent until a human prompts it.
+	try {
+		await runOrphanCompletionSweep();
+	} catch (err) {
+		console.error("[discord] Orphan completion sweep at startup failed:", err);
+	}
+
 	// Self-heal: release orphaned background subagent runs (completion event never
 	// arrived), recover channels whose run wedged between agent_end and the SDK's
 	// settle path, and replay anything parked. Runs without user input, so a
@@ -4026,9 +4295,13 @@ async function main() {
 			}
 		}
 
+		// Announce completions that were written to a transcript but never delivered.
+		// After the recovery pass (a rebuilt session is idle by then) and before the
+		// replay pass, which owns any channel that still has parked messages.
+		await runOrphanCompletionSweep();
+
 		for (const chId of candidates) {
-			if (sessionStore.get(chId)?.hasPendingBackgroundWork()) continue; // legitimately draining still
-			// A channel mid-rebuild is being handled by the recovery pass; replaying
+			if (sessionStore.get(chId)?.hasPendingBackgroundWork()) continue; // legitimately draining still			// A channel mid-rebuild is being handled by the recovery pass; replaying
 			// against a session that is about to be disposed would post into nowhere.
 			if (recoveringChannels.has(chId)) continue;
 			// Without a subscription the replayed prompt is answered into the void and

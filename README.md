@@ -239,6 +239,24 @@ sudo systemctl restart pi-discord   # or: systemctl --user restart pi-discord
 credentials. Anonymous HTTPS is read-only by design — push from a development
 machine, not from the server.
 
+**Restart only when no subagent run is in flight.** A background run reports its
+result through the process that started it; restarting mid-run kills the runner
+before it can announce anything, which leaves a completion nobody is waiting for
+(the bot then stays silent until someone prompts it). Use the guard instead of a
+bare restart:
+
+```bash
+./scripts/restart-when-idle.sh                 # waits, then restarts
+./scripts/restart-when-idle.sh --dry-run       # just report what is in flight
+./scripts/restart-when-idle.sh --max-wait 600  # wait longer
+./scripts/restart-when-idle.sh --force         # restart anyway
+```
+
+It reads the async-run store (`$PI_SUBAGENTS_TEMP_ROOT`, else
+`<tmpdir>/pi-subagents-<scope>/async-subagent-runs`) and only waits on runs that
+are `queued`/`running` **with a live pid** — a stale record never blocks the
+restart that would clear it.
+
 ### Diagnosing a hang
 
 A wedged run shows up as the bot going quiet while every new message is answered
@@ -271,6 +289,25 @@ actual parked frame use the inspector: start the unit with
 `--inspect=127.0.0.1:9229` (or send `SIGUSR1`), attach, run `Debugger.pause`, then
 read the stack plus `process._getActiveHandles()` and
 `process._getActiveRequests()`.
+
+### Background completions that never arrive
+
+A subagent completion is delivered through the process that started the run. If
+that process is gone — a restart mid-workflow, the case the deploy guard above
+avoids — the notice is written to the transcript as a `subagent-notify` record
+and no turn starts: the channel stays silent until someone prompts it.
+
+The orphan-completion watchdog covers that case. On startup and on every sweep it
+reads the channel transcript and wakes the session itself when either
+
+- a `subagent-notify` record has no assistant message after it, or
+- a finished run's end is newer than everything the transcript recorded (the
+  completion was never announced at all).
+
+Every wake logs `[watchdog] orphan completion run=<id> channel=<id> ageMs=<..>`
+and is recorded in `~/.pi-discord/sessions/orphan-wakes.json`, so a restart cannot
+announce the same completion twice. The wake states plainly when a run left no
+result payload, instead of implying one exists.
 
 ## Architecture
 

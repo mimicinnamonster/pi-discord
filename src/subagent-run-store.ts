@@ -58,6 +58,15 @@ export interface RunStatusRecord {
 	pid?: number;
 	/** Epoch ms of the last status write. */
 	lastUpdate?: number;
+	/** Epoch ms the run terminalised, when the runner recorded it. */
+	endedAt?: number;
+	/**
+	 * Agent session file the run belongs to.
+	 *
+	 * For this bot that is the channel transcript, which is what lets the orphan
+	 * watchdog attribute a finished run to the channel it should have woken.
+	 */
+	sessionId?: string;
 }
 
 /** An outstanding run as rendered in the diagnostic line. */
@@ -152,6 +161,8 @@ export function parseRunStatus(json: string, fallbackRunId: string): RunStatusRe
 		state: record.state,
 		pid: typeof record.pid === "number" && record.pid > 0 ? record.pid : undefined,
 		lastUpdate: typeof record.lastUpdate === "number" ? record.lastUpdate : undefined,
+		endedAt: typeof record.endedAt === "number" ? record.endedAt : undefined,
+		sessionId: typeof record.sessionId === "string" && record.sessionId ? record.sessionId : undefined,
 	};
 }
 
@@ -295,4 +306,91 @@ export function summarizeRunStore(options: SummarizeOptions = {}): RunStoreSumma
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
+}
+
+/** Every run status the store could parse, outstanding or not. */
+export interface RunStatusSnapshot {
+	dir?: string;
+	runs: RunStatusRecord[];
+	/** Set when the store could not be read; `runs` is then empty. */
+	error?: string;
+}
+
+export interface ListRunStatusesOptions {
+	dir?: string;
+	maxRuns?: number;
+}
+
+/**
+ * Read every parseable `status.json` in the async-run store.
+ *
+ * The diagnostic snapshot above deliberately keeps only outstanding runs; the
+ * orphan-completion watchdog needs the opposite half — the runs that already
+ * finished — to tell a completion that was announced from one that was silently
+ * dropped. Reading is shared so both views describe the same store.
+ *
+ * Never throws: an unreadable store is reported, not propagated.
+ */
+export function listRunStatuses(options: ListRunStatusesOptions = {}): RunStatusSnapshot {
+	const dir = options.dir ?? resolveAsyncRunStoreDir();
+	const maxRuns = options.maxRuns ?? MAX_SUMMARIZED_RUNS;
+
+	let entries: string[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name)
+			.sort();
+	} catch (err) {
+		return { dir, runs: [], error: `cannot read ${dir}: ${errorMessage(err)}` };
+	}
+
+	const runs: RunStatusRecord[] = [];
+	for (const entry of entries.slice(0, maxRuns)) {
+		try {
+			const record = parseRunStatus(readFileSync(join(dir, entry, "status.json"), "utf8"), entry);
+			if (record) runs.push(record);
+		} catch {
+			// Missing or half-written status.json: nothing to report for this run.
+		}
+	}
+	return { dir, runs };
+}
+
+/**
+ * Directory holding delivered-result payloads, sibling to the run directory.
+ *
+ * pi-subagents writes `<tempRoot>/async-subagent-results/<runId>-<ts>.json`, so
+ * the same temp-root/scope resolution applies.
+ */
+export function resolveAsyncResultStoreDir(
+	env: NodeJS.ProcessEnv = process.env,
+	tempRoot: string = tmpdir()
+): string {
+	const configuredRoot = env.PI_SUBAGENTS_TEMP_ROOT?.trim();
+	const root = configuredRoot
+		? resolve(configuredRoot)
+		: join(tempRoot, `pi-subagents-${resolveTempScopeId(env)}`);
+	return join(root, "async-subagent-results");
+}
+
+/**
+ * Path of the result payload for a run, or undefined when it produced none.
+ *
+ * A run can terminalise without ever writing a result (observed live: run
+ * `a68f7721` completed and left nothing), which is exactly the case the wake
+ * prompt must report as unavailable rather than silently imply success.
+ */
+export function findResultPayload(runId: string, options: { dir?: string } = {}): string | undefined {
+	const dir = options.dir ?? resolveAsyncResultStoreDir();
+	const shortId = shortRunId(runId);
+	try {
+		const match = readdirSync(dir)
+			.filter((name) => name.startsWith(shortId))
+			.sort()
+			.at(-1);
+		return match ? join(dir, match) : undefined;
+	} catch {
+		return undefined;
+	}
 }
