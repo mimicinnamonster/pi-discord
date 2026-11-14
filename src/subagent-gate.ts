@@ -53,6 +53,12 @@ export interface SubagentGate {
 	 * main turn (and therefore overlap the agent_end drain in src/index.ts).
 	 */
 	pendingAsyncWork(): number;
+	/**
+	 * Any subagent work in this channel, async runs *and* sync in-flight tool
+	 * calls. Used by the stale-run watchdog: a sync child emits no session event
+	 * for its whole duration, so its silence must not look like a wedged run.
+	 */
+	hasActiveWork(): boolean;
 	acquireSync(toolCallId: string): boolean;
 	releaseSync(toolCallId: string): void;
 	onAsyncStarted(payload: unknown): void;
@@ -100,6 +106,10 @@ export function createSubagentGate(options: SubagentGateOptions = {}): SubagentG
 
 		pendingAsyncWork(): number {
 			return asyncRuns.size;
+		},
+
+		hasActiveWork(): boolean {
+			return holderCount() > 0;
 		},
 
 		acquireSync(toolCallId: string): boolean {

@@ -3,7 +3,7 @@
  * Tests for the session persistence behavior
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { SessionStore } from "../src/session-store.ts";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
@@ -146,6 +146,19 @@ describe("SessionStore", () => {
 			const target = available.find((m) => m.provider === "google" && m.id === "gemma-4-31b-it") ?? available[0];
 			await discordSession.setModel(target.provider, target.id);
 			expect(discordSession.session.settingsManager.getRetrySettings().maxRetries).toBe(3);
+		});
+	});
+
+	describe("Provider Idle Timeout", () => {
+		it("should force a finite provider idle timeout over a global 0", async () => {
+			// A human `httpIdleTimeoutMs: 0` is expanded by the SDK to ~24.8 days, and
+			// the library entry the bot imports never installs the undici dispatcher
+			// that would otherwise cap a stalled response body. The bot therefore has
+			// to impose its own ceiling, and it has to survive session creation (which
+			// reloads settings from disk and drops earlier overrides).
+			const discordSession = await store.getOrCreate("idle-timeout-channel");
+
+			expect(discordSession.session.settingsManager.getHttpIdleTimeoutMs()).toBe(600_000);
 		});
 	});
 
@@ -432,6 +445,42 @@ describe("SessionStore", () => {
 
 			expect(store.getClosedSessions(channelId)[0].label).toBe("pre-experiment");
 			expect(await store.resumeSession(channelId, "pre-experiment")).toBe(true);
+		});
+
+		it("should keep the pre-fork snapshot when fork and resume share a timestamp", async () => {
+			// Backups used to be named `<file>-<Date.now()>.jsonl` and written with
+			// renameSync, which overwrites silently. A fork followed by a resume inside
+			// the same millisecond therefore moved the forked session onto the snapshot's
+			// path: the snapshot was destroyed and the "resumed" session came back with
+			// the fork's UUID. Freezing the clock makes that collision deterministic
+			// instead of a timing flake.
+			const channelId = "fork-same-ms-channel";
+			const sessionId = "fork-session-id-005";
+			writeSessionFixture(channelId, sessionId);
+
+			await store.getOrCreate(channelId);
+
+			const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
+			try {
+				await store.forkSession(channelId);
+
+				const closed = store.getClosedSessions(channelId);
+				expect(closed.length).toBe(1);
+				expect(closed[0].sessionId).toBe(sessionId);
+				const snapshotHeader = JSON.parse(readFileSync(closed[0].sessionFile, "utf-8").split("\n")[0]);
+				expect(snapshotHeader.id).toBe(sessionId);
+
+				expect(await store.resumeSession(channelId, sessionId)).toBe(true);
+
+				// The live file is the snapshot again, not the fork.
+				const restoredHeader = JSON.parse(readFileSync(store.getSessionFile(channelId), "utf-8").split("\n")[0]);
+				expect(restoredHeader.id).toBe(sessionId);
+
+				const restored = await store.getOrCreate(channelId);
+				expect(restored.session.getSessionStats().sessionId).toBe(sessionId);
+			} finally {
+				nowSpy.mockRestore();
+			}
 		});
 
 		it("should preserve cwd and model metadata across fork", async () => {

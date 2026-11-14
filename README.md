@@ -239,6 +239,39 @@ sudo systemctl restart pi-discord   # or: systemctl --user restart pi-discord
 credentials. Anonymous HTTPS is read-only by design — push from a development
 machine, not from the server.
 
+### Diagnosing a hang
+
+A wedged run shows up as the bot going quiet while every new message is answered
+with 🛑 *Interrupted by user*. The self-heal sweep recovers these on its own and
+every recovery logs a `[watchdog]` line, including a snapshot of the outstanding
+subagent runs (`runId`, `state`, `pid`, `pidAlive`, `ageMs`) — that line names
+the child that pinned the settle path.
+
+When the journal is not enough, capture the live state. The process is idle by
+definition (it is parked on a promise), so CPU profiling proves nothing and
+`gdb -p <pid> -batch -ex bt` only shows `epoll_wait`.
+
+```ini
+# in the unit — quote it: systemd splits an unquoted Environment= on spaces
+Environment="NODE_OPTIONS=--report-on-signal --report-signal=SIGUSR2 --report-directory=/var/lib/pi-discord/reports"
+ExecStartPre=/bin/mkdir -p /var/lib/pi-discord/reports
+```
+
+```bash
+kill -USR2 <bot pid>        # writes report.<date>.<pid>.0.001.json
+jq '.libuv[] | select(.is_active) | {type, localEndpoint, remoteEndpoint, firesInMsFromNow}' \
+  /var/lib/pi-discord/reports/report.*.json
+```
+
+The `libuv` section is what matters: an active TCP write/listen handle on a
+provider socket with no matching progress is the fingerprint of a stalled
+stream. `javascriptStack` is present but usually empty for a signal-triggered
+report — Node only fills it when the report comes from a JS error — so for the
+actual parked frame use the inspector: start the unit with
+`--inspect=127.0.0.1:9229` (or send `SIGUSR1`), attach, run `Debugger.pause`, then
+read the stack plus `process._getActiveHandles()` and
+`process._getActiveRequests()`.
+
 ## Architecture
 
 ```

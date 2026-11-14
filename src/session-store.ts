@@ -92,6 +92,33 @@ function resolveMaxRetries(): number {
 	return Number.isFinite(fromEnv) && fromEnv >= 0 ? fromEnv : DEFAULT_MAX_RETRIES;
 }
 
+/**
+ * Ceiling for an idle provider stream body.
+ *
+ * The CLI installs an undici dispatcher that caps idle response bodies
+ * (configureHttpDispatcher, DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000), but the bot
+ * imports the library entry (dist/index.js), which never configures it. The only
+ * remaining lever is the per-request `timeoutMs`, derived from
+ * `settings.httpIdleTimeoutMs` — and a human config may set that to 0, which the
+ * SDK expands to 2147483647 ms (~24.8 days). With no cap, a stream that stalls
+ * inside the post-run/settle phase parks the run forever: the run-active latch
+ * only clears when the run settles (see the stale-run watchdog in src/index.ts).
+ *
+ * 600_000 (10 minutes) is deliberately longer than the CLI default: a long
+ * reasoning turn must not be cut off mid-stream, and the watchdog recovers a
+ * genuinely stalled run in about two minutes anyway, so this value only has to
+ * be finite. It exists to stop a *never*-ending body, not a slow one.
+ */
+const PROVIDER_HTTP_IDLE_TIMEOUT_MS = 600_000;
+
+/** Session settings that must survive `session.reload()` (it wipes in-memory overrides). */
+function applySettingsOverrides(settingsManager: SettingsManager): void {
+	settingsManager.applyOverrides({
+		retry: { enabled: true, maxRetries: resolveMaxRetries() },
+		httpIdleTimeoutMs: PROVIDER_HTTP_IDLE_TIMEOUT_MS,
+	});
+}
+
 // Per-channel "max 1 subagent at a time" gate. Each channel session gets its
 // own SubagentGate instance (created here, keyed only by this session), so
 // channels are independent: one channel's in-flight subagent never blocks
@@ -161,17 +188,15 @@ export class DiscordSession {
 		const m = this.session.modelRuntime.getModel(provider, model)
 		if (!m) throw new Error(`Can't find model ${provider}/${model}`)
 		await this.session.setModel(m);
-		this.applyRetryOverrides();
+		this.applySessionSettingsOverrides();
 	}
 
 	/**
-	 * Public so the Discord layer can re-apply retry overrides after
+	 * Public so the Discord layer can re-apply the overrides after
 	 * `session.reload()`, which resets in-memory settings.
 	 */
-	applyRetryOverrides() {
-		this.session.settingsManager.applyOverrides({
-			retry: { enabled: true, maxRetries: resolveMaxRetries() },
-		});
+	applySessionSettingsOverrides() {
+		applySettingsOverrides(this.session.settingsManager);
 	}
 
 	isModelActive() {
@@ -191,6 +216,16 @@ export class DiscordSession {
 	 */
 	hasPendingBackgroundWork(): boolean {
 		return (subagentGates.get(this.channelId)?.pendingAsyncWork() ?? 0) > 0;
+	}
+
+	/**
+	 * True while *any* subagent work is live in this channel, including sync
+	 * tool calls. A sync child produces no session event while it runs, so the
+	 * stale-run watchdog (src/stuck-run-decision.ts) must not read that silence
+	 * as a wedge.
+	 */
+	hasActiveSubagentWork(): boolean {
+		return subagentGates.get(this.channelId)?.hasActiveWork() ?? false;
 	}
 }
 
@@ -395,6 +430,28 @@ export class SessionStore {
 		return join(this.sessionDir, `discord-${channelId}.jsonl`);
 	}
 
+	/**
+	 * Timestamped sibling path for a session file that does not exist yet.
+	 *
+	 * `renameSync` overwrites its destination silently, so every backup name must
+	 * be unique on disk, not just unique by millisecond. Forking a session and
+	 * then resuming it inside the same `Date.now()` millisecond used to make
+	 * `resumeSession`'s swap land on the pre-fork snapshot's path: the snapshot was
+	 * overwritten by the forked file, and the "resumed" session came back with the
+	 * fork's UUID instead of the snapshot's. Probing for a free name keeps each
+	 * backup distinct (see the `-1`, `-2` suffixes after the timestamp).
+	 */
+	private uniqueBackupPath(sessionFile: string, timestamp: number = Date.now()): string {
+		const base = sessionFile.replace(/\.jsonl$/, "");
+		let candidate = `${base}-${timestamp}.jsonl`;
+		let suffix = 1;
+		while (existsSync(candidate)) {
+			candidate = `${base}-${timestamp}-${suffix}.jsonl`;
+			suffix += 1;
+		}
+		return candidate;
+	}
+
 	// ============================================================================
 	// Index Persistence
 	// ============================================================================
@@ -544,9 +601,7 @@ export class SessionStore {
 		// Load settings and apply overrides
 		const finalCwd = cwd || process.cwd();
 		const settingsManager = SettingsManager.create(finalCwd, agentDir);
-		settingsManager.applyOverrides({
-			retry: { enabled: true, maxRetries: resolveMaxRetries() },
-		});
+		applySettingsOverrides(settingsManager);
 
 		// Store channel name if provided
 		if (channelName) {
@@ -607,6 +662,14 @@ export class SessionStore {
 		const { session } = agent
 
 		sessionRef = session;
+
+		// Re-apply after creation: building the session reloads settings from disk,
+		// which discards the overrides applied above. Without this the bot would
+		// inherit the human `httpIdleTimeoutMs: 0` (~24.8 days) and a stalled
+		// stream body could park a run forever. Prefer the session's manager (it is
+		// what buildRequestOptions reads) and fall back to the one we created for
+		// sessions/mocks that do not expose it.
+		applySettingsOverrides(session.settingsManager ?? settingsManager);
 
 		// Restore the channel's persisted thinking mode (channel-scoped, defaults
 		// to "off") onto this freshly created session so it survives restarts,
@@ -889,7 +952,7 @@ export class SessionStore {
 
 		// Generate backup filename with timestamp
 		const timestamp = Date.now();
-		const backupFile = oldSessionFile.replace(/\.jsonl$/, `-${timestamp}.jsonl`);
+		const backupFile = this.uniqueBackupPath(oldSessionFile, timestamp);
 
 		this.log(`[${channelId}] Closing session ${sessionId}, moving ${oldSessionFile} → ${backupFile}`);
 
@@ -996,7 +1059,7 @@ export class SessionStore {
 		//    as a closed-session file — resumeSession unlinks the default path
 		//    before restoring, which would destroy the snapshot.
 		const timestamp = Date.now();
-		const backupFile = oldSessionFile.replace(/\.jsonl$/, `-${timestamp}.jsonl`);
+		const backupFile = this.uniqueBackupPath(oldSessionFile, timestamp);
 		if (existsSync(oldSessionFile)) {
 			if (oldSessionFile === defaultPath) {
 				copyFileSync(oldSessionFile, backupFile);
@@ -1106,7 +1169,9 @@ export class SessionStore {
 			// Move current session file to a backup
 			if (existsSync(currentFile)) {
 				const swapTimestamp = Date.now();
-				const swappedFile = currentFile.replace(/\.jsonl$/, `-${swapTimestamp}.jsonl`);
+				// Must not collide with the snapshot being restored below: a same-millisecond
+				// fork would otherwise clobber it (see uniqueBackupPath).
+				const swappedFile = this.uniqueBackupPath(currentFile, swapTimestamp);
 				renameSync(currentFile, swappedFile);
 
 				// Add the current session to closed sessions too, so it's not lost
@@ -1209,7 +1274,7 @@ export class SessionStore {
 				const oldFile = stats.sessionFile || defaultPath;
 				if (oldSessionId && existsSync(oldFile)) {
 					const ts = Date.now();
-					backupFile = oldFile.replace(/\.jsonl$/, `-${ts}.jsonl`);
+					backupFile = this.uniqueBackupPath(oldFile, ts);
 					renameSync(oldFile, backupFile);
 				}
 			} catch {

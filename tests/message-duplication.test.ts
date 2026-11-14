@@ -4,6 +4,16 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mkdtempSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { createPendingMessageStore } from "../src/pending-messages.ts";
+import {
+    evaluateStuckRun,
+    evaluateStuckRunLiveness,
+    REQUIRED_CONFIRMING_SWEEPS,
+    shouldRecoverStuckRun,
+} from "../src/stuck-run-decision.ts";
 
 // ============================================================================
 // Bug Detection: The check-then-add pattern is not atomic
@@ -524,5 +534,360 @@ describe("Message End Content Duplication Bug", () => {
             expect(sentMessages[0]).toBe("Your favorite color is pink! 🩷");
             expect(sentMessages[0].length).toBe(31);
         });
+    });
+});
+
+// ============================================================================
+// Stale-run recovery must run BEFORE the replay guard
+// ============================================================================
+//
+// replayPendingMessages() skips the replay while session.pendingMessageCount >
+// 0, because those queued messages belong to the session. A wedged run also
+// holds the followUps THIS process pushed (handleMessage with deliverAs:
+// "followUp"), so that raw count never drains and replaying first leaves the
+// user's message parked forever (observed live: "2 message(s) still queued in
+// the session - leaving 2 parked for a later sweep", every minute, forever).
+// The 60s self-heal sweep therefore recovers every channel (dispose +
+// getOrCreate, which yields an empty follow-up queue) before replaying any.
+
+interface FakeSession {
+    modelActive: boolean;
+    followUps: string[];
+    readonly pendingMessageCount: number;
+    isModelActive(): boolean;
+}
+
+describe("Stale-run recovery vs replay ordering", () => {
+    const CHANNEL = "1518152817620029592";
+    const THRESHOLD_MS = 10 * 60 * 1000;
+
+    function createRig() {
+        const store = createPendingMessageStore(
+            join(mkdtempSync(join(tmpdir(), "pi-discord-ordering-")), "pending-messages.json"),
+            { log: () => {} }
+        );
+        // The wedged session: still active, and it still holds the followUp we
+        // pushed for the parked message — exactly the live server state.
+        let session: FakeSession = createSession(true, ["any progress?"]);
+        let lastEventAt = Date.now() - THRESHOLD_MS * 2;
+        const delivered: string[] = [];
+        // Liveness inputs of the channel: a tool in flight means the silence is work.
+        let inFlightToolCount = 0;
+        let aborts = 0;
+        // Store membership of the channel, mirroring sessionStore's map: dispose()
+        // removes the entry and only a successful getOrCreate() puts one back.
+        let sessionExists = true;
+        let rebuildFails = false;
+        const recoveryFailureNotices: string[] = [];
+
+        function createSession(modelActive: boolean, followUps: string[]): FakeSession {
+            return {
+                modelActive,
+                followUps,
+                get pendingMessageCount(): number {
+                    return this.followUps.length;
+                },
+                isModelActive(): boolean {
+                    return this.modelActive;
+                },
+            };
+        }
+
+        // Mirrors recoverStuckSession() stage 2: dispose() + getOrCreate(). A
+        // rebuild that throws is the case the review flagged: dispose() already ran
+        // without a disposed flag, so the local reference points at an orphan.
+        function recover(): void {
+            sessionExists = false;
+            if (rebuildFails) {
+                rebuildFails = false;
+                throw new Error("getOrCreate failed");
+            }
+            session = createSession(false, []);
+            sessionExists = true;
+            lastEventAt = Date.now();
+        }
+
+        // Mirrors replayPendingMessages(): the abort of an active run is gated on
+        // the watchdog's liveness gates, so a live turn is never destroyed by a
+        // replay (finding 1b of the review of this rig's real counterpart).
+        function replay(): number {
+            const parked = store.forChannel(CHANNEL);
+            if (parked.length === 0) return 0;
+            if (session.isModelActive()) {
+                const refusal = evaluateStuckRunLiveness({
+                    modelActive: true,
+                    idleMs: Date.now() - lastEventAt,
+                    thresholdMs: THRESHOLD_MS,
+                    hasPendingBackgroundWork: false,
+                    inFlightToolCount,
+                    hasActiveSubagentWork: false,
+                    priorConfirmations: 0,
+                });
+                if (refusal) return 0;
+                aborts++;
+            }
+            if (session.pendingMessageCount > 0) return 0;
+            let replayed = 0;
+            for (const entry of parked) {
+                if (session.isModelActive()) break;
+                delivered.push(entry.content);
+                store.remove(CHANNEL, entry.discordMessageId);
+                replayed++;
+            }
+            return replayed;
+        }
+
+        function shouldRecover(): boolean {
+            return shouldRecoverStuckRun({
+                modelActive: session.isModelActive(),
+                idleMs: Date.now() - lastEventAt,
+                thresholdMs: THRESHOLD_MS,
+                hasPendingBackgroundWork: false,
+                // The wedge happens with no tool running; a sync child or an
+                // in-flight tool would legitimately keep the session silent.
+                inFlightToolCount: 0,
+                hasActiveSubagentWork: false,
+                priorConfirmations: REQUIRED_CONFIRMING_SWEEPS - 1,
+            });
+        }
+
+        function park(): void {
+            store.add({
+                channelId: CHANNEL,
+                discordMessageId: "m-1",
+                content: "any progress?",
+                queuedAt: 1_700_000_000_000,
+                reason: "run-still-active",
+            });
+        }
+
+        // ---- first-contact path (handleMessage's interrupt branch) ----------
+        // Mirrors recoverWedgedSessionOnFirstContact(): the same gates as the
+        // sweep, asked before any 🛑 is posted. A refused gate must leave the old
+        // interrupt behaviour untouched.
+        const interruptNotices: string[] = [];
+        let recoveries = 0;
+        let recoveryWaits = 0;
+        let recoveryInFlight: Promise<void> | null = null;
+
+        function shouldRecoverOnContact(): boolean {
+            return evaluateStuckRun({
+                modelActive: session.isModelActive(),
+                idleMs: Date.now() - lastEventAt,
+                thresholdMs: THRESHOLD_MS,
+                hasPendingBackgroundWork: false,
+                inFlightToolCount,
+                hasActiveSubagentWork: false,
+                priorConfirmations: REQUIRED_CONFIRMING_SWEEPS - 1,
+            }).shouldRecover;
+        }
+
+        // Mirrors recoverStuckSession()'s promise dedupe: a message arriving while
+        // the rebuild runs awaits that same rebuild instead of skipping it. The
+        // clear sits in .finally() for the same reason as in production: a rejected
+        // rebuild must not leave a poisoned entry that every later message awaits.
+        function startRecovery(): Promise<void> {
+            if (recoveryInFlight) {
+                recoveryWaits++;
+                return recoveryInFlight;
+            }
+            recoveries++;
+            recoveryInFlight = Promise.resolve()
+                .then(() => {
+                    recover();
+                })
+                .finally(() => {
+                    recoveryInFlight = null;
+                });
+            return recoveryInFlight;
+        }
+
+        async function handleIncomingMessage(text: string, messageId: string): Promise<void> {
+            if (session.isModelActive()) {
+                let healed = false;
+                if (shouldRecoverOnContact()) {
+                    try {
+                        await startRecovery();
+                        healed = true;
+                    } catch {
+                        healed = false;
+                    }
+                }
+                // Mirrors the real fallback: the store is re-read instead of trusting
+                // the local reference, so a disposed session is never prompted.
+                if (!sessionExists) {
+                    store.add({
+                        channelId: CHANNEL,
+                        discordMessageId: messageId,
+                        content: text,
+                        queuedAt: Date.now(),
+                        reason: "recovery-failed",
+                    });
+                    recoveryFailureNotices.push("⚠️ Session recovery failed");
+                    return;
+                }
+                if (!healed) {
+                    interruptNotices.push("🛑 Interrupted by user");
+                    aborts++;
+                    store.add({
+                        channelId: CHANNEL,
+                        discordMessageId: messageId,
+                        content: text,
+                        queuedAt: Date.now(),
+                        reason: "run-still-active",
+                    });
+                }
+            }
+            delivered.push(text);
+        }
+
+        return {
+            store,
+            delivered,
+            park,
+            recover,
+            replay,
+            shouldRecover,
+            setInFlightToolCount: (count: number) => { inFlightToolCount = count; },
+            failNextRebuild: () => { rebuildFails = true; },
+            aborts: () => aborts,
+            handleIncomingMessage,
+            interruptNotices: () => interruptNotices,
+            recoveryFailureNotices: () => recoveryFailureNotices,
+            recoveries: () => recoveries,
+            recoveryWaits: () => recoveryWaits,
+            markFreshActivity: () => { lastEventAt = Date.now(); },
+        };
+    }
+
+    it("strands the parked message when replay runs before recovery", () => {
+        const rig = createRig();
+        rig.park();
+
+        expect(rig.shouldRecover()).toBe(true);
+        expect(rig.replay()).toBe(0);
+
+        expect(rig.delivered).toEqual([]);
+        expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-1"]);
+    });
+
+    it("delivers the parked message exactly once when recovery runs first", () => {
+        const rig = createRig();
+        rig.park();
+
+        expect(rig.shouldRecover()).toBe(true);
+        rig.recover();
+        expect(rig.replay()).toBe(1);
+
+        // Exactly one copy: the stale followUp died with the old session, so it
+        // cannot also deliver the same text.
+        expect(rig.delivered).toEqual(["any progress?"]);
+        expect(rig.store.size()).toBe(0);
+    });
+
+    it("never aborts a live turn to re-deliver a parked message", () => {
+        const rig = createRig();
+        rig.park();
+        // A 12-minute bash/sync-subagent tool: silent, but demonstrably working.
+        rig.setInFlightToolCount(1);
+
+        expect(rig.replay()).toBe(0);
+        expect(rig.aborts()).toBe(0);
+        expect(rig.delivered).toEqual([]);
+        expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-1"]);
+    });
+
+    // ============================================================================
+    // First user contact must heal a wedged channel instead of answering 🛑
+    // ============================================================================
+    //
+    // Waiting for the sweep means the prompt that arrives after a wedge is answered
+    // with "🛑 Interrupted by user" and then parked behind a run that never settles:
+    // the message is lost either way. So handleMessage asks the watchdog gates first
+    // and, when they agree the run is dead, rebuilds the session and delivers.
+
+    describe("First-contact recovery of a wedged channel", () => {
+    it("delivers the prompt once instead of posting the interrupt notice", async () => {
+        const rig = createRig();
+
+        await rig.handleIncomingMessage("any progress?", "m-1");
+
+        expect(rig.interruptNotices()).toEqual([]);
+        expect(rig.recoveries()).toBe(1);
+        // Exactly one copy: the prompt went to the rebuilt session, and nothing
+        // was parked for a replay to deliver a second time.
+        expect(rig.delivered).toEqual(["any progress?"]);
+        expect(rig.store.size()).toBe(0);
+        expect(rig.aborts()).toBe(0);
+    });
+
+    it("keeps today's interrupt path when the run is still emitting events", async () => {
+        const rig = createRig();
+        rig.markFreshActivity();
+
+        await rig.handleIncomingMessage("hello", "m-2");
+
+        expect(rig.interruptNotices()).toEqual(["🛑 Interrupted by user"]);
+        expect(rig.recoveries()).toBe(0);
+        // Parked exactly as before, so the sweep can replay it later.
+        expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-2"]);
+    });
+
+    it("keeps today's interrupt path while a tool is in flight", async () => {
+        const rig = createRig();
+        rig.setInFlightToolCount(1);
+
+        await rig.handleIncomingMessage("hello", "m-3");
+
+        expect(rig.interruptNotices()).toEqual(["🛑 Interrupted by user"]);
+        expect(rig.recoveries()).toBe(0);
+    });
+
+    it("waits for a recovery already in flight instead of starting a second one", async () => {
+        const rig = createRig();
+
+        await Promise.all([
+            rig.handleIncomingMessage("first", "m-4"),
+            rig.handleIncomingMessage("second", "m-5"),
+        ]);
+
+        expect(rig.recoveries()).toBe(1);
+        expect(rig.recoveryWaits()).toBe(1);
+        expect(rig.interruptNotices()).toEqual([]);
+        // One delivery per prompt across the single rebuild — no duplicates.
+        expect(rig.delivered).toEqual(["first", "second"]);
+        expect(rig.store.size()).toBe(0);
+    });
+
+    it("parks the prompt instead of prompting a disposed session when the rebuild fails", async () => {
+        const rig = createRig();
+        // dispose() already threw the session away; getOrCreate() then fails. The
+        // old object carries no disposed flag, so prompting it would run on an
+        // orphan the store no longer tracks.
+        rig.failNextRebuild();
+
+        await rig.handleIncomingMessage("are you there?", "m-6");
+
+        expect(rig.delivered).toEqual([]);
+        expect(rig.interruptNotices()).toEqual([]);
+        expect(rig.recoveryFailureNotices()).toEqual(["⚠️ Session recovery failed"]);
+        // Durable, not dropped: the sweep or the next prompt can still deliver it.
+        expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-6"]);
+        expect(rig.store.forChannel(CHANNEL)[0]!.reason).toBe("recovery-failed");
+    });
+
+    it("recovers on the next message after a failed rebuild (no poisoned dedupe entry)", async () => {
+        const rig = createRig();
+        rig.failNextRebuild();
+        await rig.handleIncomingMessage("first", "m-7");
+
+        // The rejected rebuild must not be awaited forever by the next message.
+        await rig.handleIncomingMessage("second", "m-8");
+
+        expect(rig.recoveries()).toBe(2);
+        expect(rig.delivered).toEqual(["second"]);
+        // The parked copy is still queued for a replay, not forgotten.
+        expect(rig.store.forChannel(CHANNEL).map((entry) => entry.discordMessageId)).toEqual(["m-7"]);
+    });
     });
 });

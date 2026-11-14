@@ -6,6 +6,16 @@
 import { Client, GatewayIntentBits, ChannelType, ThreadChannel, DMChannel, TextChannel, NewsChannel, Message } from "discord.js";
 import { createSessionStore, sweepStaleBackgroundWork, type ClosedSessionInfo, type DiscordSession } from "./session-store.ts";
 import { shouldInterruptForIncomingMessage } from "./interrupt-decision.ts";
+import { evaluateStuckRun, evaluateStuckRunLiveness, DEFAULT_STUCK_RUN_THRESHOLD_MS, REQUIRED_CONFIRMING_SWEEPS, type StuckRunEvaluation } from "./stuck-run-decision.ts";
+import {
+	evaluatePostCompletionStall,
+	isTerminalStopReason,
+	POST_COMPLETION_STALL_GRACE_MS,
+	type PostCompletionStallInput,
+	type PostCompletionStallRefusal,
+} from "./post-completion-stall.ts";
+import { probeLiveChildProcesses } from "./child-process-probe.ts";
+import { formatOutstandingRuns, summarizeRunStore } from "./subagent-run-store.ts";
 import { isNonRetryableModelError, retryHintForModelError } from "./retry-policy.ts";
 import { splitMessagePreservingCodeBlocks, DISCORD_CHUNK_LIMIT } from "./message-chunker.ts";
 import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
@@ -45,6 +55,22 @@ const abortWaitTimeoutMs = Number(process.env.PI_DISCORD_ABORT_WAIT_MS) || 5_000
 
 /** How long /exit waits for a clean shutdown before forcing process exit. */
 const shutdownHardExitTimeoutMs = Number(process.env.PI_DISCORD_SHUTDOWN_TIMEOUT_MS) || 3_000;
+
+/**
+ * Silence after which an active run is treated as wedged (see
+ * src/stuck-run-decision.ts). Overridable so a canary can prove recovery works
+ * without waiting 45 minutes.
+ */
+const stuckRunThresholdMs =
+	Number(process.env.PI_DISCORD_STUCK_RUN_THRESHOLD_MS) || DEFAULT_STUCK_RUN_THRESHOLD_MS;
+
+/**
+ * Silence after a turn's final assistant message before it counts as stalled (see
+ * src/post-completion-stall.ts). Overridable so a canary can prove the fast path
+ * without waiting two minutes.
+ */
+const postCompletionStallGraceMs =
+	Number(process.env.PI_DISCORD_POST_COMPLETION_STALL_MS) || POST_COMPLETION_STALL_GRACE_MS;
 
 // ============================================================================
 // Logging
@@ -112,6 +138,97 @@ process.on("unhandledRejection", (reason) => {
 // Map structure: channelId -> discordMessageId -> { sessionIndex, type: 'user' | 'assistant' | 'tool' | 'thinking' }
 const discordMessageToSession = new Map<string, Map<string, { sessionIndex: number; type: string }>>();
 const sessionMessageIndex = new Map<string, number>(); // Track current message index per channel
+
+// Epoch ms of the last SDK event per channel. The 60s self-heal sweep uses the
+// gap together with isModelActive() to tell a wedged run (active but silent)
+// from a healthy one: see src/stuck-run-decision.ts.
+const lastSdkEventAt = new Map<string, number>();
+
+// Consecutive confirming sweeps per channel. Cleared by every liveness signal,
+// so recovery needs REQUIRED_CONFIRMING_SWEEPS silent sweeps in a row.
+const stuckRunConfirmations = new Map<string, number>();
+
+// Tool calls currently executing per channel (tool_execution_start -> end). A
+// running tool emits no session event, so silence during one is work, not a
+// wedge — the sweep refuses recovery while this is non-zero.
+const inFlightToolCounts = new Map<string, number>();
+
+/**
+ * Epoch ms of the terminal assistant message that ended this channel's turn.
+ *
+ * Set on `message_end` for a terminal stop reason and deleted by every later
+ * event, so its presence means "the turn's last message is on disk and nothing
+ * has happened since" — the signature of a run whose settle path never finished.
+ * See src/post-completion-stall.ts.
+ */
+const terminalMessageAt = new Map<string, number>();
+
+/** Whether the event is the assistant message that ends a turn (not a tool batch). */
+function isTerminalAssistantMessage(event: AgentSessionEvent): boolean {
+	if (event.type !== "message_end") return false;
+	if (event.message.role !== "assistant") return false;
+	return isTerminalStopReason(event.message.stopReason);
+}
+
+/**
+ * Record SDK activity for a channel.
+ *
+ * Every liveness signal goes through here so the watchdog's silence
+ * measurement and its confirmation streak can never drift apart.
+ */
+function stampSdkActivity(channelId: string): void {
+	lastSdkEventAt.set(channelId, Date.now());
+	stuckRunConfirmations.delete(channelId);
+}
+
+/**
+ * Pids of this process's live children, excluding the probe's own `ps` child
+ * and any zombie children.
+ *
+ * The last-resort liveness probe before the watchdog destroys a session: sync
+ * subagent runs and process-tool commands are real child processes, and their
+ * silence must never be read as a wedge even if the gate accounting were wrong.
+ *
+ * An empty list is also returned when `ps` is unavailable — the event/tool/
+ * subagent gates still apply, and refusing to recover at all would restore the
+ * wedge this watchdog exists to clear.
+ */
+async function findLiveChildPids(): Promise<number[]> {
+	return probeLiveChildProcesses();
+}
+
+// The run store is a diagnostic, so an unresolvable one must be reported once
+// rather than on every recovery attempt (a sweep can hit several channels).
+let runStoreUnavailableLogged = false;
+
+/**
+ * Log which subagent runs are outstanding before a session is torn down.
+ *
+ * The watchdog's own reason string describes the parent (idle, stalled) but not
+ * the child that pinned it. An outstanding run with a live pid and a growing age
+ * is the signature of a runner that never terminalised its status, which is what
+ * keeps the drain — and therefore the settle path — waiting.
+ *
+ * Never throws and never blocks: a failed snapshot must not cost the recovery
+ * that is already justified.
+ */
+function logOutstandingSubagentRuns(channelId: string): void {
+	try {
+		const summary = summarizeRunStore();
+		if (summary.error) {
+			if (runStoreUnavailableLogged) return;
+			runStoreUnavailableLogged = true;
+			console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns([])} (store unavailable: ${summary.error})`);
+			return;
+		}
+		console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns(summary.runs)}`);
+	} catch (err) {
+		if (runStoreUnavailableLogged) return;
+		runStoreUnavailableLogged = true;
+		console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns([])} (snapshot failed: ${String(err)})`);
+	}
+}
+
 
 // Track the last thinking message ID per channel for editing
 const lastThinkingMessageId = new Map<string, string>();
@@ -461,6 +578,8 @@ function restoreScheduledSessions(): void {
 function startSessionKeeper(deps: {
 	subscribedSessions: Set<string>;
 	sessionSubscriptions: Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>;
+	/** Channels currently being rebuilt by the stale-run watchdog. */
+	recoveringChannels: Set<string>;
 }): void {
 	/**
 	 * Ensure the channel's session is subscribed so agent output (from the
@@ -483,6 +602,10 @@ function startSessionKeeper(deps: {
 			cronSubscribedSessions.set(chId, sessionId);
 			return;
 		}
+		// The watchdog is midway through replacing this channel's session; it
+		// re-subscribes when it finishes, so subscribing here would add a second
+		// listener and post every event twice.
+		if (deps.recoveringChannels.has(chId)) return;
 		const channel = await fetchChannelObject(chId);
 		if (!channel) return;
 		try {
@@ -1009,6 +1132,64 @@ function createTypingChannel(channelId: string): TypingChannel {
 	};
 }
 
+/**
+ * The end-of-turn work that must happen however the end of the turn was noticed.
+ *
+ * `agent_end` is the SDK's own signal, but it is only emitted after every awaited
+ * extension handler resolves, so a stalled settle path means it never arrives at
+ * all. The turn is still over — its final message is already in the transcript —
+ * so the watchdog's post-completion fast path runs this too instead of leaving the
+ * typing indicator pulsing and a queued prompt undrained.
+ *
+ * Exactly one of the two callers drains the queue in practice: after a session
+ * recreation the disposed session's listeners are gone, so the stale `agent_end`
+ * cannot fire a second time.
+ */
+async function finishChannelTurn(
+	channelId: string,
+	channel: DMChannel | TextChannel | NewsChannel,
+	session: AgentSession,
+	typing: TypingManager
+): Promise<void> {
+	// A finished turn cannot still hold a tool: drop the count so a lost
+	// tool_execution_end can never disable the watchdog for this channel.
+	inFlightToolCounts.delete(channelId);
+	terminalMessageAt.delete(channelId);
+	// Agent turn fully finished — stop typing until the next user message
+	// or queued prompt starts a new turn (agent_start re-shows it).
+	typing.hide(channelId);
+
+	// Token utilization alert (catches the final response if message_end did not fire)
+	try {
+		const statsResult = generateTokenStatsMessage(channelId, session, previousTokens);
+		if (statsResult && statsResult.shouldAlert) {
+			sendToDiscord(channel, statsResult.message, { trackInSession: false }).catch(() => {});
+		}
+		updatePreviousTokens(channelId, session);
+	} catch (e) {
+		log(`[${channelId}] Error calculating token utilization: ${e}`);
+	}
+
+	// Process queued prompts
+	const queue = promptQueue.get(channelId);
+	if (!queue || queue.length === 0) return;
+	const nextPrompt = queue.shift();
+	if (!nextPrompt) return;
+	promptQueue.set(channelId, queue);
+	savePromptQueue();
+	log(`[${channelId}] Processing queued prompt: ${nextPrompt.slice(0, 50)}...`);
+	try {
+		await sendToDiscord(
+			channel,
+			`📤 **Executing queued prompt:**\n${nextPrompt.length > 200 ? nextPrompt.slice(0, 200) + "..." : nextPrompt}`,
+			{ trackInSession: false }
+		);
+		await session.sendUserMessage(nextPrompt);
+	} catch (e) {
+		log(`[${channelId}] Error processing queue: ${e}`);
+	}
+}
+
 function subscribeToSession(
 	session: AgentSession,
 	channelId: string,
@@ -1028,10 +1209,28 @@ function subscribeToSession(
 	// Captured at agent_end (synchronous, all messages appended) for use in .then()
 	let capturedAssistantEntryId: string | null = null;
 
+	// Baseline before the first event arrives, so a session that never emits
+	// anything is still measured from its subscription.
+	stampSdkActivity(channelId);
+
 	session.subscribe(async (event: AgentSessionEvent) => {
+		// Any event counts as activity: this is what the stale-run watchdog in the
+		// 60s sweep compares against. See src/stuck-run-decision.ts.
+		stampSdkActivity(channelId);
+		// The terminal assistant message marks the end of the turn's output; every
+		// other event (including agent_end itself) means the run is still working,
+		// so the marker only survives if the settle path went silent. See
+		// src/post-completion-stall.ts.
+		if (isTerminalAssistantMessage(event)) {
+			terminalMessageAt.set(channelId, Date.now());
+		} else {
+			terminalMessageAt.delete(channelId);
+		}
 		switch (event.type) {
 			case "agent_start":
 				log(`[${channelId}] Agent starting...`);
+				// A new turn cannot inherit a tool from the previous one.
+				inFlightToolCounts.delete(channelId);
 				responseBuffer.length = 0;
 				// LLM is processing - show typing indicator
 				typingManager.show(channelId, typingChannel);
@@ -1123,6 +1322,9 @@ function subscribeToSession(
 
 			case "tool_execution_start": {
 				log(`[${channelId}] Tool started: ${event.toolName}`);
+				// Counted for the stale-run watchdog: a tool emits nothing until it
+				// ends, so a long build must not read as a wedged run.
+				inFlightToolCounts.set(channelId, (inFlightToolCounts.get(channelId) ?? 0) + 1);
 				// Skip sending (and index tracking) when tools are hidden
 				if (!getOutputSettings(channelId).hideTools) {
 					const args = escapeForCodeBlock(JSON.stringify(event.args, null, 2));
@@ -1143,6 +1345,7 @@ function subscribeToSession(
 
 			case "tool_execution_end":
 				log(`[${channelId}] Tool ended: ${event.toolName} (error: ${event.isError})`);
+				inFlightToolCounts.set(channelId, Math.max(0, (inFlightToolCounts.get(channelId) ?? 0) - 1));
 				// Turn continues after the tool (more LLM calls may follow)
 				typingManager.show(channelId, typingChannel);
 				const outputSettings = getOutputSettings(channelId);
@@ -1171,44 +1374,10 @@ function subscribeToSession(
 
 			case "agent_end":
 				log(`[${channelId}] Agent ended`);
-				// Agent turn fully finished — stop typing until the next user message
-				// or queued prompt starts a new turn (agent_start re-shows it).
-				typingManager.hide(channelId);
 				// Capture assistant entry NOW (synchronous, all messages appended)
 				// The .then() callback will use this to track bot response Discord msg IDs
 				capturedAssistantEntryId = session.sessionManager.getLeafId();
-
-				// Token utilization alert on agent_end (catches final response if message_end didn't fire)
-				try {
-					const statsResult = generateTokenStatsMessage(channelId, session, previousTokens);
-					if (statsResult && statsResult.shouldAlert) {
-						sendToDiscord(channel, statsResult.message, { trackInSession: false }).catch(() => {});
-					}
-					updatePreviousTokens(channelId, session);
-				} catch (e) {
-					log(`[${channelId}] Error calculating token utilization: ${e}`);
-				}
-
-				// Process queued prompts
-				try {
-					const queue = promptQueue.get(channelId);
-					if (queue && queue.length > 0) {
-						const nextPrompt = queue.shift();
-						if (nextPrompt) {
-							promptQueue.set(channelId, queue);
-							savePromptQueue();
-							log(`[${channelId}] Processing queued prompt: ${nextPrompt.slice(0, 50)}...`);
-							
-							// Send notification about queued prompt being executed
-							await sendToDiscord(channel, `📤 **Executing queued prompt:**\n${nextPrompt.length > 200 ? nextPrompt.slice(0, 200) + '...' : nextPrompt}`, { trackInSession: false });
-							
-							// Send the queued prompt to the agent
-							await session.sendUserMessage(nextPrompt);
-						}
-					}
-				} catch (e) {
-					log(`[${channelId}] Error processing queue: ${e}`);
-				}
+				await finishChannelTurn(channelId, channel, session, typingManager);
 				break;
 
 			case "compaction_start":
@@ -1903,8 +2072,54 @@ async function main() {
 	const sessionSubscriptions = new Map<string, { setPendingDiscordMessageId: (id: string, isReply: boolean) => void }>();
 	/** Channels with a parked-message replay in flight (guards the 60s sweep). */
 	const replaysInFlight = new Set<string>();
+	/**
+	 * Channels whose session is being rebuilt by recoverStuckSession().
+	 *
+	 * The rebuild deletes the subscription binding and then awaits getOrCreate()
+	 * and fetchChannelObject(), so a message or the cron keeper arriving in that
+	 * window would subscribe the same session a second time — and subscribeToSession
+	 * cannot dedup, so every event would post twice forever.
+	 */
+	const recoveringChannels = new Set<string>();
+	/**
+	 * Recoveries in flight per channel.
+	 *
+	 * A user message arriving mid-rebuild must wait for that same rebuild and
+	 * deliver into it, not skip recovery and hand its prompt to a disposed
+	 * session. Deduping on the promise is what makes recoverStuckSession() safe to
+	 * call from both the sweep and the first-contact path in handleMessage().
+	 */
+	const recoveriesInFlight = new Map<string, Promise<boolean>>();
 	let subscribeCount = 0;
 	let sendCount = 0;
+
+	/**
+	 * Why re-delivering parked messages may not abort this channel's active run.
+	 *
+	 * Returns the refusing liveness gate, a child-process summary, or null when the
+	 * run looks wedged and aborting it is the only way forward. Deliberately the same
+	 * gates as the watchdog minus confirmation: a replay runs after the sweep's
+	 * recovery pass, so an unconfirmed silent run already collected its confirmations
+	 * there.
+	 */
+	async function parkedReplayAbortRefusal(
+		discordSession: DiscordSession,
+		channelId: string
+	): Promise<string | null> {
+		const refusal = evaluateStuckRunLiveness({
+			modelActive: discordSession.isModelActive(),
+			idleMs: Date.now() - (lastSdkEventAt.get(channelId) ?? Date.now()),
+			thresholdMs: stuckRunThresholdMs,
+			hasPendingBackgroundWork: discordSession.hasPendingBackgroundWork(),
+			inFlightToolCount: inFlightToolCounts.get(channelId) ?? 0,
+			hasActiveSubagentWork: discordSession.hasActiveSubagentWork(),
+			priorConfirmations: 0,
+		});
+		if (refusal) return refusal;
+		const childPids = await findLiveChildPids();
+		if (childPids.length > 0) return `child-processes(${childPids.join(",")})`;
+		return null;
+	}
 
 	/**
 	 * Re-send messages parked while the channel was draining background subagent
@@ -1933,9 +2148,21 @@ async function main() {
 		replaysInFlight.add(channelId);
 		try {
 			if (discordSession.isModelActive()) {
-				// The run that swallowed these messages still holds the session (a wedged
-				// agent_end drain). Nothing can be delivered until it lets go, so abort it
-				// - bounded, or the replay itself would hang forever.
+				// Parked messages are re-delivered for a run that swallowed them, but an
+				// active run is not by itself proof of a wedge: a long bash tool or a sync
+				// subagent child holds the turn open without emitting anything. Aborting
+				// those every 60s is exactly the live-work destruction the watchdog gates
+				// exist to prevent, so ask the same gates first and leave the messages
+				// parked when they refuse.
+				const refusal = await parkedReplayAbortRefusal(discordSession, channelId);
+				if (refusal) {
+					log(
+						`[${channelId}] Replay: not aborting the active run (${refusal}) - leaving ${parked.length} message(s) parked`
+					);
+					return 0;
+				}
+				// Nothing can be delivered while a wedged run (a stuck agent_end drain)
+				// holds the session, so abort it - bounded, or the replay itself would hang.
 				log(`[${channelId}] Replay: aborting stuck model activity before re-delivering ${parked.length} message(s)`);
 				await abortModelActivitiesBounded(discordSession, channelId);
 			}
@@ -1943,6 +2170,12 @@ async function main() {
 			// Messages already sitting in the SDK's follow-up queue are delivered by the
 			// session itself; replaying them as well would send them twice. Leave them
 			// parked and let a later sweep retry once that queue has drained.
+			//
+			// This raw count includes followUps this process pushed while the run was
+			// still active, so the guard is only correct because the 60s self-heal
+			// sweep runs recoverStuckSession() for every channel BEFORE it calls this
+			// function: recovery recreates the session, which empties that queue. Do
+			// not reorder those two passes.
 			const alreadyQueued = discordSession.session.pendingMessageCount;
 			if (alreadyQueued > 0) {
 				log(`[${channelId}] Replay: ${alreadyQueued} message(s) still queued in the session - leaving ${parked.length} parked for a later sweep`);
@@ -2013,6 +2246,220 @@ async function main() {
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
+	}
+
+	/**
+	 * Evaluate the watchdog gates for a channel's current session.
+	 *
+	 * The 60s sweep and the first-contact path in handleMessage() must ask exactly
+	 * the same question — "is this active run provably wedged?" — so both call this
+	 * instead of assembling the inputs twice. A second copy of the gate list is how
+	 * a live turn ends up destroyed by one path while the other refuses.
+	 */
+	function evaluateStuckRunForChannel(channelId: string, discordSession: DiscordSession): StuckRunEvaluation {
+		return evaluateStuckRun({
+			modelActive: discordSession.isModelActive(),
+			idleMs: Date.now() - (lastSdkEventAt.get(channelId) ?? Date.now()),
+			thresholdMs: stuckRunThresholdMs,
+			hasPendingBackgroundWork: discordSession.hasPendingBackgroundWork(),
+			inFlightToolCount: inFlightToolCounts.get(channelId) ?? 0,
+			hasActiveSubagentWork: discordSession.hasActiveSubagentWork(),
+			priorConfirmations: stuckRunConfirmations.get(channelId) ?? 0,
+		});
+	}
+
+	/**
+	 * Ask the post-completion stall question for a channel's current session.
+	 *
+	 * Two phases because the child-process probe is a subprocess: the cheap gates
+	 * (is the run active, did its final message land, has anything happened since,
+	 * is a tool running, how long has it been) decide whether probing is worth
+	 * anything at all. `liveChildProcessCount: 0` in phase one is not a claim — it
+	 * simply cannot refuse there, and phase two re-evaluates with the real count.
+	 *
+	 * Returns the refusing gate, or null when the turn is provably over and its
+	 * settle path never finished.
+	 */
+	async function evaluatePostCompletionStallForChannel(
+		channelId: string,
+		discordSession: DiscordSession
+	): Promise<{ refusal: PostCompletionStallRefusal | null; liveChildPids: number[] }> {
+		const terminalAt = terminalMessageAt.get(channelId);
+		const base: PostCompletionStallInput = {
+			modelActive: discordSession.isModelActive(),
+			msSinceTerminalMessage: terminalAt === undefined ? undefined : Date.now() - terminalAt,
+			eventSinceTerminal:
+				terminalAt !== undefined && (lastSdkEventAt.get(channelId) ?? 0) > terminalAt,
+			inFlightToolCount: inFlightToolCounts.get(channelId) ?? 0,
+			// Async subagent children run detached (own process group), so they are
+			// neither a tool in flight nor a child of this process: only the gate
+			// accounting can see that a drain is legitimately still waiting.
+			hasPendingSubagentWork:
+				discordSession.hasPendingBackgroundWork() || discordSession.hasActiveSubagentWork(),
+			liveChildProcessCount: 0,
+			graceMs: postCompletionStallGraceMs,
+		};
+
+		const cheapRefusal = evaluatePostCompletionStall(base);
+		if (cheapRefusal !== null) return { refusal: cheapRefusal, liveChildPids: [] };
+
+		const liveChildPids = await findLiveChildPids();
+		const refusal = evaluatePostCompletionStall({
+			...base,
+			liveChildProcessCount: liveChildPids.length,
+		});
+		return { refusal, liveChildPids };
+	}
+
+	/**
+	 * Heal a wedged channel when the user writes into it, instead of answering 🛑.
+	 *
+	 * Waiting for the sweep means the first prompt after a wedge is answered with
+	 * "🛑 Interrupted by user" and then parked behind a run that can never settle:
+	 * the user's message is destroyed either way, so there is nothing to protect by
+	 * waiting. Two detections can admit a channel here: the post-completion stall
+	 * (precise — the turn's final message is on disk and nothing has happened since)
+	 * or the generic idle watchdog (silent past the 45-minute threshold, confirmation
+	 * streak met).
+	 *
+	 * Returns true when the channel is usable and the caller must skip the interrupt
+	 * path; false when the gates refused and today's interrupt behaviour applies.
+	 */
+	async function recoverWedgedSessionOnFirstContact(
+		channelId: string,
+		discordSession: DiscordSession
+	): Promise<boolean> {
+		const evaluation = evaluateStuckRunForChannel(channelId, discordSession);
+		const stall = await evaluatePostCompletionStallForChannel(channelId, discordSession);
+		const stalled = stall.refusal === null;
+		if (!evaluation.shouldRecover && !stalled) return false;
+
+		// Last resort before destroying a session, same as in the sweep: a live
+		// child (sync subagent, process tool) means the silence is work. The stall
+		// probe already checked; the idle path has not.
+		if (!stalled) {
+			const childPids = await findLiveChildPids();
+			if (childPids.length > 0) {
+				console.warn(
+					`[watchdog] ${channelId} first contact refused: ${childPids.length} child process(es) alive (pids ${childPids.join(",")})`
+				);
+				return false;
+			}
+		}
+
+		const terminalAt = terminalMessageAt.get(channelId);
+		const idleMs = Date.now() - (lastSdkEventAt.get(channelId) ?? Date.now());
+		const since = stalled
+			? `post-completion stall ${terminalAt === undefined ? 0 : Date.now() - terminalAt}ms after final message`
+			: `idle ${Math.round(idleMs / 1000)}s`;
+		console.warn(`[watchdog] ${channelId} first-contact recovery, ${since} - no interrupt message`);
+		try {
+			await recoverStuckSession(channelId);
+		} catch (err) {
+			console.error(`[discord] First-contact recovery failed for ${channelId}:`, err);
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Force a wedged channel back to a usable session.
+	 *
+	 * A run can park between `agent_end` and the SDK's settle path, and only that
+	 * settle path clears `_isAgentRunActive` — so `isModelActive()` stays true,
+	 * every incoming message looks like an interrupt, and `abort()` waits on a flag
+	 * nothing will ever clear (its bounded wait always times out). That phase has
+	 * no deadline, so the only remaining lever is to throw the session object away
+	 * and reopen it from the transcript: `dispose()` + `getOrCreate()` is the same
+	 * path /cwd already uses. The recreated session has an empty follow-up queue,
+	 * which is what lets replayPendingMessages() deliver the parked messages.
+	 *
+	 * Returns true when the session had to be recreated.
+	 */
+	async function recoverStuckSession(channelId: string): Promise<boolean> {
+		const existing = recoveriesInFlight.get(channelId);
+		if (existing) {
+			log(`[watchdog] ${channelId} recovery already in flight - waiting for it`);
+			return existing;
+		}
+		recoveringChannels.add(channelId);
+		// .finally() stands outside recreateStuckSession() on purpose: an early
+		// `return false` inside it resolves the promise in the same tick, and a
+		// guard cleared before the map entry exists would leave a resolved promise
+		// behind that every later recovery would await forever.
+		const recovery = recreateStuckSession(channelId).finally(() => {
+			recoveringChannels.delete(channelId);
+			recoveriesInFlight.delete(channelId);
+		});
+		recoveriesInFlight.set(channelId, recovery);
+		return recovery;
+	}
+
+	async function recreateStuckSession(channelId: string): Promise<boolean> {
+		const discordSession = sessionStore.get(channelId);
+		if (!discordSession) return false;
+
+		// Logged here rather than at each call site: every recovery goes through
+		// this function, and the snapshot is only useful right before the teardown
+		// that would destroy the evidence.
+		logOutstandingSubagentRuns(channelId);
+
+		const idleMs = Date.now() - (lastSdkEventAt.get(channelId) ?? Date.now());
+		const idleSeconds = Math.round(idleMs / 1000);
+
+		// Stage 1: a plain abort is cheap and keeps the live session (and its
+		// context), so try it first — a run that is merely slow still settles.
+		const abortSettled = await abortModelActivitiesBounded(discordSession, channelId);
+		if (abortSettled && !discordSession.isModelActive()) {
+			log(`[watchdog] ${channelId} idle ${idleSeconds}s, abort settled - session kept`);
+			return false;
+		}
+
+		// Stage 2: still active after the bounded abort, so the run cannot settle.
+		// console.warn, not log(): log() is gated on DISCORD_DEBUG, and a session
+		// teardown on a live channel must be visible in the journal.
+		console.warn(`[watchdog] ${channelId} idle ${idleSeconds}s, abort did not settle - recreating session`);
+		sessionStore.dispose(channelId);
+		// The wedged turn never reached its agent_end cleanup, so its typing
+		// indicator would otherwise keep pulsing until Discord's own timeout.
+		typingManager.hide(channelId);
+		// Drop every per-channel binding to the dead session, or the re-subscribe
+		// below makes every agent event fire twice (the duplicate-output hazard
+		// subscribeToSession() cannot dedup by itself).
+		subscribedSessions.delete(channelId);
+		sessionSubscriptions.delete(channelId);
+		sessionMessageIndex.delete(channelId);
+		discordMessageToSession.delete(channelId);
+		lastSdkEventAt.delete(channelId);
+		stuckRunConfirmations.delete(channelId);
+		terminalMessageAt.delete(channelId);
+		// The wedged run's tool is gone with it; a stale count would otherwise
+		// block the next recovery for this channel.
+		inFlightToolCounts.delete(channelId);
+		cronSubscribedSessions.delete(channelId); // keeper re-binds on its next pass
+
+		const recreated = await sessionStore.getOrCreate(channelId, sessionStore.getChannelName(channelId));
+		const channel = await fetchChannelObject(channelId);
+		if (channel) {
+			// Replayed prompts must stream their output somewhere: without a
+			// subscription the agent would answer into the void.
+			const sub = subscribeToSession(
+				recreated.session,
+				channelId,
+				channel,
+				typingManager,
+				sessionDir,
+				getChannelOutputSettings
+			);
+			subscribedSessions.add(channelId);
+			sessionSubscriptions.set(channelId, sub);
+			log(`[watchdog] ${channelId} session recreated and re-subscribed`);
+		} else {
+			// handleMessage() subscribes on the next user message instead.
+			log(`[watchdog] ${channelId} session recreated without a channel object - subscribing on next message`);
+		}
+		stampSdkActivity(channelId);
+		return true;
 	}
 
 	/**
@@ -2090,8 +2537,10 @@ async function main() {
 		}
 
 		sessionStore.setChannelName(channelId, channelName);
-		const discordSession = await sessionStore.getOrCreate(channelId, channelName);
-		const { session } = discordSession;
+		let discordSession = await sessionStore.getOrCreate(channelId, channelName);
+		// Both are reassigned below when the watchdog rebuilds the session under us —
+		// the disposed object would silently swallow the prompt.
+		let session = discordSession.session;
 
 		// Store Discord message ID for tracking in session
 		// We'll track it when the message_start event fires
@@ -2137,12 +2586,57 @@ async function main() {
 			nonInterruptingCommand: isNonInterruptingCommand,
 		});
 		if (shouldInterrupt) {
-			log(`[${channelId}] User interrupted - aborting current operation`);
-			sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
-			// Bounded: abort() can stay open for as long as the agent_end drain. The
-			// send path below parks the message if the session is still busy.
-			await abortModelActivitiesBounded(discordSession, channelId);
-			// dont hide typing manager, fall through to sending the interrupted message to the agent
+			// The run may be wedged rather than busy: a wedged run never settles, so
+			// interrupting it only parks this prompt behind a queue nothing drains.
+			// Same gates as the 60s sweep, so the two paths cannot disagree about
+			// whether this silence is work.
+			const healed = await recoverWedgedSessionOnFirstContact(channelId, discordSession);
+			// Recovery either replaced the session or, when its rebuild failed, left the
+			// channel with none: dispose() sets no flag, so prompt() on the old object
+			// would run on an orphan the store no longer tracks. Re-read the store on
+			// both outcomes instead of trusting the local reference.
+			const storedSession = sessionStore.get(channelId);
+			if (storedSession && storedSession !== discordSession) {
+				discordSession = storedSession;
+				session = storedSession.session;
+				// The rebuild dropped this channel's Discord→session index, so re-register
+				// the prompt at its place in the fresh transcript (message deletion and
+				// reply branching read that index).
+				const index = discordMessageToSession.get(channelId) ?? new Map();
+				discordMessageToSession.set(channelId, index);
+				index.set(message.id, { sessionIndex: session.messages.length, type: "user" });
+			} else if (!storedSession) {
+				// The watchdog disposed the wedged session and the rebuild failed (e.g.
+				// getOrCreate threw): there is nothing left to deliver into, so park the
+				// text durably and say so rather than dropping it on an orphan.
+				console.error(`[${channelId}] Recovery left no session - parking message ${message.id}`);
+				const undeliverableText = (message.content ?? "").trim();
+				if (undeliverableText) {
+					pendingMessages.add({
+						channelId,
+						discordMessageId: message.id,
+						authorId: message.author?.id,
+						authorName: message.author?.username,
+						content: message.content ?? "",
+						queuedAt: Date.now(),
+						reason: "recovery-failed",
+					});
+				}
+				typingManager.hide(channelId);
+				await sendToDiscord(
+					channel as DMChannel | TextChannel | NewsChannel,
+					"⚠️ Session recovery failed - your message is queued and will be retried."
+				).catch(() => {});
+				return;
+			}
+			if (!healed) {
+				log(`[${channelId}] User interrupted - aborting current operation`);
+				sendToDiscord(channel as DMChannel | TextChannel | NewsChannel, "🛑 Interrupted by user").catch(() => {});
+				// Bounded: abort() can stay open for as long as the agent_end drain. The
+				// send path below parks the message if the session is still busy.
+				await abortModelActivitiesBounded(discordSession, channelId);
+				// dont hide typing manager, fall through to sending the interrupted message to the agent
+			}
 		}
 
 		// Store the Discord message ID so it can be tracked when the user message is processed
@@ -2153,7 +2647,12 @@ async function main() {
 		// Subscribe to session events once
 		// FIX: Add to set BEFORE calling subscribeToSession to prevent race condition
 		// where two rapid messages could both pass the has() check before either adds
-		if (!subscribedSessions.has(channelId)) {
+		if (recoveringChannels.has(channelId)) {
+			// The watchdog is replacing this channel's session right now; it
+			// re-subscribes when it is done. Subscribing here as well would leave two
+			// listeners on one session and post every event twice.
+			log(`[${channelId}] Session recovery in flight - subscription handled by the watchdog`);
+		} else if (!subscribedSessions.has(channelId)) {
 			subscribedSessions.add(channelId);
 			subscribeCount++;
 			log(`[${channelId}] Subscribing to session (total subscriptions: ${subscribeCount})`);
@@ -2641,10 +3140,10 @@ async function main() {
 			log(`[${channelId}] Reloading extensions`);
 			try {
 				await session.reload();
-				// Re-apply retry overrides after reload as it wipes in-memory settings
+				// Re-apply settings overrides after reload as it wipes in-memory settings
 				const discordSession = sessionStore.get(channelId);
 				if (discordSession) {
-					discordSession.applyRetryOverrides();
+					discordSession.applySessionSettingsOverrides();
 					// /reload rebuilds the base system prompt, but the
 					// before_agent_start memory hook is part of the reloaded
 					// extension set — no re-application needed.
@@ -3216,7 +3715,7 @@ async function main() {
 
 	// Keep sessions alive for enabled cron jobs (pi-schedule-prompt only fires
 	// while a session is open) and catch up runs missed while the bot was down.
-	startSessionKeeper({ subscribedSessions, sessionSubscriptions });
+	startSessionKeeper({ subscribedSessions, sessionSubscriptions, recoveringChannels });
 
 	// Pre-create sessions for channels with queued prompts so they survive restarts
 	for (const chId of promptQueue.keys()) {
@@ -3245,18 +3744,145 @@ async function main() {
 	}
 
 	// Self-heal: release orphaned background subagent runs (completion event never
-	// arrived) and replay anything parked behind them. Also retries messages left
-	// parked after a normal drain. Runs without user input, so a wedged channel
-	// recovers on its own instead of silently swallowing every message.
-	setInterval(() => {
+	// arrived), recover channels whose run wedged between agent_end and the SDK's
+	// settle path, and replay anything parked. Runs without user input, so a
+	// wedged channel recovers on its own instead of silently swallowing every
+	// message until the process is restarted.
+	async function runSelfHealSweep(): Promise<void> {
 		const releasedChannels = sweepStaleBackgroundWork();
-		const candidates = new Set([...releasedChannels, ...pendingMessages.all().map((entry) => entry.channelId)]);
+		const candidates = new Set([
+			...releasedChannels,
+			...subscribedSessions,
+			...pendingMessages.all().map((entry) => entry.channelId),
+		]);
+
+		// Ordered passes, not one loop: recovery MUST complete for every candidate
+		// before any replay starts (see the guard in replayPendingMessages). A
+		// session whose run never settles still reports its own followUps as queued,
+		// so replaying first would leave the parked messages parked behind a queue
+		// nothing can drain.
+		for (const chId of candidates) {
+			const discordSession = sessionStore.get(chId);
+			if (!discordSession) {
+				stuckRunConfirmations.delete(chId);
+				terminalMessageAt.delete(chId);
+				continue;
+			}
+
+			// Fast path: the turn's final assistant message is on disk and nothing has
+			// happened since, so the run is settling and never will. Precise enough to
+			// act without the idle threshold or the confirmation streak — the generic
+			// watchdog below stays for every other shape of wedge.
+			const stall = await evaluatePostCompletionStallForChannel(chId, discordSession);
+			if (stall.refusal === null) {
+				const terminalAt = terminalMessageAt.get(chId) ?? Date.now();
+				console.warn(
+					`[watchdog] ${chId} post-completion stall ${Date.now() - terminalAt}ms after final message - recovering`
+				);
+				try {
+					const recreated = await recoverStuckSession(chId);
+					if (recreated) {
+						// The stale agent_end never ran and never will: the subscription died
+						// with the session, so the end-of-turn work has to happen here.
+						const fresh = sessionStore.get(chId);
+						const stallChannel = await fetchChannelObject(chId);
+						if (fresh && stallChannel) {
+							await finishChannelTurn(chId, stallChannel, fresh.session, typingManager);
+						} else {
+							// No channel to stream a queued prompt into, so the queue waits for
+							// the next message instead of being sent into the void.
+							typingManager.hide(chId);
+							terminalMessageAt.delete(chId);
+						}
+					}
+				} catch (err) {
+					console.error(`[discord] Post-completion recovery failed for ${chId}:`, err);
+				} finally {
+					stuckRunConfirmations.delete(chId);
+				}
+				continue;
+			}
+
+			const idleMs = Date.now() - (lastSdkEventAt.get(chId) ?? Date.now());
+			const evaluation = evaluateStuckRunForChannel(chId, discordSession);
+
+			// Only a session that looks wedged but is not yet confirmed accrues
+			// evidence; every other outcome clears it (a live signal was seen).
+			if (!evaluation.candidate) {
+				stuckRunConfirmations.delete(chId);
+				continue;
+			}
+			const confirmations = (stuckRunConfirmations.get(chId) ?? 0) + 1;
+			stuckRunConfirmations.set(chId, confirmations);
+
+			if (!evaluation.shouldRecover) {
+				console.warn(
+					`[watchdog] ${chId} idle ${Math.round(idleMs / 1000)}s, recovery refused by ${evaluation.refusedBy} ` +
+						`(confirmation ${confirmations}/${REQUIRED_CONFIRMING_SWEEPS})`
+				);
+				continue;
+			}
+
+			// Last resort before the destructive path: a live child process is work
+			// (a sync subagent child emits no events for its whole duration), so the
+			// gate accounting above being wrong must not cost a healthy turn.
+			//
+			// Accepted tradeoff: this refuses on ANY child, so a long-lived child
+			// started by a tool (dev server, daemon) keeps recovery disabled for that
+			// channel until it exits. That is the safe direction - a stale run left in
+			// place, never a destroyed turn - and the pids are logged so an operator
+			// can see exactly what held it off.
+			const childPids = await findLiveChildPids();
+			if (childPids.length > 0) {
+				console.warn(
+					`[watchdog] ${chId} idle ${Math.round(idleMs / 1000)}s, but ${childPids.length} child process(es) are alive ` +
+						`(pids ${childPids.join(",")}) - not recovering`
+				);
+				stuckRunConfirmations.delete(chId);
+				continue;
+			}
+
+			try {
+				await recoverStuckSession(chId);
+			} catch (err) {
+				console.error(`[discord] Watchdog recovery failed for ${chId}:`, err);
+			} finally {
+				stuckRunConfirmations.delete(chId);
+			}
+		}
+
 		for (const chId of candidates) {
 			if (sessionStore.get(chId)?.hasPendingBackgroundWork()) continue; // legitimately draining still
+			// A channel mid-rebuild is being handled by the recovery pass; replaying
+			// against a session that is about to be disposed would post into nowhere.
+			if (recoveringChannels.has(chId)) continue;
+			// Without a subscription the replayed prompt is answered into the void and
+			// the parked copy is dropped after the send, so wait for the next message
+			// (or the keeper) to re-subscribe instead of losing it.
+			if (!sessionSubscriptions.has(chId)) continue;
 			replayPendingMessages(chId).catch((err) => {
 				console.error(`[discord] Replay sweep error for ${chId}:`, err);
 			});
 		}
+	}
+
+	// A sweep can outlive its own 60s interval (recovery awaits a bounded abort per
+	// channel), and two overlapping sweeps would let one channel accrue both of its
+	// confirming ticks inside a single idle window.
+	let sweepInFlight = false;
+	setInterval(() => {
+		if (sweepInFlight) {
+			console.warn("[discord] Self-heal sweep still running from the previous tick - skipping this one");
+			return;
+		}
+		sweepInFlight = true;
+		runSelfHealSweep()
+			.catch((err) => {
+				console.error("[discord] Self-heal sweep error:", err);
+			})
+			.finally(() => {
+				sweepInFlight = false;
+			});
 	}, 60_000);
 
 	console.log("[discord] Bot is ready and listening for messages!");
