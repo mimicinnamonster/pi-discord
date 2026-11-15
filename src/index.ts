@@ -16,6 +16,13 @@ import {
 } from "./post-completion-stall.ts";
 import { probeLiveChildProcesses, isProcessAlive } from "./child-process-probe.ts";
 import {
+	clearsTerminalMarker,
+	deriveTranscriptCompletionEvidence,
+	isLivenessEvent,
+	shouldEscalateStallRefusal,
+	STALL_ESCALATION_SWEEPS,
+} from "./stall-evidence.ts";
+import {
 	findResultPayload,
 	formatOutstandingRuns,
 	hasProgressingAsyncWork,
@@ -238,12 +245,71 @@ const inFlightToolCounts = new Map<string, number>();
 /**
  * Epoch ms of the terminal assistant message that ended this channel's turn.
  *
- * Set on `message_end` for a terminal stop reason and deleted by every later
- * event, so its presence means "the turn's last message is on disk and nothing
- * has happened since" — the signature of a run whose settle path never finished.
+ * Set on `message_end` for a terminal stop reason. Cleared only when the turn
+ * demonstrably moved on (see clearsTerminalMarker in src/stall-evidence.ts), so
+ * its presence means "the turn's last message is on disk and nothing has
+ * happened since" — the signature of a run whose settle path never finished.
+ *
+ * Interruption and end-of-run events deliberately do NOT clear it: our own abort
+ * emits them, and clearing there erased the evidence at exactly the moment the
+ * run went dead (2026-11-15, a 10-hour wedge).
+ *
  * See src/post-completion-stall.ts.
  */
 const terminalMessageAt = new Map<string, number>();
+
+/**
+ * Consecutive identical refusals from the post-completion stall check.
+ *
+ * Escalates a bookkeeping refusal that never changes into a recovery, because
+ * the refused gate may itself be an artefact of the wedge. Reset by every
+ * liveness event (stampSdkActivity) and by every recovery. See
+ * shouldEscalateStallRefusal in src/stall-evidence.ts.
+ */
+const stallRefusalStreaks = new Map<string, { refusal: PostCompletionStallRefusal; count: number }>();
+
+/**
+ * Epoch ms until which our own interrupt is still landing.
+ *
+ * An abort makes the SDK emit events (an aborted message, agent_end, settles).
+ * Those are not the model working, so they must not refresh the silence clock —
+ * otherwise every user prompt postpones the idle watchdog's recovery by resetting
+ * its 45-minute threshold, which is how a wedge survived 10 hours of someone
+ * asking "is it stuck?".
+ */
+const interruptLivenessMutedUntil = new Map<string, number>();
+
+/** How long an issued interrupt may keep muting liveness stamps. */
+const INTERRUPT_LIVENESS_MUTE_MS = 30_000;
+
+/** Record that we asked this channel's session to abort. */
+function noteInterruptIssued(channelId: string): void {
+	interruptLivenessMutedUntil.set(channelId, Date.now() + INTERRUPT_LIVENESS_MUTE_MS);
+}
+
+/** Whether an event right now would be our own interrupt landing rather than work. */
+function livenessMuted(channelId: string): boolean {
+	const until = interruptLivenessMutedUntil.get(channelId);
+	if (until === undefined) return false;
+	if (Date.now() > until) {
+		interruptLivenessMutedUntil.delete(channelId);
+		return false;
+	}
+	return true;
+}
+
+/**
+ * Note one refusal of the stall check and return the streak length.
+ *
+ * A different refusal means different evidence, so the streak restarts; only an
+ * unchanging answer accumulates.
+ */
+function recordStallRefusal(channelId: string, refusal: PostCompletionStallRefusal): number {
+	const previous = stallRefusalStreaks.get(channelId);
+	const count = previous && previous.refusal === refusal ? previous.count + 1 : 1;
+	stallRefusalStreaks.set(channelId, { refusal, count });
+	return count;
+}
 
 /** Whether the event is the assistant message that ends a turn (not a tool batch). */
 function isTerminalAssistantMessage(event: AgentSessionEvent): boolean {
@@ -261,6 +327,9 @@ function isTerminalAssistantMessage(event: AgentSessionEvent): boolean {
 function stampSdkActivity(channelId: string): void {
 	lastSdkEventAt.set(channelId, Date.now());
 	stuckRunConfirmations.delete(channelId);
+	// Real work arrived, so a stall refusal that was accumulating evidence of
+	// staleness no longer holds.
+	stallRefusalStreaks.delete(channelId);
 }
 
 /**
@@ -326,13 +395,13 @@ const stallRefusalLoggedAt = new Map<string, number>();
 /**
  * Log why the stall fast path refused, with the run snapshot.
  *
- * Only the subagent gate is logged: every other refusal rests on something
- * directly observable (a tool, a pid, a timestamp), while this one rests on
- * pi-subagents' bookkeeping — the one input that can be wrong, and the one that
- * produced a silent 45-minute non-recovery on the server.
+ * Every reason is logged, not just the subagent gate: the one refusal that was
+ * silenced here (`no-terminal-message`) is precisely the one that hid a 10-hour
+ * wedge, and a refusal nobody can see is indistinguishable from a detector that
+ * never ran. The throttle keeps a healthy 30-minute drain from burying the
+ * journal.
  */
 function logStallRefusal(channelId: string, refusal: PostCompletionStallRefusal): void {
-	if (refusal !== "subagent-work-pending") return;
 	const now = Date.now();
 	const last = stallRefusalLoggedAt.get(channelId) ?? 0;
 	if (now - last < STALL_REFUSAL_LOG_INTERVAL_MS) return;
@@ -1255,6 +1324,7 @@ async function finishChannelTurn(
 	// tool_execution_end can never disable the watchdog for this channel.
 	inFlightToolCounts.delete(channelId);
 	terminalMessageAt.delete(channelId);
+	stallRefusalStreaks.delete(channelId);
 	// Agent turn fully finished — stop typing until the next user message
 	// or queued prompt starts a new turn (agent_start re-shows it).
 	resetTypingState(channelId);
@@ -1339,16 +1409,17 @@ function subscribeToSession(
 	stampSdkActivity(channelId);
 
 	session.subscribe(async (event: AgentSessionEvent) => {
-		// Any event counts as activity: this is what the stale-run watchdog in the
-		// 60s sweep compares against. See src/stuck-run-decision.ts.
-		stampSdkActivity(channelId);
-		// The terminal assistant message marks the end of the turn's output; every
-		// other event (including agent_end itself) means the run is still working,
-		// so the marker only survives if the settle path went silent. See
-		// src/post-completion-stall.ts.
+		// Only positive work refreshes the silence clock. Counting every event here
+		// let our own interrupt (aborted message, agent_end, settles) reset the idle
+		// watchdog's threshold on each user prompt. See src/stall-evidence.ts.
+		if (isLivenessEvent(event) && !livenessMuted(channelId)) stampSdkActivity(channelId);
+		// The terminal assistant message marks the end of the turn's output. It is
+		// cleared only when the turn demonstrably continues, so an interrupt cannot
+		// erase the evidence that the settle path went silent.
 		if (isTerminalAssistantMessage(event)) {
 			terminalMessageAt.set(channelId, Date.now());
-		} else {
+			stallRefusalStreaks.delete(channelId);
+		} else if (clearsTerminalMarker(event)) {
 			terminalMessageAt.delete(channelId);
 		}
 		switch (event.type) {
@@ -2516,6 +2587,46 @@ async function main() {
 	}
 
 	/**
+	 * Completion evidence read from the transcript instead of from in-memory state.
+	 *
+	 * Only consulted when the in-memory marker is gone and the run still claims to
+	 * be active, so the cost is one tail read per sweep on a channel that already
+	 * looks suspicious. Never throws: a missing or corrupt transcript yields no
+	 * evidence, which refuses recovery rather than inventing a wedge.
+	 */
+	function transcriptTerminalAt(channelId: string, discordSession?: DiscordSession): number | undefined {
+		try {
+			const tail = parseTranscriptTail(readTranscriptTail(currentTranscriptPath(channelId, discordSession)));
+			return deriveTranscriptCompletionEvidence(tail)?.terminalAt;
+		} catch (err) {
+			log(`[${channelId}] Transcript completion evidence unavailable: ${String(err)}`);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Run the end-of-turn work for a turn whose settle path will never run.
+	 *
+	 * A wedged turn is over in every way the user can observe — its final message
+	 * is on disk and the session was just rebuilt — but the stale `agent_end`
+	 * cannot fire, so the typing indicator and a queued prompt would otherwise sit
+	 * there. Exactly one caller wins in practice: after a rebuild the disposed
+	 * session's listeners are gone, so the stale `agent_end` cannot fire.
+	 */
+	async function finishRecoveredTurn(channelId: string): Promise<void> {
+		const fresh = sessionStore.get(channelId);
+		const recoveredChannel = await fetchChannelObject(channelId);
+		if (fresh && recoveredChannel) {
+			await finishChannelTurn(channelId, recoveredChannel, fresh.session, typingManager);
+			return;
+		}
+		// No channel to stream a queued prompt into, so the queue waits for the next
+		// message instead of being sent into the void.
+		applyTypingEvent(channelId, { type: "turn_end" });
+		terminalMessageAt.delete(channelId);
+	}
+
+	/**
 	 * Announce background completions that were written to a transcript but never
 	 * delivered, so the bot reacts without a user prompt.
 	 *
@@ -2704,6 +2815,10 @@ async function main() {
 	 * Never throws. Returns true when the abort settled within the limit.
 	 */
 	async function abortModelActivitiesBounded(discordSession: DiscordSession, channelId: string): Promise<boolean> {
+		// Our own interrupt is about to make the SDK emit events: aborted message,
+		// agent_end, settles. None of those are the model working, so mute liveness
+		// stamping for the window they land in. See src/stall-evidence.ts.
+		noteInterruptIssued(channelId);
 		const abortSettled = discordSession.abortModelActivities().then(
 			() => true,
 			(error) => {
@@ -2764,7 +2879,13 @@ async function main() {
 		channelId: string,
 		discordSession: DiscordSession
 	): Promise<{ refusal: PostCompletionStallRefusal | null; liveChildPids: number[] }> {
-		const terminalAt = terminalMessageAt.get(channelId);
+		const markerAt = terminalMessageAt.get(channelId);
+		// The marker only lives in memory. A restart, a recreated session, or an
+		// interruption that erased it earlier would leave the check with no evidence
+		// even though the transcript still says the turn is over — so fall back to
+		// disk while the run claims to be active. See src/stall-evidence.ts.
+		const terminalAt =
+			markerAt ?? (discordSession.isModelActive() ? transcriptTerminalAt(channelId, discordSession) : undefined);
 		const work = subagentWorkLiveness(discordSession);
 		const base: PostCompletionStallInput = {
 			modelActive: discordSession.isModelActive(),
@@ -2920,6 +3041,8 @@ async function main() {
 		lastSdkEventAt.delete(channelId);
 		stuckRunConfirmations.delete(channelId);
 		terminalMessageAt.delete(channelId);
+		stallRefusalStreaks.delete(channelId);
+		interruptLivenessMutedUntil.delete(channelId);
 		// The wedged run's tool is gone with it; a stale count would otherwise
 		// block the next recovery for this channel.
 		inFlightToolCounts.delete(channelId);
@@ -4280,26 +4403,12 @@ async function main() {
 			// watchdog below stays for every other shape of wedge.
 			const stall = await evaluatePostCompletionStallForChannel(chId, discordSession);
 			if (stall.refusal === null) {
-				const terminalAt = terminalMessageAt.get(chId) ?? Date.now();
+				const terminalAt = terminalMessageAt.get(chId) ?? transcriptTerminalAt(chId, discordSession) ?? Date.now();
 				console.warn(
 					`[watchdog] ${chId} post-completion stall ${Date.now() - terminalAt}ms after final message - recovering`
 				);
 				try {
-					const recreated = await recoverStuckSession(chId);
-					if (recreated) {
-						// The stale agent_end never ran and never will: the subscription died
-						// with the session, so the end-of-turn work has to happen here.
-						const fresh = sessionStore.get(chId);
-						const stallChannel = await fetchChannelObject(chId);
-						if (fresh && stallChannel) {
-							await finishChannelTurn(chId, stallChannel, fresh.session, typingManager);
-						} else {
-							// No channel to stream a queued prompt into, so the queue waits for
-							// the next message instead of being sent into the void.
-							applyTypingEvent(chId, { type: "turn_end" });
-							terminalMessageAt.delete(chId);
-						}
-					}
+					if (await recoverStuckSession(chId)) await finishRecoveredTurn(chId);
 				} catch (err) {
 					console.error(`[discord] Post-completion recovery failed for ${chId}:`, err);
 				} finally {
@@ -4308,10 +4417,46 @@ async function main() {
 				continue;
 			}
 
-			// The only refusal that is not directly observable is the subagent gate, so
-			// it is the only one worth a periodic snapshot: it names the run that is
-			// (or is not) holding recovery off.
 			logStallRefusal(chId, stall.refusal);
+
+			// A refusal that never changes is itself evidence. The escalatable gates rest
+			// on bookkeeping and clocks our own interrupt can corrupt, so after a few
+			// identical sweeps the answer says more about our inputs than about the run.
+			// The child probe still applies: a live child is work, never a wedge.
+			const refusalStreak = recordStallRefusal(chId, stall.refusal);
+			if (shouldEscalateStallRefusal(stall.refusal, refusalStreak)) {
+				// Progressing subagent work is real work, whatever the refusal said: a
+				// ten-minute drain is legitimate, and the gate that reports it cannot tell
+				// "still working" from "never released". Only the run store can, and it
+				// already decided here.
+				if (subagentWorkLiveness(discordSession).async) {
+					continue;
+				}
+				const escalatedChildPids = await findLiveChildPids();
+				if (escalatedChildPids.length > 0) {
+					console.warn(
+						`[watchdog] ${chId} escalation refused despite ${refusalStreak} x ${stall.refusal}: ` +
+							`${escalatedChildPids.length} child process(es) alive (pids ${escalatedChildPids.join(",")})`
+					);
+					continue;
+				}
+				const evidenceAt = terminalMessageAt.get(chId) ?? transcriptTerminalAt(chId, discordSession);
+				const ageMs = evidenceAt === undefined ? undefined : Date.now() - evidenceAt;
+				console.warn(
+					`[watchdog] ${chId} escalating after ${refusalStreak} consecutive refusals by ${stall.refusal} ` +
+						`(requires ${STALL_ESCALATION_SWEEPS})` +
+						(ageMs === undefined ? " - recovering" : `, ${ageMs}ms after final message - recovering`)
+				);
+				try {
+					if (await recoverStuckSession(chId)) await finishRecoveredTurn(chId);
+				} catch (err) {
+					console.error(`[discord] Escalated recovery failed for ${chId}:`, err);
+				} finally {
+					stallRefusalStreaks.delete(chId);
+					stuckRunConfirmations.delete(chId);
+				}
+				continue;
+			}
 
 			const idleMs = Date.now() - (lastSdkEventAt.get(chId) ?? Date.now());
 			const evaluation = evaluateStuckRunForChannel(chId, discordSession);

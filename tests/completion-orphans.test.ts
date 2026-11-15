@@ -37,6 +37,15 @@ function assistantLine(at: string, text = "here you go"): string {
 	return JSON.stringify({ type: "message", message: { role: "assistant", content: text }, timestamp: at });
 }
 
+/** One JSONL transcript line for an assistant message with an explicit stop reason. */
+function assistantStopLine(at: string, stopReason: string, text = "here you go"): string {
+	return JSON.stringify({
+		type: "message",
+		message: { role: "assistant", content: text, stopReason },
+		timestamp: at,
+	});
+}
+
 /** One JSONL transcript line for a user message. */
 function userLine(at: string, text = "status?"): string {
 	return JSON.stringify({ type: "message", message: { role: "user", content: text }, timestamp: at });
@@ -76,6 +85,30 @@ describe("transcript tail parsing", () => {
 			[notifyLine("2026-11-14T20:37:38.864Z"), userLine("2026-11-14T21:02:08.000Z")].join("\n")
 		);
 		expect(tail.lastMeaningfulKind).toBe("user");
+	});
+
+	it("records the stop reason of the newest assistant message", () => {
+		// The stall watchdog rebuilds its completion marker from this when the
+		// in-memory one is gone; a tool batch means the turn continued.
+		const tail = parseTranscriptTail(
+			[
+				assistantStopLine("2026-11-14T21:40:57.152Z", "stop"),
+				assistantStopLine("2026-11-14T21:41:00.000Z", "toolUse"),
+			].join("\n")
+		);
+		expect(tail.lastAssistantStopReason).toBe("toolUse");
+		expect(tail.lastAssistantTerminal).toBe(false);
+	});
+
+	it("marks a terminal stop reason as the end of the turn", () => {
+		const tail = parseTranscriptTail(assistantStopLine("2026-11-14T21:40:57.152Z", "stop"));
+		expect(tail.lastAssistantTerminal).toBe(true);
+		expect(tail.lastAssistantAt).toBe(Date.parse("2026-11-14T21:40:57.152Z"));
+	});
+
+	it("treats a missing stop reason as not terminal", () => {
+		const tail = parseTranscriptTail(assistantLine("2026-11-14T21:40:57.152Z"));
+		expect(tail.lastAssistantTerminal).toBe(false);
 	});
 
 	it("counts unparseable lines without throwing and keeps the parseable ones", () => {

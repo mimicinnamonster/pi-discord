@@ -17,6 +17,8 @@
 
 import { closeSync, openSync, readSync, statSync } from "fs";
 
+import { isTerminalStopReason } from "./post-completion-stall.ts";
+
 /**
  * Grace before an orphan is considered announced-and-lost.
  *
@@ -69,6 +71,17 @@ export interface TranscriptTail {
 	lastMeaningfulAt?: number;
 	/** Epoch ms of the newest assistant message. */
 	lastAssistantAt?: number;
+	/** Stop reason of that message, when the transcript records one. */
+	lastAssistantStopReason?: string;
+	/**
+	 * Whether that message ended its turn (as opposed to continuing with tools).
+	 *
+	 * The stall watchdog reads this to recover its completion marker from disk
+	 * when the in-memory one was lost: an assistant record with a terminal stop
+	 * reason as the newest meaningful record means the turn is over. See
+	 * src/stall-evidence.ts.
+	 */
+	lastAssistantTerminal?: boolean;
 	/** Epoch ms of the newest subagent notification. */
 	lastNotifyAt?: number;
 	/** Excerpt of that notification, for the wake prompt. */
@@ -130,6 +143,8 @@ interface ParsedRecord {
 	kind: TranscriptKind;
 	at: number;
 	content?: string;
+	/** Assistant only: the stop reason recorded for the message. */
+	stopReason?: string;
 }
 
 /**
@@ -162,6 +177,8 @@ export function parseTranscriptTail(text: string): TranscriptTail {
 		}
 		if (record.kind === "assistant" && (tail.lastAssistantAt === undefined || record.at >= tail.lastAssistantAt)) {
 			tail.lastAssistantAt = record.at;
+			tail.lastAssistantStopReason = record.stopReason;
+			tail.lastAssistantTerminal = record.stopReason !== undefined && isTerminalStopReason(record.stopReason);
 		}
 		if (record.kind === "notify" && (tail.lastNotifyAt === undefined || record.at >= tail.lastNotifyAt)) {
 			tail.lastNotifyAt = record.at;
@@ -195,7 +212,10 @@ function parseRecord(line: string): ParsedRecord | null {
 	}
 	if (type === "message") {
 		const role = record.message?.role;
-		if (role === "assistant") return { kind: "assistant", at };
+		if (role === "assistant") {
+			const stopReason = record.message?.stopReason;
+			return { kind: "assistant", at, stopReason: typeof stopReason === "string" ? stopReason : undefined };
+		}
 		if (role === "user") return { kind: "user", at };
 		return { kind: "other", at };
 	}
