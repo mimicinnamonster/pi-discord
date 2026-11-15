@@ -23,6 +23,7 @@ FORCE=0
 DRY_RUN=0
 USE_SUDO=1
 USER_SCOPE=0
+CHECK_ONLY=0
 
 usage() {
   cat <<'USAGE'
@@ -36,10 +37,13 @@ Options:
   --no-sudo          call systemctl without sudo (use when already root)
   --force            restart even if runs are in flight
   --dry-run          report what would happen, change nothing
+  --check-only       wait for idle, then exit without restarting (used by
+                     scripts/deploy.sh, which restarts after pulling)
   -h, --help         show this help
 
-Exit codes: 0 restarted (or would restart with --dry-run), 2 still busy after
---max-wait (nothing restarted), 3 missing prerequisite.
+Exit codes: 0 restarted (or idle with --check-only, or would restart with
+--dry-run), 2 still busy after --max-wait (nothing restarted), 3 missing
+prerequisite.
 USAGE
 }
 
@@ -52,6 +56,7 @@ while [ $# -gt 0 ]; do
     --no-sudo) USE_SUDO=0; shift ;;
     --force) FORCE=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --check-only) CHECK_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 3 ;;
   esac
@@ -65,7 +70,7 @@ fi
 # Mirror pi-subagents' store resolution: $PI_SUBAGENTS_TEMP_ROOT, else
 # <tmpdir>/pi-subagents-<scope> with scope uid-<uid>.
 runs_dir() {
-  local root scope
+  local root
   if [ -n "${PI_SUBAGENTS_TEMP_ROOT:-}" ]; then
     root="$PI_SUBAGENTS_TEMP_ROOT"
   else
@@ -113,6 +118,9 @@ restart() {
 
 if [ "$FORCE" -eq 1 ]; then
   echo "restart-when-idle: --force, skipping the idle check" >&2
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    exit 0
+  fi
   restart
   exit 0
 fi
@@ -122,6 +130,9 @@ while :; do
   busy="$(busy_runs)"
   if [ -z "$busy" ]; then
     echo "restart-when-idle: no run in flight ($(runs_dir))"
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+      exit 0
+    fi
     restart
     exit 0
   fi

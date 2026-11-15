@@ -248,15 +248,41 @@ sudo systemctl restart pi-discord   # or: systemctl --user restart pi-discord
 credentials. Anonymous HTTPS is read-only by design — push from a development
 machine, not from the server.
 
-**Restart only when no subagent run is in flight.** A background run reports its
+**Deploy with the script, not by hand.** `scripts/deploy.sh` runs from a
+development machine, drives the whole sequence over ssh, and refuses to leave the
+host on a revision that does not boot:
+
+```bash
+./scripts/deploy.sh --host oracle                  # pull, gate, restart, verify
+./scripts/deploy.sh --host oracle --dry-run        # print the ssh commands only
+./scripts/deploy.sh --host oracle --max-wait 600   # wait longer for in-flight runs
+./scripts/deploy.sh --host oracle --force          # restart even if a run is live
+./scripts/deploy.sh --host oracle --skip-build     # skip the tsc gate
+```
+
+It goes, in order: refuse a dirty remote checkout (never stashes or commits
+there) → wait for idle → record the current HEAD as the rollback point →
+`git pull --ff-only` → `npm run build` (the `tsc` gate) → restart → poll for a
+`Bot is ready` / `Bot logged in` line written *after* the restart → on failure
+`git reset --hard` the old revision, restart it, and exit non-zero.
+
+Both middle gates matter because the unit runs `node src/index.ts` directly
+(Node type stripping, no compiled output). `tsc` catches syntax Node's strip-only
+loader rejects — a parameter property once crash-looped the unit until systemd
+refused to keep restarting it — and the readiness poll catches everything `tsc`
+cannot see. `systemctl is-active` alone is not proof: it still reports `active`
+for a process that crashed after startup.
+
+**Never restart while a subagent run is in flight.** A background run reports its
 result through the process that started it; restarting mid-run kills the runner
 before it can announce anything, which leaves a completion nobody is waiting for
-(the bot then stays silent until someone prompts it). Use the guard instead of a
-bare restart:
+(the bot then stays silent until someone prompts it). `deploy.sh` waits for that,
+and the guard is also usable on its own:
 
 ```bash
 ./scripts/restart-when-idle.sh                 # waits, then restarts
 ./scripts/restart-when-idle.sh --dry-run       # just report what is in flight
+./scripts/restart-when-idle.sh --check-only    # wait for idle, do not restart
 ./scripts/restart-when-idle.sh --max-wait 600  # wait longer
 ./scripts/restart-when-idle.sh --force         # restart anyway
 ```
