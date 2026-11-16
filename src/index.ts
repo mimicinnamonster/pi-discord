@@ -43,6 +43,13 @@ import { isNonRetryableModelError, retryHintForModelError } from "./retry-policy
 import { splitMessagePreservingCodeBlocks, DISCORD_CHUNK_LIMIT } from "./message-chunker.ts";
 import { STALE_ASYNC_WORK_TIMEOUT_MS } from "./subagent-gate.ts";
 import { createPendingMessageStore, PENDING_MESSAGES_FILE } from "./pending-messages.ts";
+import {
+	evaluateIdleQueueRecovery,
+	parkedDeliveryDecision,
+	partitionClearedMessages,
+	STALE_QUEUE_REASON,
+	type IdleQueueRefusal,
+} from "./idle-queue-recovery.ts";
 import { saveChannelThinkingMode, setThinkingModeEnabled, isThinkingModeEnabled, loadChannelThinkingMode, DEFAULT_THINKING_MODE } from "./thinking-mode.ts";
 import { TypingManager, type TypingChannel } from "./typing-manager.ts";
 import { ChannelSendQueue } from "./send-queue.ts";
@@ -2669,6 +2676,61 @@ async function main() {
 	}
 
 	/**
+	 * Drop stale SDK queue copies that duplicate parked messages on an idle session.
+	 *
+	 * Needed for queues built before the "never park and queue the same message"
+	 * invariant (src/idle-queue-recovery.ts): a run that ended without consuming its
+	 * followUps leaves an idle session whose queue nothing will ever drain. The
+	 * parked store is the source of truth, so the stale copies are dropped and replay
+	 * delivers the durable ones; a cleared text with no parked copy is written back to
+	 * the store rather than lost.
+	 */
+	async function clearStaleIdleQueue(
+		channelId: string,
+		discordSession: DiscordSession
+	): Promise<{ cleared: number; refusal: IdleQueueRefusal | null }> {
+		const parked = pendingMessages.forChannel(channelId);
+		const base = {
+			modelActive: discordSession.isModelActive(),
+			pendingMessageCount: discordSession.session.pendingMessageCount,
+			parkedCount: parked.length,
+			recovering: recoveringChannels.has(channelId),
+			clearQueueAvailable: typeof discordSession.session.clearQueue === "function",
+			hasProgressingAsyncWork: false,
+			liveChildProcessCount: 0,
+		};
+		// Cheap gates first: the child probe spawns a process, so it only runs when
+		// everything else already says the queue is ours to clear.
+		const cheap = evaluateIdleQueueRecovery(base);
+		if (cheap.refusal !== null) return { cleared: 0, refusal: cheap.refusal };
+
+		if (subagentWorkLiveness(discordSession).async) {
+			return { cleared: 0, refusal: "async-work-progressing" };
+		}
+		const childPids = await findLiveChildPids();
+		const decision = evaluateIdleQueueRecovery({ ...base, liveChildProcessCount: childPids.length });
+		if (decision.refusal !== null) return { cleared: 0, refusal: decision.refusal };
+
+		const cleared = discordSession.session.clearQueue();
+		const partition = partitionClearedMessages(cleared, parked);
+		partition.unmatched.forEach((orphan, index) => {
+			if (!orphan.trim()) return;
+			pendingMessages.add({
+				channelId,
+				discordMessageId: `${STALE_QUEUE_REASON}-${Date.now()}-${index}`,
+				content: orphan,
+				queuedAt: Date.now(),
+				reason: STALE_QUEUE_REASON,
+			});
+		});
+		console.warn(
+			`[watchdog] cleared ${partition.total} stale queued message(s) for ${channelId} ` +
+				`(idle session, ${parked.length} parked, ${partition.unmatched.length} re-parked)`
+		);
+		return { cleared: partition.total, refusal: null };
+	}
+
+	/**
 	 * Re-send messages parked while the channel was draining background subagent
 	 * work (see src/pending-messages.ts) now that the blocking run is gone.
 	 *
@@ -2724,19 +2786,35 @@ async function main() {
 				await abortModelActivitiesBounded(discordSession, channelId);
 			}
 
-			// Messages already sitting in the SDK's follow-up queue are delivered by the
-			// session itself; replaying them as well would send them twice. Leave them
-			// parked and let a later sweep retry once that queue has drained.
-			//
-			// This raw count includes followUps this process pushed while the run was
-			// still active, so the guard is only correct because the 60s self-heal
-			// sweep runs recoverStuckSession() for every channel BEFORE it calls this
-			// function: recovery recreates the session, which empties that queue. Do
-			// not reorder those two passes.
+			// Messages already sitting in the SDK's queue are delivered by the session
+			// itself, so replaying them as well would send them twice — but only while a
+			// run is actually active. The queue also holds followUp copies of parked
+			// messages, and a run that ended without consuming them leaves an IDLE session
+			// whose queue nothing will ever drain (2026-11-16: two entries, session idle,
+			// both detectors correctly said `not-active`, replay refused forever). So an
+			// idle session's stale copies are cleared and the durable store decides what is
+			// delivered; only an active run keeps the guard.
 			const alreadyQueued = discordSession.session.pendingMessageCount;
 			if (alreadyQueued > 0) {
-				log(`[${channelId}] Replay: ${alreadyQueued} message(s) still queued in the session - leaving ${parked.length} parked for a later sweep`);
-				return 0;
+				if (discordSession.isModelActive()) {
+					log(`[${channelId}] Replay: ${alreadyQueued} message(s) still queued in the session - leaving ${parked.length} parked for a later sweep`);
+					return 0;
+				}
+				const cleared = await clearStaleIdleQueue(channelId, discordSession);
+				if (cleared.refusal !== null) {
+					log(
+						`[${channelId}] Replay: ${alreadyQueued} queued message(s) not cleared (${cleared.refusal}) - ` +
+							`leaving ${parked.length} parked for a later sweep`
+					);
+					return 0;
+				}
+				if (discordSession.session.pendingMessageCount > 0) {
+					log(
+						`[${channelId}] Replay: queue still holds ${discordSession.session.pendingMessageCount} message(s) after clearing - ` +
+							`leaving ${parked.length} parked`
+					);
+					return 0;
+				}
 			}
 
 			let replayed = 0;
@@ -4200,6 +4278,7 @@ async function main() {
 			// only materialises when the current run settles; if that run never
 			// settles the message would be lost. See src/pending-messages.ts.
 			const sessionStillActive = discordSession.isModelActive();
+			let parked = false;
 			if (sessionStillActive) {
 				const parkedText = message.content ?? "";
 				if (parkedText.trim()) {
@@ -4212,17 +4291,29 @@ async function main() {
 						queuedAt: Date.now(),
 						reason: "run-still-active",
 					});
+					parked = true;
 				} else {
 					log(
 						`[${channelId}] Message ${message.id} has no text (attachments only) and cannot be parked for replay`
 					);
 				}
 			}
-			// While the aborted run is still winding down a bare send would throw
-			// "Agent is already processing" — queue it as a follow-up instead, which
-			// runs as soon as that run settles. If it settled in the meantime,
-			// isStreaming is false and the message runs normally.
-			await session.sendUserMessage(finalContent, sessionStillActive ? { deliverAs: "followUp" } : undefined);
+			// Invariant (src/idle-queue-recovery.ts): a message with a durable parked
+			// copy is never also queued in the SDK. Replay owns delivery of the parked
+			// copy, and a followUp copy outlives the run that queued it: on 2026-11-16 two
+			// of them sat in an idle session's queue and made the replay guard refuse the
+			// parked originals forever. `deliverAs: "followUp"` stays for the messages we
+			// could not park (attachments only), which have no durable copy to fall back on.
+			const delivery = parkedDeliveryDecision({ sessionStillActive, parked });
+			if (delivery.skipSend) {
+				log(`[${channelId}] Message ${message.id} parked for replay - not queued in the session`);
+				applyTypingEvent(channelId, { type: "turn_end" });
+				return;
+			}
+			await session.sendUserMessage(
+				finalContent,
+				delivery.deliverAs ? { deliverAs: delivery.deliverAs } : undefined
+			);
 			delivered = true;
 
 			// Track user Discord message → user Pi entry
@@ -4388,7 +4479,8 @@ async function main() {
 		// before any replay starts (see the guard in replayPendingMessages). A
 		// session whose run never settles still reports its own followUps as queued,
 		// so replaying first would leave the parked messages parked behind a queue
-		// nothing can drain.
+		// nothing can drain. The replay pass also clears a queue left behind by a run
+		// that already ended: see clearStaleIdleQueue().
 		for (const chId of candidates) {
 			const discordSession = sessionStore.get(chId);
 			if (!discordSession) {
@@ -4519,6 +4611,9 @@ async function main() {
 			// the parked copy is dropped after the send, so wait for the next message
 			// (or the keeper) to re-subscribe instead of losing it.
 			if (!sessionSubscriptions.has(chId)) continue;
+			// This pass is also where an idle session's stale queue is cleared: replay
+			// asks clearStaleIdleQueue() before its own queue guard, so the two cannot
+			// disagree about what is deliverable.
 			replayPendingMessages(chId).catch((err) => {
 				console.error(`[discord] Replay sweep error for ${chId}:`, err);
 			});
