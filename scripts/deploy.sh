@@ -25,6 +25,12 @@
 # local *edits to tracked files*, not to demand a pristine tree — see
 # scripts/lib/checkout-guard.sh and its tests in scripts/deploy.test.sh.
 #
+# The tsc gate runs over a non-interactive ssh shell, which does not inherit the
+# interactive PATH: on this host node/npm come from mise. The gate therefore
+# prepends ~/.local/share/mise/shims when present. Without that it aborts with
+# "npm: command not found" (exit 127) after the pull but before any restart,
+# leaving a partially applied deploy — precisely what this script must prevent.
+#
 # Usage: scripts/deploy.sh --host <ssh-target> [options]
 #
 set -euo pipefail
@@ -193,7 +199,12 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
   log "build gate: skipped (--skip-build)"
 else
   log "build gate: tsc"
-  remote "cd $REMOTE_PATH && if [ -x node_modules/.bin/tsc ]; then npm run build; else echo 'deploy: no node_modules/.bin/tsc, skipping tsc gate' >&2; fi"
+  # A non-interactive ssh shell has no mise PATH, so `npm` would not resolve.
+  build_path_prefix=""
+  if [ "$(capture "[ -d \$HOME/.local/share/mise/shims ] && echo yes || echo no")" = "yes" ]; then
+    build_path_prefix='PATH="$HOME/.local/share/mise/shims:$PATH" '
+  fi
+  remote "cd $REMOTE_PATH && ${build_path_prefix}if [ -x node_modules/.bin/tsc ]; then npm run build; else echo 'deploy: no node_modules/.bin/tsc, skipping tsc gate' >&2; fi"
 fi
 
 # --- 6. restart -------------------------------------------------------------
