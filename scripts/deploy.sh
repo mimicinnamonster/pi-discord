@@ -200,9 +200,10 @@ if [ "$SKIP_BUILD" -eq 1 ]; then
 else
   log "build gate: tsc"
   # A non-interactive ssh shell has no mise PATH, so `npm` would not resolve.
+  # `export` (not a VAR=value prefix) because the target is a compound `if`.
   build_path_prefix=""
   if [ "$(capture "[ -d \$HOME/.local/share/mise/shims ] && echo yes || echo no")" = "yes" ]; then
-    build_path_prefix='PATH="$HOME/.local/share/mise/shims:$PATH" '
+    build_path_prefix='export PATH="$HOME/.local/share/mise/shims:$PATH"; '
   fi
   remote "cd $REMOTE_PATH && ${build_path_prefix}if [ -x node_modules/.bin/tsc ]; then npm run build; else echo 'deploy: no node_modules/.bin/tsc, skipping tsc gate' >&2; fi"
 fi
