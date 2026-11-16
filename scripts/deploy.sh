@@ -16,6 +16,15 @@
 # restart -> poll for a readiness line (catches whatever `tsc` did not) ->
 # roll back and restart the old revision if the smoke test fails.
 #
+# "Dirty" here means modified TRACKED files only, and that refusal is hard (no
+# override). Untracked files do not block the deploy: a `--ff-only` pull cannot
+# clobber an untracked path (git aborts the pull on collision instead), and this
+# checkout permanently carries untracked research notes that must never be
+# deleted or stashed. They are reported on one informational line so the deploy
+# log still proves they were seen and left alone. The guard exists to protect
+# local *edits to tracked files*, not to demand a pristine tree — see
+# scripts/lib/checkout-guard.sh and its tests in scripts/deploy.test.sh.
+#
 # Usage: scripts/deploy.sh --host <ssh-target> [options]
 #
 set -euo pipefail
@@ -89,6 +98,10 @@ fi
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15)
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/checkout-guard.sh
+. "$SCRIPT_DIR/lib/checkout-guard.sh"
+
 log() { printf 'deploy: %s\n' "$*"; }
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
 
@@ -117,18 +130,30 @@ capture() {
 }
 
 # --- 1. preflight -----------------------------------------------------------
+# Tracked modifications refuse (local edits are at risk); untracked files are
+# reported and left alone (a --ff-only pull cannot clobber them).
 log "preflight: $HOST:$REMOTE_PATH"
-dirty="$(capture "cd $REMOTE_PATH && git status --porcelain")"
-case "$dirty" in
-  "")
-    ;;
-  DRY-RUN)
-    ;;
-  *)
-    printf 'deploy: remote checkout has uncommitted changes - refusing to deploy:\n%s\n' "$dirty" >&2
-    exit 1
-    ;;
-esac
+tracked_changes="$(capture "cd $REMOTE_PATH && git status --porcelain --untracked-files=no")"
+all_changes="$(capture "cd $REMOTE_PATH && git status --porcelain")"
+if [ "$DRY_RUN" -eq 0 ]; then
+  verdict="$(guard_verdict "$tracked_changes" "$all_changes")"
+  case "$verdict" in
+    refuse)
+      printf 'deploy: remote checkout has modifications to tracked files - refusing to deploy:\n%s\n' "$tracked_changes" >&2
+      exit 1
+      ;;
+    proceed-clean)
+      ;;
+    proceed-untracked\ *)
+      untracked_count="${verdict##* }"
+      untracked_names="$(untracked_paths "$all_changes" | tr '\n' ' ')"
+      log "note: $untracked_count untracked file(s) present, not touched: ${untracked_names% }"
+      ;;
+    *)
+      die "preflight: unexpected guard verdict '$verdict' - nothing changed"
+      ;;
+  esac
+fi
 
 # --- 2. wait for idle -------------------------------------------------------
 # Reuses the guard's logic so a live subagent run is never killed; that guard
