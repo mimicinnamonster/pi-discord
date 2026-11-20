@@ -12,7 +12,7 @@
 
 import { spawn, type ChildProcess } from "child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { findChildPids, isProcessAlive, parseProcessTable, probeLiveChildProcesses } from "../src/child-process-probe.ts";
+import { findChildPids, isProcessAlive, parseProcStatState, parseProcessTable, probeLiveChildProcesses } from "../src/child-process-probe.ts";
 
 const spawned: ChildProcess[] = [];
 
@@ -102,6 +102,27 @@ describe("probeLiveChildProcesses", () => {
 	});
 });
 
+describe("parseProcStatState", () => {
+	it("reads the state field after the command name", () => {
+		expect(parseProcStatState("1234 (node) S 1 1234 1 0 -1")).toBe("S");
+	});
+
+	it("reports a zombie as Z", () => {
+		// The whole point of reading state: a `Z` still holds its pid but does no work.
+		expect(parseProcStatState("1234 (node) Z 1 1234 1 0 -1")).toBe("Z");
+	});
+
+	it("keeps a command name containing spaces and parentheses intact", () => {
+		expect(parseProcStatState("1234 (my (odd) name) R 1 1234 1 0 -1")).toBe("R");
+	});
+
+	it("returns undefined for input with no state field", () => {
+		expect(parseProcStatState("")).toBeUndefined();
+		expect(parseProcStatState("1234 (node)")).toBeUndefined();
+		expect(parseProcStatState("garbage")).toBeUndefined();
+	});
+});
+
 describe("isProcessAlive", () => {
 	it("reports this process as alive", () => {
 		expect(isProcessAlive(process.pid)).toBe(true);
@@ -123,7 +144,10 @@ describe("isProcessAlive", () => {
 		const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
 		child.kill("SIGKILL");
 		await exited;
-		// A zombie still holds the pid, so spin briefly rather than asserting instantly.
+		// Dead the moment it exits: a zombie (`Z`) still holds the pid but does no work,
+		// so it must not count as alive. Node reaps quickly, which this does not rely on.
+		expect(isProcessAlive(pid as number)).toBe(false);
+		// A zombie holds the pid, so spin briefly rather than asserting instantly.
 		for (let attempt = 0; attempt < 50 && isProcessAlive(pid as number); attempt += 1) {
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}

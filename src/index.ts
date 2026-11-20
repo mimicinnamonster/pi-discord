@@ -27,6 +27,8 @@ import {
 	formatOutstandingRuns,
 	hasProgressingAsyncWork,
 	listRunStatuses,
+	type OutstandingRun,
+	RUN_MAX_HOLD_MS,
 	summarizeRunStore,
 } from "./subagent-run-store.ts";
 import {
@@ -360,6 +362,31 @@ async function findLiveChildPids(): Promise<number[]> {
 let runStoreUnavailableLogged = false;
 
 /**
+ * One-line snapshot of the async-run store, with a read failure folded into the
+ * same string so a caller can always print a single line.
+ *
+ * `failed` lets the callers that must not repeat themselves (a sweep can hit
+ * several channels) distinguish "no runs" from "could not tell".
+ */
+function outstandingRunsSnapshot(): { snapshot: string; failed: boolean } {
+	try {
+		const summary = summarizeRunStore();
+		if (summary.error) {
+			return {
+				snapshot: `${formatOutstandingRuns([])} (store unavailable: ${summary.error})`,
+				failed: true,
+			};
+		}
+		return { snapshot: formatOutstandingRuns(summary.runs), failed: false };
+	} catch (err) {
+		return {
+			snapshot: `${formatOutstandingRuns([])} (snapshot failed: ${String(err)})`,
+			failed: true,
+		};
+	}
+}
+
+/**
  * Log which subagent runs are outstanding before a session is torn down.
  *
  * The watchdog's own reason string describes the parent (idle, stalled) but not
@@ -371,20 +398,12 @@ let runStoreUnavailableLogged = false;
  * that is already justified.
  */
 function logOutstandingSubagentRuns(channelId: string): void {
-	try {
-		const summary = summarizeRunStore();
-		if (summary.error) {
-			if (runStoreUnavailableLogged) return;
-			runStoreUnavailableLogged = true;
-			console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns([])} (store unavailable: ${summary.error})`);
-			return;
-		}
-		console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns(summary.runs)}`);
-	} catch (err) {
+	const { snapshot, failed } = outstandingRunsSnapshot();
+	if (failed) {
 		if (runStoreUnavailableLogged) return;
 		runStoreUnavailableLogged = true;
-		console.warn(`[watchdog] ${channelId} ${formatOutstandingRuns([])} (snapshot failed: ${String(err)})`);
 	}
+	console.warn(`[watchdog] ${channelId} ${snapshot}`);
 }
 
 /**
@@ -398,6 +417,24 @@ const STALL_REFUSAL_LOG_INTERVAL_MS = 5 * 60_000;
 
 /** Last time each channel logged a refused stall check, for the throttle above. */
 const stallRefusalLoggedAt = new Map<string, number>();
+
+/** Last time each channel logged an unattributable subagent run, same throttle. */
+const unattributedRunLoggedAt = new Map<string, number>();
+
+/**
+ * Throttle key for counted runs whose `sessionId` maps to no channel.
+ *
+ * Separate from `unattributedRunLoggedAt` on purpose: that one counts runs this
+ * channel *released*, this one counts runs it *credited* with weaker evidence.
+ * Sharing a key would make the two rates indistinguishable in the journal.
+ */
+const countedUnattributedLoggedAt = new Map<string, number>();
+
+/** Total counted-but-unattributable runs seen since start, logged with the rate. */
+let countedUnattributedTotal = 0;
+
+/** Throttle key for hold-cap trips (platforms where pid state cannot be classified). */
+const holdCappedLoggedAt = new Map<string, number>();
 
 /**
  * Log why the stall fast path refused, with the run snapshot.
@@ -2326,29 +2363,97 @@ async function main() {
 	let sendCount = 0;
 
 	/**
-	 * Split the channel's subagent work into "provably live" and "only counted".
+	 * Log a counted run whose `sessionId` maps to no channel.
+	 *
+	 * It is still credited — tally membership is the stronger ownership evidence —
+	 * so this is not the release path. Reported separately anyway: a run we hold on
+	 * weaker evidence is the residual-risk case, and the counter shows its rate.
+	 */
+	function logCountedRunWithoutOwner(channelId: string, run: OutstandingRun): void {
+		countedUnattributedTotal += 1;
+		const now = Date.now();
+		const last = countedUnattributedLoggedAt.get(channelId) ?? 0;
+		if (now - last < STALL_REFUSAL_LOG_INTERVAL_MS) return;
+		countedUnattributedLoggedAt.set(channelId, now);
+		console.warn(
+			`[watchdog] ${channelId} holding on tally for run runId=${run.runId.slice(0, 8)} state=${run.state} ` +
+				`pid=${run.pid ?? "none"} sessionId=${run.sessionId ?? "none"}: no channel attribution ` +
+				`(${countedUnattributedTotal} so far)`
+		);
+	}
+
+	/** Log once per window when a live-pid hold ends because its state is unclassifiable. */
+	function logHoldCapped(channelId: string, run: OutstandingRun): void {
+		const now = Date.now();
+		const last = holdCappedLoggedAt.get(channelId) ?? 0;
+		if (now - last < STALL_REFUSAL_LOG_INTERVAL_MS) return;
+		holdCappedLoggedAt.set(channelId, now);
+		console.warn(
+			`[watchdog] ${channelId} releasing run runId=${run.runId.slice(0, 8)} pid=${run.pid ?? "none"}: ` +
+				`pid appears alive but its state is unclassifiable on ${process.platform}, ` +
+				`held past RUN_MAX_HOLD_MS (${RUN_MAX_HOLD_MS}ms)`
+		);
+	}
+
+	/**
+	 *
+	 * Such a run is released, never credited, so this is the only trace of the rate
+	 * at which attribution fails. Throttled per channel like the refusal log: a
+	 * single unattributable run would otherwise be printed on every 60s sweep.
+	 */
+	function logUnattributedRun(channelId: string, run: OutstandingRun): void {
+		const now = Date.now();
+		const last = unattributedRunLoggedAt.get(channelId) ?? 0;
+		if (now - last < STALL_REFUSAL_LOG_INTERVAL_MS) return;
+		unattributedRunLoggedAt.set(channelId, now);
+		console.warn(
+			`[watchdog] ${channelId} not suppressed by run runId=${run.runId.slice(0, 8)} state=${run.state} ` +
+				`pid=${run.pid ?? "none"} sessionId=${run.sessionId ?? "none"}: no channel attribution`
+		);
+	}
+
+	/**
+	 * Split the channel's subagent work into "provably live" and "verified on disk".
 	 *
 	 * `sync` is a subagent tool call holding a live child process: work by
-	 * construction. `async` comes from the gate's in-memory tally, which is
-	 * released only by pi-subagents' async-complete event — and that event is
-	 * delivered through the session, so the wedge that blocks the settle path also
-	 * blocks the release. Reading that tally as work in progress deadlocks the
-	 * recovery that would break the loop, so each counted run is resolved against
-	 * the on-disk run store instead.
+	 * construction. `async` is resolved against the on-disk run store, attributed to
+	 * this channel by transcript path.
+	 *
+	 * The gate's tally is deliberately not the answer. It is released only by
+	 * pi-subagents' async-complete event — delivered through the session — so the
+	 * wedge that blocks the settle path also blocks the release, and reading it as
+	 * work in progress deadlocks the recovery that would break the loop. It is also
+	 * per-session state, so a session replacement empties it while runs it counted
+	 * are still alive; treating that empty tally as "nothing is running" is what let
+	 * production log `outstanding runs: none` and then tear the session down.
 	 *
 	 * A run that is terminal, or whose pid is dead and whose status is older than
 	 * RUN_PROGRESS_RECENT_MS, is not work — its pending delivery is a consequence
-	 * of the wedge, not evidence against recovering from it. When the store cannot
-	 * be read the async half reports live: an unverifiable input must not be the
-	 * reason a turn is destroyed.
+	 * of the wedge, not evidence against recovering from it. A run whose process is
+	 * alive is work no matter how old its status file is. When the store cannot be
+	 * read the async half reports live: an unverifiable input must not be the reason
+	 * a turn is destroyed.
 	 */
 	function subagentWorkLiveness(
 		discordSession: DiscordSession
 	): { sync: boolean; async: boolean } {
 		const sync = discordSession.hasSyncSubagentWork();
 		const pendingRuns = discordSession.pendingAsyncRuns();
-		if (pendingRuns.length === 0) return { sync, async: false };
-		return { sync, async: hasProgressingAsyncWork(pendingRuns, summarizeRunStore()) };
+		// The tally is only a hint: it is per-session, so a replacement drops runs that
+		// are still alive. The store is authoritative, attributed by transcript path.
+		return {
+			sync,
+			async: hasProgressingAsyncWork(pendingRuns, summarizeRunStore(), {
+				scope: {
+					channelId: discordSession.channelId,
+					channelIdForRun: (run) => channelIdFromSessionPath(run.sessionId),
+					onUnattributedRun: (run) => logUnattributedRun(discordSession.channelId, run),
+					onCountedRunWithoutOwner: (run) =>
+						logCountedRunWithoutOwner(discordSession.channelId, run),
+				},
+				onHoldCapped: (run) => logHoldCapped(discordSession.channelId, run),
+			}),
+		};
 	}
 
 	/**
@@ -3099,7 +3204,12 @@ async function main() {
 		// Stage 2: still active after the bounded abort, so the run cannot settle.
 		// console.warn, not log(): log() is gated on DISCORD_DEBUG, and a session
 		// teardown on a live channel must be visible in the journal.
-		console.warn(`[watchdog] ${channelId} idle ${idleSeconds}s, abort did not settle - recreating session`);
+		// The snapshot rides on the teardown line itself, not just the earlier
+		// pre-abort line: this is the line that says a session was destroyed, so it
+		// has to name what was outstanding at that moment on its own.
+		console.warn(
+			`[watchdog] ${channelId} idle ${idleSeconds}s, abort did not settle - recreating session - ${outstandingRunsSnapshot().snapshot}`
+		);
 		// Output already accepted for this channel is flushed before the rebuild, so
 		// the pre-recovery turn's last lines still land in order instead of racing
 		// the recreated session's first output. Bounded: a stuck send is abandoned

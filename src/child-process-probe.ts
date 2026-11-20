@@ -16,6 +16,7 @@
  */
 
 import { spawn } from "child_process";
+import { readFileSync } from "fs";
 
 /** One row of `ps -eo pid=,ppid=,stat=,comm=`. */
 export interface ProcessRow {
@@ -85,26 +86,64 @@ export function findChildPids(
 }
 
 /**
+ * State field of a `/proc/<pid>/stat` line: `pid (comm) state ...`.
+ *
+ * `comm` is the executable name in parentheses and may itself contain spaces
+ * and parentheses, so the split is on the *last* `)` rather than the first —
+ * otherwise `(/usr/bin/my (odd) name)` would shift every later field.
+ */
+export function parseProcStatState(stat: string): string | undefined {
+	const close = stat.lastIndexOf(")");
+	if (close === -1) return undefined;
+	const state = stat.slice(close + 1).trim().split(/\s+/)[0];
+	return state ? state : undefined;
+}
+
+/**
+ * Process state from `/proc`, or undefined where there is no procfs.
+ *
+ * Undefined means "this platform cannot tell us", which callers must not read as
+ * "dead": macOS has no `/proc`, and a liveness probe that guessed there would
+ * report every live run as finished.
+ */
+function readProcState(pid: number): string | undefined {
+	try {
+		return parseProcStatState(readFileSync(`/proc/${pid}/stat`, "utf8"));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Whether an arbitrary pid is held by a live process.
  *
  * `Signal 0` performs the permission and existence checks without delivering a
  * signal, so this needs no subprocess — the diagnostics that call it run inside
  * a recovery path and must stay cheap.
  *
- * A zombie reads as alive here (its pid is still allocated). That is the wrong
- * answer for a run whose runner has exited but whose status was never
- * terminalised — exactly the state we want to report as suspicious — so callers
- * treat `true` as "maybe alive" and rely on the run's age for the verdict.
+ * A zombie (`Z`) is *not* live: its pid is still allocated, but the process it
+ * names has already exited, and the only thing left is an unreaped exit status.
+ * Reporting one as alive is what let a runner that exited without terminalising
+ * its status file pin a channel indefinitely, so the state is consulted here.
+ *
+ * `true` therefore means **not known to be dead** — alive, or a pid whose state
+ * could not be classified at all (no procfs, `hidepid`, an unreadable or
+ * malformed line, a kill/proc race). Callers already rely on that weaker reading
+ * (`subagent-run-store.ts`, `completion-orphans.ts`): a `true` whose state was
+ * never classified is not proof of work, only the absence of proof of death.
  */
 export function isProcessAlive(pid: number): boolean {
 	if (!Number.isInteger(pid) || pid <= 0) return false;
+	let exists: boolean;
 	try {
 		process.kill(pid, 0);
-		return true;
+		exists = true;
 	} catch (err) {
 		// EPERM means the process exists but belongs to another user.
-		return (err as NodeJS.ErrnoException).code === "EPERM";
+		exists = (err as NodeJS.ErrnoException).code === "EPERM";
 	}
+	if (!exists) return false;
+	return readProcState(pid) !== "Z";
 }
 
 /**

@@ -50,6 +50,19 @@ const SHORT_RUN_ID_LENGTH = 8;
  */
 export const RUN_PROGRESS_RECENT_MS = 90_000;
 
+/**
+ * Upper bound on a `pidAlive` hold where the pid's state cannot be classified.
+ *
+ * On Linux a live pid is direct evidence of work and needs no cap: a zombie is
+ * classified dead, so `pidAlive === true` means a running process. The cap exists
+ * only for platforms with no procfs, where `true` degrades to "pid allocated" and
+ * an unreaped zombie would otherwise pin a channel forever.
+ *
+ * Thirty minutes is well past the longest plausible runner, so tripping it means
+ * the liveness answer is stale rather than that the work is slow.
+ */
+export const RUN_MAX_HOLD_MS = 30 * 60_000;
+
 /** The subset of a run's `status.json` worth printing. */
 export interface RunStatusRecord {
 	runId: string;
@@ -78,6 +91,14 @@ export interface OutstandingRun {
 	pidAlive?: boolean;
 	/** Undefined when `status.json` carried no usable `lastUpdate`. */
 	ageMs?: number;
+	/**
+	 * Session file the run belongs to, when the runner recorded one.
+	 *
+	 * Not printed in the diagnostic line, but carried because it is the only field
+	 * that attributes a run to a channel — the watchdog needs it to decide whether
+	 * a live run is *this* channel's work or another channel's.
+	 */
+	sessionId?: string;
 }
 
 export interface RunStoreSummary {
@@ -178,6 +199,52 @@ export interface PendingAsyncRunRef {
 }
 
 /**
+ * Which channel a liveness question is about, and how to attribute a run to one.
+ *
+ * `status.json.sessionId` is the only field in the store that ties a run to a
+ * conversation — for this bot it is the channel transcript the run was launched
+ * from — so it is what makes the store usable as an authoritative source rather
+ * than a second-hand view filtered by the gate's in-memory tally.
+ */
+export interface AsyncWorkScope {
+	/** Channel being asked about: a run attributed elsewhere must not suppress it. */
+	channelId: string;
+	/** Channel a run belongs to, or undefined when its `sessionId` cannot be mapped. */
+	channelIdForRun: (run: OutstandingRun) => string | undefined;
+	/**
+	 * Called for a progressing run that cannot be attributed to any channel.
+	 *
+	 * Such a run is released rather than credited — one we cannot place must not
+	 * hold an arbitrary channel open — but the rate is worth seeing, so callers log
+	 * it here rather than silently swallowing it.
+	 */
+	onUnattributedRun?: ((run: OutstandingRun) => void) | undefined;
+	/**
+	 * Called for a run the channel's tally counts whose `sessionId` maps to no
+	 * channel.
+	 *
+	 * Deliberately separate from `onUnattributedRun`: this one *is* credited (see
+	 * the note in the tally pass), so it means "credited with weaker attribution",
+	 * not "not credited". Callers keep their own throttle and counter for it so the
+	 * two rates can be told apart in the journal.
+	 */
+	onCountedRunWithoutOwner?: ((run: OutstandingRun) => void) | undefined;
+}
+
+/** How a single run's liveness is judged beyond its status age. */
+export interface ProgressOptions {
+	/**
+	 * Whether the pid's state could be classified as live vs zombie.
+	 *
+	 * Defaults to true on Linux, where `/proc` answers it. False means `pidAlive`
+	 * only says "pid allocated", so the hold is capped at `RUN_MAX_HOLD_MS`.
+	 */
+	stateClassifiable?: boolean | undefined;
+	/** Called when `RUN_MAX_HOLD_MS` ends a hold that had no classified state. */
+	onHoldCapped?: ((run: OutstandingRun) => void) | undefined;
+}
+
+/**
  * Whether a single outstanding run is still doing something.
  *
  * Ordering matters. A live pid is direct evidence of work and is trusted over
@@ -185,18 +252,33 @@ export interface PendingAsyncRunRef {
  * status yet) there is nothing to say it stopped, so it is assumed to be
  * working — the safe direction for a watchdog that must never destroy a live
  * turn.
+ *
+ * The live-pid branch is unbounded only where the state actually classifies: on
+ * Linux a `Z` reads dead, so `pidAlive === true` is a running process and no age
+ * cap may be applied to it. Where the platform cannot classify (no procfs), a
+ * zombie reads alive indefinitely, so that hold is capped at `RUN_MAX_HOLD_MS`.
  */
 export function isProgressingRun(
 	run: OutstandingRun,
-	recentMs: number = RUN_PROGRESS_RECENT_MS
+	recentMs: number = RUN_PROGRESS_RECENT_MS,
+	options: ProgressOptions = {}
 ): boolean {
-	if (run.pidAlive === true) return true;
+	if (run.pidAlive === true) {
+		if (options.stateClassifiable ?? process.platform === "linux") return true;
+		// Unclassified: "pid allocated" cannot tell a live runner from an unreaped
+		// zombie, so the hold needs an upper bound of its own.
+		if (run.ageMs !== undefined && run.ageMs > RUN_MAX_HOLD_MS) {
+			options.onHoldCapped?.(run);
+			return false;
+		}
+		return true;
+	}
 	if (run.ageMs === undefined) return true;
 	return run.ageMs <= recentMs;
 }
 
 /**
- * Whether any async run the gate still counts is genuinely progressing.
+ * Whether any async run is genuinely progressing for the channel in scope.
  *
  * The gate's tally is event-driven and its completion event is delivered *through
  * the session* — so the exact wedge that keeps a run from settling also keeps
@@ -205,34 +287,95 @@ export function isProgressingRun(
  * waiting for that delivery. Reading the tally as "work in progress" therefore
  * deadlocks the recovery that would break the loop.
  *
- * The run store is the ground truth. A run that is absent from the store's
- * outstanding set has terminalised (complete/failed) or never wrote a status; in
- * either case it is not work, unless it started so recently that its status may
- * simply not exist yet. Fails closed (reports work) when the store could not be
- * read, because an unverifiable diagnostic must never be the reason a live turn
- * is torn down.
+ * The run store is the ground truth, and with a `scope` it is authoritative: the
+ * tally is only a fast-path hint, never the sole veto. That distinction matters
+ * because `pendingAsyncRuns()` is per-session state, so a session replacement
+ * drops the accounting for runs that are still alive — the case that produced
+ * "outstanding runs: none" in the journal immediately before a teardown. A run
+ * the gate has forgotten is still work while its process lives, and only the
+ * store can say so.
+ *
+ * A run absent from the store's outstanding set has terminalised (complete/failed
+ * or paused) or never wrote a status; in either case it is not work, unless it
+ * started so recently that its status may simply not exist yet. That is what
+ * bounds the suppression: a finished run cannot hold a channel open beyond one
+ * status interval. Fails closed (reports work) when the store could not be read,
+ * because an unverifiable diagnostic must never be the reason a live turn is torn
+ * down.
+ *
+ * Without a `scope` there is no way to attribute store runs to a channel, so
+ * unscoped callers keep the tally-only behaviour — including, as before, the
+ * empty tally early exit.
  */
 export function hasProgressingAsyncWork(
 	pendingRuns: readonly PendingAsyncRunRef[],
 	summary: RunStoreSummary,
-	options: { now?: number; recentMs?: number } = {}
+	options: {
+		now?: number;
+		recentMs?: number;
+		scope?: AsyncWorkScope;
+		stateClassifiable?: boolean | undefined;
+		onHoldCapped?: ((run: OutstandingRun) => void) | undefined;
+	} = {}
 ): boolean {
-	if (pendingRuns.length === 0) return false;
+	const scope = options.scope;
+	if (scope === undefined && pendingRuns.length === 0) return false;
 	if (summary.error) return true;
 
 	const now = options.now ?? Date.now();
 	const recentMs = options.recentMs ?? RUN_PROGRESS_RECENT_MS;
+	const progress: ProgressOptions = {
+		stateClassifiable: options.stateClassifiable,
+		onHoldCapped: options.onHoldCapped,
+	};
 	const outstanding = new Map(summary.runs.map((run) => [shortRunId(run.runId), run]));
+	const counted = new Set<string>();
 
 	for (const pending of pendingRuns) {
-		const record = outstanding.get(shortRunId(pending.id));
+		const key = shortRunId(pending.id);
+		counted.add(key);
+		const record = outstanding.get(key);
 		if (record === undefined) {
 			// Not outstanding on disk: terminalised, or still too young to have written
 			// a status. Only the latter is work.
 			if (now - pending.startedAt < recentMs) return true;
 			continue;
 		}
-		if (isProgressingRun(record, recentMs)) return true;
+		if (scope !== undefined) {
+			const owner = scope.channelIdForRun(record);
+			// Ownership of a *counted* run is not decided by the sessionId mapping.
+			// The tally is per-DiscordSession state, so membership means this channel's
+			// own gate recorded the start event: it is stronger ownership evidence than
+			// `sessionId` -> transcript, which is a path this bot parses and that older
+			// status files do not always carry. Crediting on the tally is therefore the
+			// conservative direction — releasing a counted run because its sessionId is
+			// missing or unparsable is exactly the teardown bug this pass exists to
+			// prevent, for the runs we can least afford to drop. Only a *positive*
+			// attribution to another channel overrides it.
+			//
+			// The asymmetry with the authoritative pass below is deliberate: there, the
+			// tally says nothing about the run, so an unmappable sessionId leaves no
+			// ownership evidence at all and the channel is released. The two branches are
+			// not a duplicated decision that drifted apart — do not "unify" them on
+			// release.
+			if (owner !== undefined && owner !== scope.channelId) continue;
+			if (owner === undefined && isProgressingRun(record, recentMs, progress)) {
+				scope.onCountedRunWithoutOwner?.(record);
+				return true;
+			}
+		}
+		if (isProgressingRun(record, recentMs, progress)) return true;
+	}
+
+	if (scope === undefined) return false;
+
+	// Authoritative pass: runs the tally no longer counts, attributed by transcript.
+	for (const run of summary.runs) {
+		if (counted.has(shortRunId(run.runId))) continue;
+		if (!isProgressingRun(run, recentMs, progress)) continue;
+		const owner = scope.channelIdForRun(run);
+		if (owner === scope.channelId) return true;
+		if (owner === undefined) scope.onUnattributedRun?.(run);
 	}
 	return false;
 }
@@ -296,6 +439,7 @@ export function summarizeRunStore(options: SummarizeOptions = {}): RunStoreSumma
 			pid: record.pid,
 			pidAlive: record.pid === undefined ? undefined : pidAlive(record.pid),
 			ageMs: record.lastUpdate === undefined ? undefined : Math.max(0, now - record.lastUpdate),
+			sessionId: record.sessionId,
 		});
 	}
 

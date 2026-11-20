@@ -20,6 +20,7 @@ import {
 	isProgressingRun,
 	parseRunStatus,
 	resolveAsyncRunStoreDir,
+	RUN_MAX_HOLD_MS,
 	RUN_PROGRESS_RECENT_MS,
 	summarizeRunStore,
 	type OutstandingRun,
@@ -233,6 +234,45 @@ describe("isProgressingRun", () => {
 	it("honours a custom recent window", () => {
 		expect(isProgressingRun(run({ pidAlive: false, ageMs: 5_000 }), 1_000)).toBe(false);
 	});
+
+	it("keeps an arbitrarily old live pid progressing where the state classifies", () => {
+		// Linux: a `Z` reads dead, so `pidAlive === true` is a running process and no
+		// status age may demote it. This must stay unbounded.
+		const ancient = run({ pid: 99, pidAlive: true, ageMs: 365 * 24 * 60 * 60_000 });
+		expect(isProgressingRun(ancient, undefined, { stateClassifiable: true })).toBe(true);
+		if (process.platform === "linux") {
+			// The default must be that same branch on Linux: no cap at all.
+			expect(isProgressingRun(ancient)).toBe(true);
+		}
+	});
+
+	it("caps an unclassifiable live-pid hold after RUN_MAX_HOLD_MS", () => {
+		// No procfs: `pidAlive === true` only means "pid allocated", so an unreaped
+		// zombie would otherwise pin the channel forever.
+		const capped: string[] = [];
+		const stale = run({ runId: "capped-run", pid: 99, pidAlive: true, ageMs: RUN_MAX_HOLD_MS + 1 });
+		expect(
+			isProgressingRun(stale, undefined, {
+				stateClassifiable: false,
+				onHoldCapped: (candidate) => capped.push(candidate.runId),
+			})
+		).toBe(false);
+		expect(capped).toEqual(["capped-run"]);
+	});
+
+	it("holds an unclassifiable live pid below the cap", () => {
+		expect(
+			isProgressingRun(run({ pid: 99, pidAlive: true, ageMs: RUN_MAX_HOLD_MS - 1 }), undefined, {
+				stateClassifiable: false,
+			})
+		).toBe(true);
+	});
+
+	it("holds an unclassifiable live pid with no timestamp to measure", () => {
+		expect(
+			isProgressingRun(run({ pid: 99, pidAlive: true }), undefined, { stateClassifiable: false })
+		).toBe(true);
+	});
 });
 
 describe("hasProgressingAsyncWork", () => {
@@ -291,5 +331,147 @@ describe("hasProgressingAsyncWork", () => {
 		const pending = [{ id: "99998888-0000-0000-0000-000000000000", startedAt: NOW - 60_000 }];
 		const aging = summary([run({ runId: pending[0]!.id, pid: 42, pidAlive: false, ageMs: RUN_PROGRESS_RECENT_MS + 1 })]);
 		expect(hasProgressingAsyncWork(pending, aging, { now: NOW })).toBe(false);
+	});
+});
+
+// ============================================================================
+// Scoped liveness: the store is authoritative, attributed by transcript
+// ============================================================================
+
+describe("hasProgressingAsyncWork with a channel scope", () => {
+	const NOW = 10_000_000;
+	const CHANNEL = "1492621695352045762";
+	const OTHER = "1533738889922088960";
+
+	/** Transcript path the runner records in `status.json.sessionId`. */
+	const transcript = (channelId: string): string => `/sessions/discord-${channelId}.jsonl`;
+
+	function scope(logged: OutstandingRun[] = []) {
+		return {
+			channelId: CHANNEL,
+			channelIdForRun: (candidate: OutstandingRun) => {
+				const match = candidate.sessionId?.match(/^.*discord-(\d+)(?:-\d+)?\.jsonl$/);
+				return match?.[1];
+			},
+			onUnattributedRun: (candidate: OutstandingRun) => logged.push(candidate),
+		};
+	}
+
+	it("suppresses on a live run the gate has forgotten (the production wedge)", () => {
+		// The journal said "outstanding runs: none" because the tally was empty after a
+		// session replacement, then the stall net tore the session down mid-run.
+		const store = summary([
+			run({ runId: "aaaa1111-0000", pid: 42, pidAlive: true, ageMs: 45 * 60_000, sessionId: transcript(CHANNEL) }),
+		]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope() })).toBe(true);
+	});
+
+	it("does not suppress a channel for a live run belonging to another channel", () => {
+		const store = summary([
+			run({ runId: "bbbb2222-0000", pid: 43, pidAlive: true, sessionId: transcript(OTHER) }),
+		]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope() })).toBe(false);
+	});
+
+	it("still suppresses for its own run when another channel also has one", () => {
+		const store = summary([
+			run({ runId: "cccc3333-0000", pid: 43, pidAlive: true, sessionId: transcript(OTHER) }),
+			run({ runId: "dddd4444-0000", pid: 44, pidAlive: true, sessionId: transcript(CHANNEL) }),
+		]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope() })).toBe(true);
+	});
+
+	it("releases a run it cannot attribute, and reports it", () => {
+		const logged: OutstandingRun[] = [];
+		const store = summary([run({ runId: "eeee5555-0000", pid: 45, pidAlive: true, ageMs: 1_000 })]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope(logged) })).toBe(false);
+		expect(logged.map((entry) => entry.runId)).toEqual(["eeee5555-0000"]);
+	});
+
+	it("releases a run whose sessionId is not a channel transcript", () => {
+		const logged: OutstandingRun[] = [];
+		const store = summary([
+			run({ runId: "ffff6666-0000", pid: 46, pidAlive: true, sessionId: "/tmp/other-agent.jsonl" }),
+		]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope(logged) })).toBe(false);
+		expect(logged).toHaveLength(1);
+	});
+
+	it("does not hold a channel open for a finished run whose pid is gone", () => {
+		// Bounded grace: a terminal run, or one whose runner exited, releases the channel
+		// once one status interval has passed — a finished run cannot pin it forever.
+		const store = summary([
+			run({
+				runId: "11112222-0000",
+				pid: 47,
+				pidAlive: false,
+				ageMs: RUN_PROGRESS_RECENT_MS + 1,
+				sessionId: transcript(CHANNEL),
+			}),
+		]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope() })).toBe(false);
+	});
+
+	it("does not suppress on a terminal run even with a recorded live pid", () => {
+		// `summarizeRunStore` keeps outstanding states only, so a completed run never
+		// reaches this decision at all; the store being the source is the bound.
+		expect(hasProgressingAsyncWork([], summary([]), { now: NOW, scope: scope() })).toBe(false);
+	});
+
+	it("counts a fresh tally run that has no status yet, scoped", () => {
+		const pending = [{ id: "99990000-0000", startedAt: NOW - 5_000 }];
+		expect(hasProgressingAsyncWork(pending, summary([]), { now: NOW, scope: scope() })).toBe(true);
+	});
+
+	it("ignores a counted run the store attributes to another channel", () => {
+		const pending = [{ id: "33334444-0000", startedAt: NOW - 60_000 }];
+		const store = summary([
+			run({ runId: "33334444-0000", pid: 48, pidAlive: true, sessionId: transcript(OTHER) }),
+		]);
+		expect(hasProgressingAsyncWork(pending, store, { now: NOW, scope: scope() })).toBe(false);
+	});
+
+	it("fails closed for a scoped channel when the store is unreadable", () => {
+		expect(
+			hasProgressingAsyncWork([], summary([], "cannot read /store: ENOENT"), { now: NOW, scope: scope() })
+		).toBe(true);
+	});
+
+	it("releases a wedged channel with no live run at all", () => {
+		// The recovery the nets exist for: nothing outstanding, so nothing to protect.
+		expect(hasProgressingAsyncWork([], summary([]), { now: NOW, scope: scope() })).toBe(false);
+	});
+
+	it("credits a counted run whose sessionId maps to no channel, and reports it distinctly", () => {
+		// Tally membership is the stronger ownership evidence: this channel's own gate
+		// recorded the start event, so an unmappable sessionId must not release it.
+		const credited: OutstandingRun[] = [];
+		const released: OutstandingRun[] = [];
+		const pending = [{ id: "77778888-0000", startedAt: NOW - 60_000 }];
+		const store = summary([run({ runId: "77778888-0000", pid: 50, pidAlive: true, ageMs: 1_000 })]);
+
+		const result = hasProgressingAsyncWork(pending, store, {
+			now: NOW,
+			scope: { ...scope(released), onCountedRunWithoutOwner: (candidate) => credited.push(candidate) },
+		});
+
+		expect(result).toBe(true);
+		expect(credited.map((entry) => entry.runId)).toEqual(["77778888-0000"]);
+		// `onUnattributedRun` means "not credited" — it must never fire for a counted run.
+		expect(released).toHaveLength(0);
+	});
+
+	it("forwards the hold cap into run decisions", () => {
+		const store = summary([
+			run({
+				runId: "12121212-0000",
+				pid: 51,
+				pidAlive: true,
+				ageMs: RUN_MAX_HOLD_MS + 1,
+				sessionId: transcript(CHANNEL),
+			}),
+		]);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope(), stateClassifiable: false })).toBe(false);
+		expect(hasProgressingAsyncWork([], store, { now: NOW, scope: scope(), stateClassifiable: true })).toBe(true);
 	});
 });
